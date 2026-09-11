@@ -5050,10 +5050,9 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
     }
 }
 
-// Device-side MoE path. Returns false to fall back to the per-expert loop below.
-static bool ggml_sycl_mul_mat_id_mmvq_fused(
-    ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
-    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst)
+// Shape and layout gate of the device-side MoE path below.
+static bool ggml_sycl_mul_mat_id_mmvq_shape_ok(
+    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, const ggml_tensor * dst)
 {
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
@@ -5066,6 +5065,21 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const int64_t n_ids_per_group = ids->ne[0];
     if (ids->ne[1] != ne12 || ids->nb[0] != sizeof(int32_t)) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
+    return true;
+}
+
+// Device-side MoE path. Returns false to fall back to the per-expert loop below.
+static bool ggml_sycl_mul_mat_id_mmvq_fused(
+    ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst)
+{
+    if (!ggml_sycl_mul_mat_id_mmvq_shape_ok(src0, src1, ids, dst)) {
+        return false;
+    }
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t n_ids_per_group = ids->ne[0];
 
     const queue_ptr stream           = ctx.stream();
     const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
@@ -6452,6 +6466,30 @@ static bool mul_mat_uses_library_gemm(ggml_tensor * dst) {
            !can_use_mul_mat_q(src0, src1, dst);
 }
 
+// Reports if ggml_sycl_mul_mat_id() runs this node entirely on device. The fallback path
+// copies ids to the host and waits on the queue, which a graph recording cannot do.
+// Conservative about the reorder decision: it is made lazily by opt_for_reorder_id(), so a
+// type the reorder variant cannot take is rejected even before the weights are reordered.
+static bool mul_mat_id_runs_on_device(const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+    if (src0 == nullptr || src1 == nullptr || ids == nullptr) {
+        return false;
+    }
+    if (ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+        return false;
+    }
+    if (!ggml_sycl_mul_mat_id_mmvq_shape_ok(src0, src1, ids, dst)) {
+        return false;
+    }
+    if (!ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type)) {
+        return false;
+    }
+    return !ggml_sycl_supports_reorder_mmvq(src0->type) ||
+           ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type);
+}
+
 static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
     if (ggml_sycl_info().device_count > 1) {
         // A sycl_ex::command_graph object can only be created for a single device
@@ -6477,14 +6515,19 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
                 // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
                 // but wait() can't be called on the events returned by a queue recording
                 // to a graph.
-                [[fallthrough]];
-            case GGML_OP_MUL_MAT_ID:
-                // ggml_sycl_mul_mat_id() does a blocking host wait on the sycl queue after
-                // submitting a memcpy operation, but wait() can't be called on a queue that
-                // is recording to a graph.
                 GGML_LOG_DEBUG("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
                                ggml_op_name(node_op));
                 return false;
+            case GGML_OP_MUL_MAT_ID:
+                // the fallback path of ggml_sycl_mul_mat_id() does a blocking host wait on the
+                // sycl queue after submitting a memcpy operation, but wait() can't be called on
+                // a queue that is recording to a graph. The device-side path does neither.
+                if (!mul_mat_id_runs_on_device(node)) {
+                    GGML_LOG_DEBUG("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
+                                   ggml_op_name(node_op));
+                    return false;
+                }
+                break;
             case GGML_OP_OUT_PROD:
             case GGML_OP_CONV_3D:
             case GGML_OP_SOLVE_TRI:

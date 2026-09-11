@@ -70,6 +70,11 @@ bool ggml_sycl_mul_mat_vec_q_id(
     const ggml_sycl_moe_route_order * route_order,
     dpct::queue_ptr    stream);
 
+// True if the mat-vec MoE entry points handle src0_type, i.e. whether MUL_MAT_ID runs
+// entirely on device. The reorder variant covers fewer types than the plain one.
+bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type);
+bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type);
+
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.
 // vy: src1 quantized with quantize_and_reorder_q8_1_soa (per-row SoA). Returns false if src0_type isn't handled.
