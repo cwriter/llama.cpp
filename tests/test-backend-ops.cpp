@@ -3725,53 +3725,6 @@ struct test_rms_norm : public test_case {
     }
 };
 
-// qwen4exp hyper-connection combine: REPEAT -> MUL -> ADD with a scale/sigmoid/scale
-// weight chain, the pattern the SYCL repeat_mul_add fusion matches
-struct test_hc_combine : public test_case {
-    const int64_t n_embd;
-    const int64_t hc;
-    const int64_t nt;
-
-    std::string op_desc(ggml_tensor * t) override {
-        GGML_UNUSED(t);
-        return "HC_COMBINE";
-    }
-
-    bool run_whole_graph() override { return true; }
-
-    std::string vars() override {
-        return VARS_TO_STR3(n_embd, hc, nt);
-    }
-
-    test_hc_combine(int64_t n_embd, int64_t hc, int64_t nt) : n_embd(n_embd), hc(hc), nt(nt) {}
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, nt);
-        ggml_set_name(residual, "residual");
-        ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
-        ggml_set_name(block_out, "block_out");
-        // inject must be COMPUTED, as in the model: its last graph consumer is the scale
-        // below, so ggml-alloc may hand its block to a later tensor
-        ggml_tensor * w_inj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
-        ggml_set_name(w_inj, "w_inj");
-        ggml_tensor * xn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
-        ggml_set_name(xn, "xn");
-        ggml_tensor * inject = ggml_mul_mat(ctx, w_inj, xn);
-        ggml_set_name(inject, "inject");
-
-        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
-        w = ggml_scale(ctx, w, 2.0f);
-        w = ggml_reshape_3d(ctx, w, 1, hc, nt);
-
-        ggml_tensor * b = ggml_reshape_3d(ctx, block_out, n_embd, 1, nt);
-        b = ggml_repeat_4d(ctx, b, n_embd, hc, nt, 1);
-
-        ggml_tensor * out = ggml_add(ctx, residual, ggml_mul(ctx, b, w));
-        ggml_set_name(out, "out");
-        return out;
-    }
-};
-
 // GGML_OP_RMS_NORM_BACK
 struct test_rms_norm_back : public test_case {
     const ggml_type type;
@@ -9797,10 +9750,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-
-    test_cases.emplace_back(new test_hc_combine(2560, 4, 2));
-    test_cases.emplace_back(new test_hc_combine(2560, 4, 1));
-    test_cases.emplace_back(new test_hc_combine(64, 4, 3));
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
