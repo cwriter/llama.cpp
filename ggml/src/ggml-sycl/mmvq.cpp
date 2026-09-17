@@ -1,5 +1,7 @@
 #include "mmvq.hpp"
 
+#include <type_traits>
+
 #include "ggml.h"
 #include "common.hpp"
 #include "element_wise.hpp"
@@ -2846,8 +2848,14 @@ static void mul_mat_vec_q8_0_moe_ordered_xmx(
     constexpr int tile_n = 16;
     constexpr int tile_k = 32;
 
-    const int expert  = item.get_group(0);
+    const int slot_x  = item.get_group(0);
     const int group_y = item.get_group(1);
+    // same compaction as the non-XMX kernel: the grid covers the routed experts, so
+    // slots past the actual count belong to the host-side bound and just exit
+    if (active_experts != nullptr && (uint32_t) slot_x >= *n_active) {
+        return;
+    }
+    const int expert = active_experts != nullptr ? (int) active_experts[slot_x] : slot_x;
     const int row_base = group_y * tile_m;
     const int lane = item.get_local_linear_id();
     const uint32_t begin = expert_offsets[expert];
@@ -2958,6 +2966,9 @@ static void launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl(
     const size_t expert_weight_stride, const size_t dst_row_stride,
     const size_t src1_row_stride, const size_t dst_token_stride,
     const size_t src1_token_stride, dpct::queue_ptr stream) {
+    // grid covers the routed experts when the compacted list is available
+    const int n_expert_slices = route_order.active_experts != nullptr ? route_order.n_active_max
+                                                                     : route_order.n_experts;
     constexpr int tile_m = 8;
     constexpr int tile_n = 16;
     constexpr int tile_k = 32;
@@ -2969,7 +2980,7 @@ static void launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl(
         sycl::local_accessor<float, 1> scales_b(tile_n, cgh);
         sycl::local_accessor<int32_t, 1> tile_c(tile_m * tile_n, cgh);
         cgh.parallel_for(
-            sycl::nd_range<2>(sycl::range<2>(route_order.n_experts, block_num_y * WARP_SIZE),
+            sycl::nd_range<2>(sycl::range<2>(n_expert_slices, block_num_y * WARP_SIZE),
                               sycl::range<2>(1, WARP_SIZE)),
             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                 mul_mat_vec_q8_0_moe_ordered_xmx<experts_used>(
@@ -3023,10 +3034,24 @@ static constexpr int moe_ordered_blocks_tile() {
     return per_warp > 4 ? per_warp : 4;
 }
 
+// Rows per work group. The activation tile is shared by every row in the group, so a
+// wider group amortizes it over more rows; it also halves the number of groups, which
+// costs latency hiding. Measured on 3x Arc Pro B60 with iq4_nl (nrows 2560): 16 rows is
+// 17% faster per call at ~20 routes per expert and 41% slower at ~1, so the width is
+// only widened once there are routes to amortize over.
+template <typename block_q_t>
+static constexpr int moe_ordered_rows_per_wg() {
+    return std::is_same<block_q_t, block_iq4_nl>::value ? 16 : 8;
+}
+
+// between the 1 route per expert that regressed and the ~20 that gained; not tuned finer
+static constexpr int moe_ordered_wide_min_routes = 4;
+
 // aligned == the caller guarantees blocks_per_row % blocks_tile == 0 and
 // nrows % rows_per_wg == 0, which turns block_count into a compile-time power of two
 // (so both index divisions become shifts) and removes the row bounds checks.
-template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl, bool aligned>
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl, bool blocks_aligned,
+          int rows_per_wg>
 [[sycl::reqd_sub_group_size(WARP_SIZE)]]
 static void mul_mat_vec_q_moe_ordered_slm(
     const void * __restrict__ vx_base,
@@ -3038,6 +3063,7 @@ static void mul_mat_vec_q_moe_ordered_slm(
     const uint32_t * __restrict__ n_active,
     const int ncols,
     const int nrows,
+    const bool rows_aligned,
     const sycl::uint3 rows_fastdiv,      // wg_idx -> (expert, group_y) without an integer divide
     const sycl::uint3 experts_fastdiv,   // route -> (token, slot) without an integer divide
     const size_t expert_weight_stride,
@@ -3048,7 +3074,6 @@ static void mul_mat_vec_q_moe_ordered_slm(
     block_q_t * __restrict__ tile_x,
     block_q8_1 * __restrict__ tile_y,
     const sycl::nd_item<1> & item) {
-    constexpr int rows_per_wg  = 8;
     constexpr int routes_tile  = 8;
     constexpr int blocks_tile  = moe_ordered_blocks_tile<qi, vdr>();
     constexpr int y_per_x      = qk / QK8_1;
@@ -3084,31 +3109,38 @@ static void mul_mat_vec_q_moe_ordered_slm(
         const int route_count = sycl::min((uint32_t) routes_tile, end - route_base);
         float sums[routes_tile] = {};
 
-        for (int block_base = 0; block_base < blocks_per_row; block_base += blocks_tile) {
-            const int block_count = aligned ? blocks_tile
-                                            : sycl::min(blocks_tile, blocks_per_row - block_base);
-            // Walk the whole tile rather than block_count slots: a runtime divisor here
-            // compiles to math.inv plus two cr0 rounding-mode writes (which serialize),
-            // while blocks_tile is a compile-time power of two and folds to a shift.
-            constexpr int x_slots = rows_per_wg * blocks_tile;
+        // Walk the whole tile rather than block_count slots: a runtime divisor here
+        // compiles to math.inv plus two cr0 rounding-mode writes (which serialize),
+        // while blocks_tile is a compile-time power of two and folds to a shift.
+        constexpr int x_slots     = rows_per_wg * blocks_tile;
+        constexpr int y_per_route = blocks_tile * y_per_x;
+        constexpr int y_slots     = routes_tile * y_per_route;
+
+        // Fill one buffer while the other is being read, so a single barrier per block
+        // tile both publishes the new tile and retires the reads of the old one. The
+        // previous form needed two: one after the loads, one to stop the next iteration
+        // overwriting tiles still in use.
+        const auto load_tiles = [&](int load_base, int buf) {
+            if (load_base >= blocks_per_row) {
+                return;
+            }
+            const int load_count = blocks_aligned ? blocks_tile
+                                                  : sycl::min(blocks_tile, blocks_per_row - load_base);
             for (int index = local_id; index < x_slots; index += local_size) {
                 const int tile_row = index / blocks_tile;
                 const int tile_block = index - tile_row * blocks_tile;
                 const int global_row = group_y * rows_per_wg + tile_row;
-                if (tile_block < block_count && (aligned || global_row < nrows)) {
-                    tile_x[tile_row * blocks_tile + tile_block] =
-                        x[global_row * blocks_per_row + block_base + tile_block];
+                if (tile_block < load_count && (rows_aligned || global_row < nrows)) {
+                    tile_x[buf * x_slots + tile_row * blocks_tile + tile_block] =
+                        x[global_row * blocks_per_row + load_base + tile_block];
                 }
             }
-
-            constexpr int y_per_route = blocks_tile * y_per_x;
-            constexpr int y_slots      = routes_tile * y_per_route;
             for (int index = local_id; index < y_slots; index += local_size) {
                 const int route_local = index / y_per_route;
                 const int y_local = index - route_local * y_per_route;
                 const int block_local = y_local / y_per_x;
                 const int y_in_block = y_local - block_local * y_per_x;
-                if (route_local >= route_count || block_local >= block_count) {
+                if (route_local >= route_count || block_local >= load_count) {
                     continue;
                 }
                 const uint32_t route = sorted_routes[route_base + route_local];
@@ -3117,13 +3149,21 @@ static void mul_mat_vec_q_moe_ordered_slm(
                 const uint32_t slot  = ts.y();
                 const block_q8_1 * y = (const block_q8_1 *) ((const char *) vy_base +
                     (size_t) token * src1_token_stride + (size_t) slot * src1_row_stride);
-                tile_y[(route_local * blocks_tile + block_local) * y_per_x + y_in_block] =
-                    y[(block_base + block_local) * y_per_x + y_in_block];
+                tile_y[buf * y_slots + (route_local * blocks_tile + block_local) * y_per_x + y_in_block] =
+                    y[(load_base + block_local) * y_per_x + y_in_block];
             }
+        };
 
-            item.barrier(sycl::access::fence_space::local_space);
+        load_tiles(0, 0);
+        item.barrier(sycl::access::fence_space::local_space);
 
-            if (aligned || row < nrows) {
+        int buf = 0;
+        for (int block_base = 0; block_base < blocks_per_row; block_base += blocks_tile) {
+            const int block_count = blocks_aligned ? blocks_tile
+                                                   : sycl::min(blocks_tile, blocks_per_row - block_base);
+            load_tiles(block_base + blocks_tile, buf ^ 1);
+
+            if (rows_aligned || row < nrows) {
                 // Block outer, route inner. bx and the (expensive) weight dequant inside
                 // vec_dot depend only on bx and iqs, both invariant across the route loop,
                 // so the dequant can be hoisted once per block instead of being redone for
@@ -3131,13 +3171,14 @@ static void mul_mat_vec_q_moe_ordered_slm(
 #pragma unroll 4
                 for (int block_local = lane_id / (qi / vdr);
                      block_local < block_count; block_local += blocks_per_warp) {
-                    const block_q_t * bx = &tile_x[sg_id * blocks_tile + block_local];
+                    const block_q_t * bx = &tile_x[buf * x_slots + sg_id * blocks_tile + block_local];
 #pragma unroll
                     for (int route_local = 0; route_local < routes_tile; ++route_local) {
                         if (route_local >= route_count) {
                             break;
                         }
-                        const block_q8_1 * by = &tile_y[(route_local * blocks_tile + block_local) * y_per_x];
+                        const block_q8_1 * by =
+                            &tile_y[buf * y_slots + (route_local * blocks_tile + block_local) * y_per_x];
                         for (size_t elem = 0; elem < qi / vdr; elem += WARP_SIZE) {
                             const int iqs = elem + vdr * (lane_id % (qi / vdr));
                             sums[route_local] += vec_dot_q_sycl(bx, by, iqs);
@@ -3145,9 +3186,9 @@ static void mul_mat_vec_q_moe_ordered_slm(
                     }
                 }
             }
-            if (block_base + block_count < blocks_per_row || route_base + route_count < end) {
-                item.barrier(sycl::access::fence_space::local_space);
-            }
+            // publishes the tile just loaded and retires the reads above in one go
+            item.barrier(sycl::access::fence_space::local_space);
+            buf ^= 1;
         }
 
 #pragma unroll
@@ -3158,7 +3199,7 @@ static void mul_mat_vec_q_moe_ordered_slm(
             for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
                 sums[route_local] += dpct::permute_sub_group_by_xor(sg, sums[route_local], mask);
             }
-            if (lane_id == 0 && (aligned || row < nrows)) {
+            if (lane_id == 0 && (rows_aligned || row < nrows)) {
                 const uint32_t route = sorted_routes[route_base + route_local];
                 const sycl::uint2 ts = fast_div_modulo(route, experts_fastdiv);
                 const uint32_t token = ts.x();
@@ -3171,7 +3212,8 @@ static void mul_mat_vec_q_moe_ordered_slm(
     }
 }
 
-template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl, bool aligned>
+template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl,
+          bool blocks_aligned, int rows_per_wg>
 static void launch_mul_mat_vec_q_moe_ordered_impl(
     const void * vx_base, const void * vy, float * dst_base,
     const ggml_sycl_moe_route_order & route_order,
@@ -3179,7 +3221,6 @@ static void launch_mul_mat_vec_q_moe_ordered_impl(
     const size_t expert_weight_stride, const size_t dst_row_stride,
     const size_t src1_row_stride, const size_t dst_token_stride,
     const size_t src1_token_stride, dpct::queue_ptr stream) {
-    constexpr int rows_per_wg = 8;
     const int block_num_y = (nrows + rows_per_wg - 1) / rows_per_wg;
     // grid covers the routed experts when the compacted list is available
     const int n_expert_slices = route_order.active_experts != nullptr ? route_order.n_active_max
@@ -3194,15 +3235,18 @@ static void launch_mul_mat_vec_q_moe_ordered_impl(
     const sycl::uint3 experts_fastdiv = init_fastdiv_values((uint32_t) n_experts_used);
     const sycl::uint3 rows_fastdiv    = init_fastdiv_values((uint32_t) block_num_y);
     stream->submit([&](sycl::handler & cgh) {
-        sycl::local_accessor<block_q_t, 1> tile_x(rows_per_wg * blocks_tile, cgh);
-        sycl::local_accessor<block_q8_1, 1> tile_y(routes_tile * blocks_tile * y_per_x, cgh);
+        // two buffers: the loop fills one tile while computing from the other
+        sycl::local_accessor<block_q_t, 1> tile_x(2 * rows_per_wg * blocks_tile, cgh);
+        sycl::local_accessor<block_q8_1, 1> tile_y(2 * routes_tile * blocks_tile * y_per_x, cgh);
         cgh.parallel_for(
             sycl::nd_range<1>(global_range, local_range),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_moe_ordered_slm<qk, qi, block_q_t, vdr, vec_dot_q_sycl, aligned>(
+                mul_mat_vec_q_moe_ordered_slm<qk, qi, block_q_t, vdr, vec_dot_q_sycl, blocks_aligned,
+                                              rows_per_wg>(
                     vx_base, vy, dst_base, route_order.expert_offsets, route_order.sorted_routes,
                     route_order.active_experts, route_order.n_active,
-                    ncols, nrows, rows_fastdiv, experts_fastdiv, expert_weight_stride,
+                    ncols, nrows, nrows % rows_per_wg == 0, rows_fastdiv, experts_fastdiv,
+                    expert_weight_stride,
                     dst_row_stride, src1_row_stride, dst_token_stride, src1_token_stride,
                     get_pointer(tile_x), get_pointer(tile_y), item);
             });
@@ -3219,20 +3263,41 @@ static void launch_mul_mat_vec_q_moe_ordered(
     const size_t expert_weight_stride, const size_t dst_row_stride,
     const size_t src1_row_stride, const size_t dst_token_stride,
     const size_t src1_token_stride, dpct::queue_ptr stream) {
-    constexpr int rows_per_wg = 8;
+    constexpr int wide_rows   = moe_ordered_rows_per_wg<block_q_t>();
     constexpr int blocks_tile = moe_ordered_blocks_tile<qi, vdr>();
-    const int blocks_per_row  = ncols / qk;
-    if (blocks_per_row % blocks_tile == 0 && nrows % rows_per_wg == 0) {
-        launch_mul_mat_vec_q_moe_ordered_impl<qk, qi, block_q_t, vdr, vec_dot_q_sycl, true>(
-            vx_base, vy, dst_base, route_order, ncols, nrows, n_experts_used,
-            expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
-            src1_token_stride, stream);
-    } else {
-        launch_mul_mat_vec_q_moe_ordered_impl<qk, qi, block_q_t, vdr, vec_dot_q_sycl, false>(
-            vx_base, vy, dst_base, route_order, ncols, nrows, n_experts_used,
-            expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
-            src1_token_stride, stream);
+    const int  blocks_per_row = ncols / qk;
+    // Two independent things: whether the block loop bound folds to a shift, and whether
+    // the row bounds checks can go. Tying them together cost the wide row group whenever
+    // ncols/qk did not divide blocks_tile, which is the common case for this model.
+    const bool blocks_aligned = blocks_per_row % blocks_tile == 0;
+
+    const auto dispatch = [&](auto width) {
+        constexpr int rows = decltype(width)::value;
+        if (blocks_aligned) {
+            launch_mul_mat_vec_q_moe_ordered_impl<qk, qi, block_q_t, vdr, vec_dot_q_sycl, true, rows>(
+                vx_base, vy, dst_base, route_order, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
+                src1_token_stride, stream);
+        } else {
+            launch_mul_mat_vec_q_moe_ordered_impl<qk, qi, block_q_t, vdr, vec_dot_q_sycl, false, rows>(
+                vx_base, vy, dst_base, route_order, ncols, nrows, n_experts_used,
+                expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
+                src1_token_stride, stream);
+        }
+    };
+
+    // widest row group the row count divides, and only when enough routes share each
+    // expert to pay for the lost work groups. rows_aligned is handled at runtime so the
+    // width choice does not multiply the instantiations.
+    if constexpr (wide_rows > 8) {
+        const int slices           = route_order.n_active_max > 0 ? route_order.n_active_max : 1;
+        const int routes_per_slice = route_order.n_routes / slices;
+        if (nrows % wide_rows == 0 && routes_per_slice >= moe_ordered_wide_min_routes) {
+            dispatch(std::integral_constant<int, wide_rows>{});
+            return;
+        }
     }
+    dispatch(std::integral_constant<int, 8>{});
 }
 
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>

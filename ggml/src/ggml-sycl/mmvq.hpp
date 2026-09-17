@@ -25,6 +25,7 @@ struct ggml_sycl_moe_route_order {
     const uint32_t * active_experts;
     const uint32_t * n_active;
     int              n_active_max;
+    int              n_routes;      // n_tokens * n_experts_used, for shape-based dispatch
 };
 
 void ggml_sycl_build_moe_route_order(

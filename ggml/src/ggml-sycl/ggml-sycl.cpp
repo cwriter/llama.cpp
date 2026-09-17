@@ -5113,7 +5113,8 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         // at most one distinct expert per route, so this bounds the compacted list
         const int n_active_max = (int) std::min<int64_t>(n_experts, n_routes);
         route_order = { expert_offsets.get(), sorted_routes.get(), n_experts,
-                        active_experts.get(), active_experts.get() + n_experts, n_active_max };
+                        active_experts.get(), active_experts.get() + n_experts, n_active_max,
+                        (int) n_routes };
         route_order_ptr = &route_order;
     }
 
