@@ -1,6 +1,7 @@
 #include "binbcast.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <sycl/sycl.hpp>
@@ -648,3 +649,509 @@ void ggml_sycl_op_add_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * a
     }
 }
 
+
+struct ggml_sycl_add_n_operand {
+    const float * data;
+    size_t nb1;
+    size_t nb2;
+    size_t nb3;
+};
+
+template <int begin, int end, size_t n_operands>
+static float add_n_f32_strided_sum(const std::array<ggml_sycl_add_n_operand, n_operands> & operands,
+                                   uint32_t i0, uint32_t i1, uint32_t i2, uint32_t i3) {
+    if constexpr (end - begin == 1) {
+        const char * base = (const char *) operands[begin].data;
+        const float * src = (const float *) (base + i1 * operands[begin].nb1 +
+            i2 * operands[begin].nb2 + i3 * operands[begin].nb3);
+        return src[i0];
+    } else {
+        constexpr int mid = begin + (end - begin) / 2;
+        return add_n_f32_strided_sum<begin, mid>(operands, i0, i1, i2, i3) +
+               add_n_f32_strided_sum<mid, end>(operands, i0, i1, i2, i3);
+    }
+}
+
+template <int n_operands>
+static void k_add_n_f32(const std::array<ggml_sycl_add_n_operand, n_operands> operands, float * dst,
+                        uint32_t nelements, const sycl::uint3 ne0_fd, const sycl::uint3 ne1_fd,
+                        const sycl::uint3 ne2_fd,
+                        size_t dst_nb1, size_t dst_nb2, size_t dst_nb3, float scale, float bias,
+                        const sycl::nd_item<1> & item) {
+    const uint32_t index = item.get_global_linear_id();
+    if (index >= nelements) {
+        return;
+    }
+    const sycl::uint2 i0_rc = fast_div_modulo(index, ne0_fd);
+    const sycl::uint2 i1_rc = fast_div_modulo(i0_rc.x(), ne1_fd);
+    const sycl::uint2 i2_rc = fast_div_modulo(i1_rc.x(), ne2_fd);
+    const uint32_t i0 = i0_rc.y();
+    const uint32_t i1 = i1_rc.y();
+    const uint32_t i2 = i2_rc.y();
+    const uint32_t i3 = i2_rc.x();
+
+    const float sum = add_n_f32_strided_sum<0, n_operands>(operands, i0, i1, i2, i3);
+    char * dst_base = (char *) dst + i1 * dst_nb1 + i2 * dst_nb2 + i3 * dst_nb3;
+    ((float *) dst_base)[i0] = sum * scale + bias;
+}
+
+template <int operand, size_t n_linear, size_t n_strided>
+static float add_n_f32_grouped_load(const std::array<const float *, n_linear> & linear,
+                                    const std::array<const float *, n_strided> & strided,
+                                    uint32_t index, size_t strided_offset) {
+    if constexpr (operand < n_linear) {
+        return linear[operand][index];
+    } else {
+        const char * base = (const char *) strided[operand - n_linear];
+        return *(const float *) (base + strided_offset);
+    }
+}
+
+template <int begin, int end, size_t n_linear, size_t n_strided>
+static float add_n_f32_grouped_sum(const std::array<const float *, n_linear> & linear,
+                                   const std::array<const float *, n_strided> & strided,
+                                   uint32_t index, size_t strided_offset) {
+    if constexpr (end - begin == 1) {
+        return add_n_f32_grouped_load<begin>(linear, strided, index, strided_offset);
+    } else {
+        constexpr int mid = begin + (end - begin) / 2;
+        return add_n_f32_grouped_sum<begin, mid>(linear, strided, index, strided_offset) +
+               add_n_f32_grouped_sum<mid, end>(linear, strided, index, strided_offset);
+    }
+}
+
+template <int n_linear, int n_strided, bool bounds_check>
+static void k_add_n_f32_grouped(const std::array<const float *, n_linear> linear,
+                                const std::array<const float *, n_strided> strided, float * dst,
+                                uint32_t nelements, const sycl::uint3 ne0_fd, const sycl::uint3 ne1_fd,
+                                const sycl::uint3 ne2_fd, size_t nb1, size_t nb2, size_t nb3,
+                                float scale, float bias, const sycl::nd_item<1> & item) {
+    const uint32_t index = item.get_global_linear_id();
+    if constexpr (bounds_check) {
+        if (index >= nelements) {
+            return;
+        }
+    }
+    const sycl::uint2 i0_rc = fast_div_modulo(index, ne0_fd);
+    const sycl::uint2 i1_rc = fast_div_modulo(i0_rc.x(), ne1_fd);
+    const sycl::uint2 i2_rc = fast_div_modulo(i1_rc.x(), ne2_fd);
+    const size_t offset = i0_rc.y() * sizeof(float) + i1_rc.y() * nb1 + i2_rc.y() * nb2 + i2_rc.x() * nb3;
+    const float sum = add_n_f32_grouped_sum<0, n_linear + n_strided>(linear, strided, index, offset);
+    dst[index] = sum * scale + bias;
+}
+
+template <int n_operands>
+static void launch_add_n_f32_strided(ggml_backend_sycl_context & ctx,
+                                     const std::array<const ggml_tensor *, 9> & tensors,
+                                     ggml_tensor * dst, uint32_t nelements, float scale, float bias) {
+    std::array<ggml_sycl_add_n_operand, n_operands> operands;
+    for (int i = 0; i < n_operands; ++i) {
+        operands[i] = { (const float *) tensors[i]->data, tensors[i]->nb[1], tensors[i]->nb[2], tensors[i]->nb[3] };
+    }
+    const sycl::uint3 ne0_fd = init_fastdiv_values((uint32_t) dst->ne[0]);
+    const sycl::uint3 ne1_fd = init_fastdiv_values((uint32_t) dst->ne[1]);
+    const sycl::uint3 ne2_fd = init_fastdiv_values((uint32_t) dst->ne[2]);
+    // read the host tensor here: the kernel must not dereference it
+    float * const dst_d   = (float *) dst->data;
+    const size_t  dst_nb1 = dst->nb[1];
+    const size_t  dst_nb2 = dst->nb[2];
+    const size_t  dst_nb3 = dst->nb[3];
+    constexpr int block_size = 256;
+    const uint32_t global_size = ceil_div(nelements, (uint32_t) block_size) * block_size;
+    ctx.stream()->parallel_for(
+        sycl::nd_range<1>(global_size, block_size),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            k_add_n_f32<n_operands>(operands, dst_d, nelements, ne0_fd, ne1_fd, ne2_fd,
+                                    dst_nb1, dst_nb2, dst_nb3, scale, bias, item);
+        });
+}
+
+template <int n_linear, int n_strided, bool bounds_check>
+static void launch_add_n_f32_grouped_impl(ggml_backend_sycl_context & ctx,
+                                          const std::array<const ggml_tensor *, 9> & tensors,
+                                          float * dst, uint32_t nelements, float scale, float bias) {
+    std::array<const float *, n_linear> linear;
+    std::array<const float *, n_strided> strided;
+    for (int i = 0; i < n_linear; ++i) {
+        linear[i] = (const float *) tensors[i]->data;
+    }
+    for (int i = 0; i < n_strided; ++i) {
+        strided[i] = (const float *) tensors[n_linear + i]->data;
+    }
+    const ggml_tensor * layout = tensors[n_linear];
+    const sycl::uint3 ne0_fd = init_fastdiv_values((uint32_t) layout->ne[0]);
+    const sycl::uint3 ne1_fd = init_fastdiv_values((uint32_t) layout->ne[1]);
+    const sycl::uint3 ne2_fd = init_fastdiv_values((uint32_t) layout->ne[2]);
+    // read the host tensor here: the kernel must not dereference it
+    const size_t nb1 = layout->nb[1];
+    const size_t nb2 = layout->nb[2];
+    const size_t nb3 = layout->nb[3];
+    constexpr int block_size = 256;
+    const uint32_t global_size = ceil_div(nelements, (uint32_t) block_size) * block_size;
+    ctx.stream()->parallel_for(
+        sycl::nd_range<1>(global_size, block_size),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            k_add_n_f32_grouped<n_linear, n_strided, bounds_check>(linear, strided, dst, nelements,
+                                                                  ne0_fd, ne1_fd, ne2_fd, nb1, nb2, nb3,
+                                                                  scale, bias, item);
+        });
+}
+
+template <int n_linear, int n_strided>
+static void launch_add_n_f32_grouped(ggml_backend_sycl_context & ctx,
+                                     const std::array<const ggml_tensor *, 9> & tensors,
+                                     float * dst, uint32_t nelements, float scale, float bias) {
+    constexpr int block_size = 256;
+    if (nelements % block_size == 0) {
+        launch_add_n_f32_grouped_impl<n_linear, n_strided, false>(ctx, tensors, dst, nelements, scale, bias);
+    } else {
+        launch_add_n_f32_grouped_impl<n_linear, n_strided, true>(ctx, tensors, dst, nelements, scale, bias);
+    }
+}
+
+template <int n_operands>
+static void launch_add_n_f32_grouped(ggml_backend_sycl_context & ctx,
+                                     const std::array<const ggml_tensor *, 9> & tensors,
+                                     float * dst, uint32_t nelements, float scale, float bias, int n_linear) {
+    if (n_linear == 0) {
+        launch_add_n_f32_grouped<0, n_operands>(ctx, tensors, dst, nelements, scale, bias);
+    } else {
+        GGML_ASSERT(n_linear == 1);
+        launch_add_n_f32_grouped<1, n_operands - 1>(ctx, tensors, dst, nelements, scale, bias);
+    }
+}
+
+template <int begin, int end, size_t n_operands>
+static float add_n_f32_contiguous_sum(const std::array<const float *, n_operands> & src, uint32_t index) {
+    if constexpr (end - begin == 1) {
+        return src[begin][index];
+    } else {
+        constexpr int mid = begin + (end - begin) / 2;
+        return add_n_f32_contiguous_sum<begin, mid>(src, index) +
+               add_n_f32_contiguous_sum<mid, end>(src, index);
+    }
+}
+
+template <int n_operands>
+static void launch_add_n_f32_contiguous(ggml_backend_sycl_context & ctx,
+                                        const std::array<const ggml_tensor *, 9> & tensors,
+                                        float * dst, uint32_t nelements, float scale, float bias) {
+    std::array<const float *, n_operands> src;
+    for (int i = 0; i < n_operands; ++i) {
+        src[i] = (const float *) tensors[i]->data;
+    }
+    constexpr int block_size = 256;
+    const uint32_t global_size = ceil_div(nelements, (uint32_t) block_size) * block_size;
+    ctx.stream()->parallel_for(
+        sycl::nd_range<1>(global_size, block_size),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const uint32_t index = item.get_global_linear_id();
+            if (index >= nelements) {
+                return;
+            }
+            const float sum = add_n_f32_contiguous_sum<0, n_operands>(src, index);
+            dst[index] = sum * scale + bias;
+        });
+}
+
+void ggml_sycl_op_add_n_fused(ggml_backend_sycl_context & ctx, ggml_tensor * const * nodes, int n_nodes,
+                              ggml_tensor * scale_node) {
+    GGML_ASSERT(n_nodes >= 1 && n_nodes <= 8);
+    std::array<const ggml_tensor *, 9> tensors = {};
+    tensors[0] = nodes[0]->src[0];
+    tensors[1] = nodes[0]->src[1];
+    for (int i = 1; i < n_nodes; ++i) {
+        GGML_ASSERT(nodes[i]->src[0] == nodes[i - 1]);
+        tensors[i + 1] = nodes[i]->src[1];
+    }
+
+    for (int i = 0; i <= n_nodes; ++i) {
+        GGML_ASSERT(tensors[i]->type == GGML_TYPE_F32 && tensors[i]->nb[0] == sizeof(float));
+    }
+    ggml_tensor * dst = scale_node != nullptr ? scale_node : nodes[n_nodes - 1];
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+    const int64_t nelements = ggml_nelements(dst);
+    GGML_ASSERT(nelements < ((int64_t) 1 << 31));
+    float scale = 1.0f;
+    float bias = 0.0f;
+    if (scale_node != nullptr) {
+        GGML_ASSERT(scale_node->src[0] == nodes[n_nodes - 1]);
+        memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
+        memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+    }
+
+    bool contiguous = ggml_is_contiguous(dst);
+    for (int i = 0; i <= n_nodes; ++i) {
+        contiguous = contiguous && ggml_is_contiguous(tensors[i]);
+    }
+    if (contiguous) {
+        switch (n_nodes + 1) {
+            case 2: launch_add_n_f32_contiguous<2>(ctx, tensors, (float *) dst->data, nelements, scale, bias); break;
+            case 3: launch_add_n_f32_contiguous<3>(ctx, tensors, (float *) dst->data, nelements, scale, bias); break;
+            case 4: launch_add_n_f32_contiguous<4>(ctx, tensors, (float *) dst->data, nelements, scale, bias); break;
+            case 5: launch_add_n_f32_contiguous<5>(ctx, tensors, (float *) dst->data, nelements, scale, bias); break;
+            case 6: launch_add_n_f32_contiguous<6>(ctx, tensors, (float *) dst->data, nelements, scale, bias); break;
+            case 7: launch_add_n_f32_contiguous<7>(ctx, tensors, (float *) dst->data, nelements, scale, bias); break;
+            case 8: launch_add_n_f32_contiguous<8>(ctx, tensors, (float *) dst->data, nelements, scale, bias); break;
+            case 9: launch_add_n_f32_contiguous<9>(ctx, tensors, (float *) dst->data, nelements, scale, bias); break;
+            default: GGML_ABORT("invalid fused ADD operand count");
+        }
+        return;
+    }
+
+    int n_linear = 0;
+    while (n_linear <= n_nodes && ggml_is_contiguous(tensors[n_linear])) {
+        ++n_linear;
+    }
+    bool grouped = ggml_is_contiguous(dst) && n_linear <= 1;
+    for (int i = n_linear + 1; grouped && i <= n_nodes; ++i) {
+        grouped = ggml_are_same_stride(tensors[n_linear], tensors[i]);
+    }
+    if (grouped) {
+        switch (n_nodes + 1) {
+            case 2: launch_add_n_f32_grouped<2>(ctx, tensors, (float *) dst->data, nelements, scale, bias, n_linear); break;
+            case 3: launch_add_n_f32_grouped<3>(ctx, tensors, (float *) dst->data, nelements, scale, bias, n_linear); break;
+            case 4: launch_add_n_f32_grouped<4>(ctx, tensors, (float *) dst->data, nelements, scale, bias, n_linear); break;
+            case 5: launch_add_n_f32_grouped<5>(ctx, tensors, (float *) dst->data, nelements, scale, bias, n_linear); break;
+            case 6: launch_add_n_f32_grouped<6>(ctx, tensors, (float *) dst->data, nelements, scale, bias, n_linear); break;
+            case 7: launch_add_n_f32_grouped<7>(ctx, tensors, (float *) dst->data, nelements, scale, bias, n_linear); break;
+            case 8: launch_add_n_f32_grouped<8>(ctx, tensors, (float *) dst->data, nelements, scale, bias, n_linear); break;
+            case 9: launch_add_n_f32_grouped<9>(ctx, tensors, (float *) dst->data, nelements, scale, bias, n_linear); break;
+            default: GGML_ABORT("invalid fused ADD operand count");
+        }
+        return;
+    }
+
+    switch (n_nodes + 1) {
+        case 2: launch_add_n_f32_strided<2>(ctx, tensors, dst, nelements, scale, bias); break;
+        case 3: launch_add_n_f32_strided<3>(ctx, tensors, dst, nelements, scale, bias); break;
+        case 4: launch_add_n_f32_strided<4>(ctx, tensors, dst, nelements, scale, bias); break;
+        case 5: launch_add_n_f32_strided<5>(ctx, tensors, dst, nelements, scale, bias); break;
+        case 6: launch_add_n_f32_strided<6>(ctx, tensors, dst, nelements, scale, bias); break;
+        case 7: launch_add_n_f32_strided<7>(ctx, tensors, dst, nelements, scale, bias); break;
+        case 8: launch_add_n_f32_strided<8>(ctx, tensors, dst, nelements, scale, bias); break;
+        case 9: launch_add_n_f32_strided<9>(ctx, tensors, dst, nelements, scale, bias); break;
+        default: GGML_ABORT("invalid fused ADD operand count");
+    }
+}
+
+void ggml_sycl_op_scale_sigmoid_scale_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * input,
+                                             ggml_tensor * dst, float scale_in, float scale_out) {
+    GGML_ASSERT(input->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_are_same_shape(input, dst));
+    GGML_ASSERT(ggml_is_contiguous(input) && ggml_is_contiguous(dst));
+    const int64_t nelements = ggml_nelements(dst);
+    constexpr int block_size = 256;
+    const int64_t global_size = ((nelements + block_size - 1) / block_size) * block_size;
+    const float * input_dd = (const float *) input->data;
+    float *       dst_dd   = (float *) dst->data;
+    ctx.stream()->parallel_for(
+        sycl::nd_range<1>(global_size, block_size),
+        [=](sycl::nd_item<1> item) {
+            const int64_t i = item.get_global_linear_id();
+            if (i < nelements) {
+                const float x = input_dd[i] * scale_in;
+                dst_dd[i] = scale_out / (1.0f + sycl::exp(-x));
+            }
+        });
+}
+
+// -----------------------------------------------------------------------------
+// 1. Vectorized Device Kernels (For ne0 % 4 == 0)
+// -----------------------------------------------------------------------------
+
+template <typename src0_t, typename src1_t, typename src2_t, typename dst_t>
+static void k_repeat_mul_add_vec4(const src0_t * block_out, const src1_t * weight, const src2_t * addend, dst_t * dst,
+        uint32_t ne0_vec, uint32_t ne1, uint32_t ne2, const sycl::nd_item<3> &item_ct1) {
+
+    const uint32_t i0_vec = item_ct1.get_global_id(2);
+    const uint32_t i1     = item_ct1.get_global_id(1);
+    const uint32_t i2     = item_ct1.get_global_id(0);
+
+    if (i0_vec >= ne0_vec || i1 >= ne1 || i2 >= ne2) {
+        return;
+    }
+
+
+    const size_t i_dst_vec = (size_t)(i2 * ne0_vec * ne1 + i1 * ne0_vec + i0_vec);
+    const size_t i_bo_vec  = (size_t)(i2 * ne0_vec + i0_vec);
+    const size_t i_w       = (size_t)(i2 * ne1 + i1);
+
+    using float4 = sycl::vec<float, 4>;
+
+    // Cast pointers to float4 for 16-byte memory transactions
+    const float4* bo_ptr  = reinterpret_cast<const float4*>(block_out);
+    const float4* add_ptr = reinterpret_cast<const float4*>(addend);
+    float4* dst_ptr       = reinterpret_cast<float4*>(dst);
+
+    // weight[i_w] is scalar and invariant across i0, perfect for broadcast
+    float4 bo_vec  = bo_ptr[i_bo_vec];
+    float4 add_vec = add_ptr[i_dst_vec];
+    const float w_scalar = (float) weight[i_w];
+
+    dst_ptr[i_dst_vec] = add_vec + (bo_vec * w_scalar);
+}
+
+template <typename src0_t, typename src1_t, typename src2_t, typename dst_t>
+static void k_repeat_mul_add_unravel_vec4(const src0_t * block_out, const src1_t * weight, const src2_t * addend,
+        dst_t * dst, uint32_t ne0_vec, uint32_t ne1, uint32_t ne2, const sycl::nd_item<3> &item_ct1) {
+
+    const size_t i_vec = item_ct1.get_global_id(2);
+    const uint32_t numel_vec = ne0_vec * ne1 * ne2;
+
+    if (i_vec >= numel_vec) {
+        return;
+    }
+
+    const uint32_t i0_vec = i_vec % ne0_vec;
+    const uint32_t i_rest = i_vec / ne0_vec;
+    const uint32_t i1     = i_rest % ne1;
+    const uint32_t i2     = i_rest / ne1;
+
+    const size_t i_dst_vec = i_vec;
+    const size_t i_bo_vec  = (size_t)(i2 * ne0_vec + i0_vec);
+    const size_t i_w       = (size_t)(i2 * ne1 + i1);
+
+    using float4 = sycl::vec<float, 4>;
+
+    const float4* bo_ptr  = reinterpret_cast<const float4*>(block_out);
+    const float4* add_ptr = reinterpret_cast<const float4*>(addend);
+    float4* dst_ptr       = reinterpret_cast<float4*>(dst);
+
+    float4 bo_vec  = bo_ptr[i_bo_vec];
+    float4 add_vec = add_ptr[i_dst_vec];
+    const float w_scalar = (float) weight[i_w];
+
+    dst_ptr[i_dst_vec] = add_vec + (bo_vec * w_scalar);
+}
+
+// -----------------------------------------------------------------------------
+// 2. Optimized Scalar Fallback Kernels (For ne0 % 4 != 0)
+// -----------------------------------------------------------------------------
+
+template <typename src0_t, typename src1_t, typename src2_t, typename dst_t>
+static void k_repeat_mul_add(const src0_t * block_out, const src1_t * weight, const src2_t * addend, dst_t * dst,
+        uint32_t ne0, uint32_t ne1, uint32_t ne2, const sycl::nd_item<3> &item_ct1) {
+
+    const uint32_t i0 = item_ct1.get_global_id(2);
+    const uint32_t i1 = item_ct1.get_global_id(1);
+    const uint32_t i2 = item_ct1.get_global_id(0);
+
+    if (i0 >= ne0 || i1 >= ne1 || i2 >= ne2) {
+        return;
+    }
+
+    const size_t i_dst = (size_t)(i2 * ne0 * ne1 + i1 * ne0 + i0);
+    const size_t i_bo  = (size_t)(i2 * ne0 + i0);
+    const size_t i_w   = (size_t)(i2 * ne1 + i1);
+
+    dst[i_dst] = addend[i_dst] + (dst_t) ((float) block_out[i_bo] * (float) weight[i_w]);
+}
+
+template <typename src0_t, typename src1_t, typename src2_t, typename dst_t>
+static void k_repeat_mul_add_unravel(const src0_t * block_out, const src1_t * weight, const src2_t * addend,
+        dst_t * dst, int ne0, int ne1, int ne2, const sycl::nd_item<3> &item_ct1) {
+
+    const size_t i = item_ct1.get_global_id(2);
+    const uint32_t numel = (uint32_t)ne0 * ne1 * ne2;
+
+    if (i >= numel) {
+        return;
+    }
+
+    const uint32_t u_i   = (uint32_t)i;
+    const uint32_t u_ne0 = (uint32_t)ne0;
+    const uint32_t u_ne1 = (uint32_t)ne1;
+
+    const uint32_t i0 = u_i % u_ne0;
+    const uint32_t i_rest = u_i / u_ne0;
+    const uint32_t i1 = i_rest % u_ne1;
+    const uint32_t i2 = i_rest / u_ne1;
+
+    const size_t i_dst = i;
+    const size_t i_bo  = (size_t)(i2 * u_ne0 + i0);
+    const size_t i_w   = (size_t)(i2 * u_ne1 + i1);
+
+    dst[i_dst] = addend[i_dst] + (dst_t) ((float) block_out[i_bo] * (float) weight[i_w]);
+}
+
+// -----------------------------------------------------------------------------
+// 3. Host Dispatcher
+// -----------------------------------------------------------------------------
+
+void ggml_sycl_op_repeat_mul_add_fused(ggml_backend_sycl_context & ctx,
+                                       const ggml_sycl_repeat_mul_add_fused & p) {
+    const ggml_tensor * block_out = p.block_out;
+    const ggml_tensor * weight    = p.weight;
+    const ggml_tensor * addend    = p.addend;
+    const ggml_tensor * dst       = p.dst;
+
+    GGML_ASSERT(block_out->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 &&
+                addend->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    dpct::queue_ptr stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    // the kernels run on the device, so resolve the tensor data pointers here
+    const float * block_out_dd = (const float *) block_out->data;
+    const float * weight_dd    = (const float *) weight->data;
+    const float * addend_dd    = (const float *) addend->data;
+    float *       dst_dd       = (float *) dst->data;
+
+    const uint32_t ne0 = (uint32_t)dst->ne[0];
+    const uint32_t ne1 = (uint32_t)dst->ne[1];
+    const uint32_t ne2 = (uint32_t)dst->ne[2];
+
+    // Check if we can safely vectorize
+    const bool can_vec = (ne0 % 4 == 0);
+    const uint32_t ne0_dispatch = can_vec ? (ne0 / 4) : ne0;
+    const int64_t numel_dispatch = (int64_t) ne0_dispatch * ne1 * ne2;
+
+    const size_t block_size = 256;
+    sycl::range<3> block_dims(1, 1, 1);
+    block_dims[2] = std::min<unsigned int>(ne0_dispatch, block_size);
+    block_dims[1] = std::min<unsigned int>(ne1, block_size / (unsigned int) block_dims[2]);
+    block_dims[0] = std::min(std::min<unsigned int>(ne2,
+                            block_size / (unsigned int) block_dims[2] / (unsigned int) block_dims[1]),
+                            64U);
+
+    sycl::range<3> block_nums((ne2 + block_dims[0] - 1) / block_dims[0],
+                              (ne1 + block_dims[1] - 1) / block_dims[1],
+                              (ne0_dispatch + block_dims[2] - 1) / block_dims[2]);
+
+    if (block_nums[0] > 65535) {
+        const size_t num_blocks = (numel_dispatch + block_size - 1) / block_size;
+
+        if (can_vec) {
+            stream->parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, block_size),
+                                  sycl::range<3>(1, 1, block_size)),
+                [=](sycl::nd_item<3> item_ct1) {
+                    k_repeat_mul_add_unravel_vec4<float, float, float, float>(
+                        block_out_dd, weight_dd, addend_dd, dst_dd, ne0_dispatch, ne1, ne2, item_ct1);
+                });
+        } else {
+            stream->parallel_for(
+                sycl::nd_range<3>(sycl::range<3>(1, 1, num_blocks) * sycl::range<3>(1, 1, block_size),
+                                  sycl::range<3>(1, 1, block_size)),
+                [=](sycl::nd_item<3> item_ct1) {
+                    k_repeat_mul_add_unravel<float, float, float, float>(
+                        block_out_dd, weight_dd, addend_dd, dst_dd, ne0_dispatch, ne1, ne2, item_ct1);
+                });
+        }
+    } else {
+        if (can_vec) {
+            stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                 [=](sycl::nd_item<3> item_ct1) {
+                k_repeat_mul_add_vec4<float, float, float, float>(
+                    block_out_dd, weight_dd, addend_dd, dst_dd, ne0_dispatch, ne1, ne2, item_ct1);
+            });
+        } else {
+            stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                                 [=](sycl::nd_item<3> item_ct1) {
+                k_repeat_mul_add<float, float, float, float>(
+                    block_out_dd, weight_dd, addend_dd, dst_dd, ne0_dispatch, ne1, ne2, item_ct1);
+            });
+        }
+    }
+}
