@@ -6035,8 +6035,193 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     return skip;
 }
 
+// match the hyper-connection combine REPEAT(block_out) -> MUL(*, weight) -> ADD(+, residual),
+// the residual mixer of the dsv4 hard connections. The weight chain (scale/sigmoid/scale)
+// is scheduled between the REPEAT and the MUL, so the REPEAT launch is suppressed here and
+// the fused kernel fires once that chain has produced `weight`. Returns whether `repeat`
+// can be elided by reading block_out directly in the MUL's fused kernel.
+static bool ggml_sycl_try_repeat_mul_add_fusion(const ggml_cgraph * cgraph, int node_idx,
+                                                ggml_sycl_repeat_mul_add_fused & fused) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return false;
+    }
+
+    const ggml_tensor * repeat = cgraph->nodes[node_idx];
+    if (repeat->op != GGML_OP_REPEAT || repeat->type != GGML_TYPE_F32 ||
+        !ggml_node_has_n_uses(cgraph, node_idx, 1)) {
+        return false;
+    }
+
+    const ggml_tensor * mul = nullptr;
+    int                 mul_idx = -1;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (n->op == GGML_OP_MUL && (n->src[0] == repeat || n->src[1] == repeat)) {
+            mul     = n;
+            mul_idx = j;
+            break;
+        }
+    }
+    if (mul == nullptr || mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, repeat) ||
+        !ggml_node_has_n_uses(cgraph, mul_idx, 1)) {
+        return false;
+    }
+
+    // the ADD must be the immediate next cgraph node: the fused kernel reads its
+    // addend operand at MUL time, so nothing may be scheduled between MUL and ADD
+    // (the qwen4exp PLE module also builds REPEAT -> MUL -> ADD, but its ADD sits
+    // after the conv subtree, which rejects it here)
+    if (mul_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * add = cgraph->nodes[mul_idx + 1];
+    const int add_idx = mul_idx + 1;
+    if (add->op != GGML_OP_ADD || (add->src[0] != mul && add->src[1] != mul) ||
+        add->type != GGML_TYPE_F32 || !ggml_are_same_shape(add, mul) || add->ne[3] != 1) {
+        return false;
+    }
+
+    const ggml_tensor * block_out = repeat->src[0];
+    const ggml_tensor * weight    = (mul->src[0] == repeat) ? mul->src[1] : mul->src[0];
+    const ggml_tensor * addend    = (add->src[0] == mul)    ? add->src[1] : add->src[0];
+
+    // the fused kernel indexes all three flat, so they must be contiguous F32
+    if (block_out == nullptr || weight == nullptr || addend == nullptr ||
+        block_out->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 || addend->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(block_out) || !ggml_is_contiguous(weight) || !ggml_is_contiguous(addend)) {
+        return false;
+    }
+
+    // fan-out contract: block_out has no stream dim, weight has no column dim
+    if (block_out->ne[1] != 1 || weight->ne[0] != 1 || block_out->ne[3] != 1 || weight->ne[3] != 1 ||
+        repeat->ne[3] != 1 || mul->ne[3] != 1) {
+        return false;
+    }
+    if (block_out->ne[0] != repeat->ne[0] || block_out->ne[2] != repeat->ne[2] ||
+        weight->ne[1] != repeat->ne[1] || weight->ne[2] != repeat->ne[2] ||
+        !ggml_are_same_shape(addend, add)) {
+        return false;
+    }
+
+    fused.active    = true;
+    fused.block_out = block_out;
+    fused.weight    = weight;
+    fused.addend    = addend;
+    fused.dst       = add;
+    fused.mul       = mul;
+    fused.skip      = (unsigned short) (add_idx - mul_idx);
+    // the caller reuses one struct across sites, and this model has REPEAT -> MUL -> ADD
+    // sites with no weight chain. clear the chain fields so such a site cannot inherit
+    // the previous one's
+    fused.weight_scale_in  = nullptr;
+    fused.weight_sigmoid   = nullptr;
+    fused.weight_scale_out = nullptr;
+    fused.scale_in         = 1.0f;
+    fused.scale_out        = 1.0f;
+
+    const ggml_tensor * weight_base = weight;
+    while (weight_base != nullptr && ggml_sycl_is_view_or_noop(weight_base) && weight_base->op != GGML_OP_NONE) {
+        weight_base = weight_base->src[0];
+    }
+    if (weight_base != nullptr && weight_base->op == GGML_OP_SCALE && weight_base->src[0] != nullptr &&
+        weight_base->src[0]->op == GGML_OP_UNARY &&
+        ggml_get_unary_op(weight_base->src[0]) == GGML_UNARY_OP_SIGMOID &&
+        weight_base->src[0]->src[0] != nullptr && weight_base->src[0]->src[0]->op == GGML_OP_SCALE) {
+        const ggml_tensor * scale_out = weight_base;
+        const ggml_tensor * sigmoid   = scale_out->src[0];
+        const ggml_tensor * scale_in  = sigmoid->src[0];
+        const ggml_tensor * input     = scale_in->src[0];
+        float scale_in_value;
+        float scale_in_bias;
+        float scale_out_value;
+        float scale_out_bias;
+        memcpy(&scale_in_value,  (const float *) scale_in->op_params + 0, sizeof(float));
+        memcpy(&scale_in_bias,   (const float *) scale_in->op_params + 1, sizeof(float));
+        memcpy(&scale_out_value, (const float *) scale_out->op_params + 0, sizeof(float));
+        memcpy(&scale_out_bias,  (const float *) scale_out->op_params + 1, sizeof(float));
+
+        int scale_in_idx = -1;
+        int sigmoid_idx = -1;
+        int scale_out_idx = -1;
+        for (int j = node_idx + 1; j < mul_idx; ++j) {
+            scale_in_idx  = cgraph->nodes[j] == scale_in  ? j : scale_in_idx;
+            sigmoid_idx   = cgraph->nodes[j] == sigmoid   ? j : sigmoid_idx;
+            scale_out_idx = cgraph->nodes[j] == scale_out ? j : scale_out_idx;
+        }
+        if (input != nullptr && input->type == GGML_TYPE_F32 && ggml_is_contiguous(input) &&
+            ggml_are_same_shape(input, scale_out) && scale_in_bias == 0.0f && scale_out_bias == 0.0f &&
+            scale_in_idx >= 0 && sigmoid_idx > scale_in_idx && scale_out_idx > sigmoid_idx &&
+            ggml_node_has_n_uses(cgraph, scale_in_idx, 1) && ggml_node_has_n_uses(cgraph, sigmoid_idx, 1) &&
+            ggml_node_has_n_uses(cgraph, scale_out_idx, 1)) {
+            fused.weight_scale_in  = scale_in;
+            fused.weight_sigmoid   = sigmoid;
+            fused.weight_scale_out = scale_out;
+            fused.scale_in         = scale_in_value;
+            fused.scale_out        = scale_out_value;
+        }
+    }
+    return true;
+}
+
+static int ggml_sycl_try_add_n_fusion(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion) {
+        return 0;
+    }
+    constexpr int max_nodes = 8;
+    ggml_tensor * nodes[max_nodes] = {};
+    nodes[0] = cgraph->nodes[node_idx];
+    if (nodes[0]->op != GGML_OP_ADD || nodes[0]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+
+    int n_nodes = 1;
+    while (n_nodes < max_nodes && node_idx + n_nodes < cgraph->n_nodes) {
+        ggml_tensor * next = cgraph->nodes[node_idx + n_nodes];
+        if (next->op != GGML_OP_ADD || next->type != GGML_TYPE_F32 || next->src[0] != nodes[n_nodes - 1] ||
+            !ggml_sycl_can_fuse(cgraph, node_idx + n_nodes - 1, { GGML_OP_ADD, GGML_OP_ADD }, {})) {
+            break;
+        }
+        const ggml_tensor * operand = next->src[1];
+        if (operand->type != GGML_TYPE_F32 || operand->nb[0] != sizeof(float) ||
+            !ggml_are_same_shape(operand, next)) {
+            break;
+        }
+        nodes[n_nodes++] = next;
+    }
+    const ggml_tensor * first0 = nodes[0]->src[0];
+    const ggml_tensor * first1 = nodes[0]->src[1];
+    if (first0->type != GGML_TYPE_F32 || first1->type != GGML_TYPE_F32 ||
+        first0->nb[0] != sizeof(float) || first1->nb[0] != sizeof(float) ||
+        !ggml_are_same_shape(first0, nodes[0]) || !ggml_are_same_shape(first1, nodes[0]) ||
+        ggml_nelements(nodes[0]) >= ((int64_t) 1 << 31)) {
+        return 0;
+    }
+
+    ggml_tensor * scale = nullptr;
+    const int scale_idx = node_idx + n_nodes;
+    if (scale_idx < cgraph->n_nodes) {
+        ggml_tensor * candidate = cgraph->nodes[scale_idx];
+        if (candidate->op == GGML_OP_SCALE && candidate->src[0] == nodes[n_nodes - 1] &&
+            candidate->type == GGML_TYPE_F32 && ggml_are_same_shape(candidate, nodes[n_nodes - 1]) &&
+            ggml_is_contiguous(candidate) &&
+            ggml_can_fuse(cgraph, scale_idx - 1, { GGML_OP_ADD, GGML_OP_SCALE })) {
+            scale = candidate;
+        }
+    }
+    if (n_nodes < 3 && scale == nullptr) {
+        return 0;
+    }
+    ggml_sycl_op_add_n_fused(ctx, nodes, n_nodes, scale);
+    return n_nodes - 1 + (scale != nullptr ? 1 : 0);
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+
+    ggml_sycl_repeat_mul_add_fused pending_repeat_mul_add;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6044,6 +6229,31 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        // fused hyper-connection combine REPEAT -> MUL -> ADD: suppress the REPEAT
+        // materialization here, then run the single combined kernel at the MUL node
+        // once the weight chain (scale/sigmoid/scale) has produced the weight.
+        if (!pending_repeat_mul_add.active && node->op == GGML_OP_REPEAT &&
+            ggml_sycl_try_repeat_mul_add_fusion(cgraph, i, pending_repeat_mul_add)) {
+            continue;
+        }
+        if (pending_repeat_mul_add.active && node == pending_repeat_mul_add.weight_scale_in) {
+            ggml_sycl_op_scale_sigmoid_scale_fused(*sycl_ctx, node->src[0],
+                                                   const_cast<ggml_tensor *>(pending_repeat_mul_add.weight_scale_out),
+                                                   pending_repeat_mul_add.scale_in,
+                                                   pending_repeat_mul_add.scale_out);
+            continue;
+        }
+        if (pending_repeat_mul_add.active &&
+            (node == pending_repeat_mul_add.weight_sigmoid || node == pending_repeat_mul_add.weight_scale_out)) {
+            continue;
+        }
+        if (pending_repeat_mul_add.active && node == pending_repeat_mul_add.mul) {
+            ggml_sycl_op_repeat_mul_add_fused(*sycl_ctx, pending_repeat_mul_add);
+            i += pending_repeat_mul_add.skip;
+            pending_repeat_mul_add.active = false;
             continue;
         }
 
@@ -6081,6 +6291,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_op_rms_norm_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i++;
             continue;
+        }
+        if (node->op == GGML_OP_ADD) {
+            const int add_n_skip = ggml_sycl_try_add_n_fusion(*sycl_ctx, cgraph, i);
+            if (add_n_skip > 0) {
+                i += add_n_skip;
+                continue;
+            }
         }
         if (node->op == GGML_OP_ADD &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_ADD, GGML_OP_ADD }, {})) {
