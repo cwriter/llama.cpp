@@ -518,8 +518,8 @@ static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int64_t k
             stream->submit([&](sycl::handler &cgh) {
                   cgh.parallel_for(
                       sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
-                                            sycl::range<3>(1, 1, 32),
-                                        sycl::range<3>(1, 1, 32)),
+                                            sycl::range<3>(1, 1, iq4_nl_wg_size()),
+                                        sycl::range<3>(1, 1, iq4_nl_wg_size())),
                       [=](sycl::nd_item<3> item_ct1) {
                             dequantize_block_iq4_nl(vx, y, item_ct1);
                       });
