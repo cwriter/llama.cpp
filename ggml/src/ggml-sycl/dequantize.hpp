@@ -1584,6 +1584,15 @@ dequantize_block_iq1_m(const void *__restrict__ vx, dst_t *__restrict__ yy,
 
 }
 
+// qs bytes each work item dequantizes: 1, 2, 4 or 8. drives the store width and, through
+// iq4_nl_wg_size() below, the work group size. tune here.
+static constexpr int IQ4_NL_QS_BYTES_PER_THREAD = 4;
+
+// 8 blocks of QK4_NL per QK_K region, each split into 16/bpt chunks
+static constexpr int iq4_nl_wg_size() {
+    return 8 * ((QK4_NL/2) / IQ4_NL_QS_BYTES_PER_THREAD);
+}
+
 template <typename dst_t>
 __dpct_inline__ static void
 dequantize_block_iq4_nl(const void *__restrict__ vx, dst_t *__restrict__ yy,
@@ -1592,18 +1601,29 @@ dequantize_block_iq4_nl(const void *__restrict__ vx, dst_t *__restrict__ yy,
     const int64_t i = item_ct1.get_group(2);
     const block_iq4_nl * x = (const block_iq4_nl *) vx + i*(QK_K/QK4_NL);
 
+    // each work item takes IQ4_NL_QS_BYTES_PER_THREAD of the block's 16 qs bytes. that
+    // count is also the store width of each half, so it sets the work group size too:
+    // the mapping keeps ib varying fastest, as consecutive blocks are adjacent in memory.
+    constexpr int bpt = IQ4_NL_QS_BYTES_PER_THREAD;
     const int64_t tid = item_ct1.get_local_id(2);
-    const int64_t il = tid/8; // 0...3
-    const int64_t ib = tid%8; // 0...7
-    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
-    const uint8_t  * q4 = x[ib].qs + 4*il;
+    const int64_t il = tid/8;
+    const int64_t ib = tid%8;
+    dst_t * y = yy + i*QK_K + 32*ib + bpt*il;
+    const uint8_t  * q4 = x[ib].qs + bpt*il;
     const float d = (float)x[ib].d;
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        y[j+ 0] = d * kvalues_iq4nl[q4[j] & 0xf];
-        y[j+16] = d * kvalues_iq4nl[q4[j] >>  4];
-    }
 
+    // y is bpt element aligned here, so each half goes out as one vector store instead of
+    // bpt scalar ones. the loads stay scalar: block_iq4_nl is 18 bytes, so qs is not
+    // dword aligned for odd blocks.
+    sycl::vec<dst_t, bpt> lo;
+    sycl::vec<dst_t, bpt> hi;
+#pragma unroll
+    for (int j = 0; j < bpt; ++j) {
+        lo[j] = d * kvalues_iq4nl[q4[j] & 0xf];
+        hi[j] = d * kvalues_iq4nl[q4[j] >>  4];
+    }
+    *(sycl::vec<dst_t, bpt> *) (y +  0) = lo;
+    *(sycl::vec<dst_t, bpt> *) (y + 16) = hi;
 }
 
 
