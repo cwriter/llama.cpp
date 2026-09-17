@@ -4017,8 +4017,6 @@ static void launch_mul_mat_vec_q_reorder_glu_impl(const void * vx, const void * 
                                              const int ncols, const int nrows, const int stride_col_y_bytes,
                                              const int stride_col_dst, const ggml_glu_op glu_op,
                                              dpct::queue_ptr stream) {
-    GGML_ASSERT(ncols % QK_K == 0);
-
     constexpr size_t num_subgroups = WARP_SIZE;
 
     const int            block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups * rows_per_sg);
@@ -4267,6 +4265,28 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
                                          int ncols_dst, int stride_col_y_bytes, int stride_col_dst,
                                          dpct::queue_ptr stream) {
     if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+        return false;
+    }
+
+    if (src0_type == GGML_TYPE_Q8_0) {
+        if (glu_op != GGML_GLU_OP_SWIGLU) {
+            return false;
+        }
+        using vec_dot_q8_0 = reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>;
+        switch (ncols_dst) {
+            case 1:
+                launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 1>(
+                    vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
+                return true;
+            case 2:
+                launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 2>(
+                    vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
+                return true;
+            default:
+                return false;
+        }
+    }
+    if (src0_type != GGML_TYPE_Q4_K && src0_type != GGML_TYPE_Q5_K) {
         return false;
     }
 
