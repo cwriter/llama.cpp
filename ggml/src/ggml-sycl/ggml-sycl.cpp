@@ -6490,12 +6490,33 @@ static bool mul_mat_id_runs_on_device(const ggml_tensor * dst) {
            ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type);
 }
 
-static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
-    if (ggml_sycl_info().device_count > 1) {
-        // A sycl_ex::command_graph object can only be created for a single device
-        GGML_LOG_DEBUG("%s: disabling SYCL graphs due to multiple devices\n", __func__);
+// A sycl_ex::command_graph records for one device, so every tensor the node touches must
+// live on this backend's device. With the model split over several devices the scheduler
+// hands each backend its own cgraph, so those graphs are still recordable one by one.
+// Split buffers are not: they dispatch across all devices from a single node.
+static bool node_is_device_local(ggml_backend_buffer_type_t device_buft, const ggml_tensor * node) {
+    if (node->buffer == nullptr || node->buffer->buft != device_buft) {
         return false;
     }
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const ggml_tensor * src = node->src[j];
+        if (src == nullptr || src->buffer == nullptr) {
+            continue;
+        }
+        if (ggml_backend_buffer_is_sycl_split(src->buffer)) {
+            return false;
+        }
+        // host and other backends' buffers are read through their own copies, not recorded
+        if (ggml_backend_buffer_is_sycl(src->buffer) && src->buffer->buft != device_buft) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgraph * cgraph) {
+    // ggml_backend_sycl_buffer_type() takes a global lock, so resolve it once for the scan
+    const ggml_backend_buffer_type_t device_buft = ggml_backend_sycl_buffer_type(ctx->device);
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6503,6 +6524,12 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
         // skip the nodes that ggml_backend_sycl_graph_compute_impl() does not run
         if (ggml_sycl_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (!node_is_device_local(device_buft, node)) {
+            GGML_LOG_DEBUG("%s: disabling SYCL graphs due to node %s not being device local\n", __func__,
+                           ggml_op_name(node->op));
+            return false;
         }
 
         const ggml_op node_op      = node->op;
