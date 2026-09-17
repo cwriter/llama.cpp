@@ -30,12 +30,19 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
         return false;
     }
 
-    // only q4_K has a fused reorder GEMV so far, and it walks whole super-blocks
-    if (wu->type != GGML_TYPE_Q4_K || wu->ne[0] % QK_K != 0) {
+    // q4_K and q8_0 have a fused reorder GEMV, and each walks whole blocks
+    if (wu->type != GGML_TYPE_Q4_K && wu->type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (wu->type == GGML_TYPE_Q8_0 && glu_op != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    if ((wu->type == GGML_TYPE_Q4_K && wu->ne[0] % QK_K != 0) ||
+        (wu->type == GGML_TYPE_Q8_0 && wu->ne[0] % QK8_0 != 0)) {
         return false;
     }
 
-    // one 2D reorder-layout matrix in, a plain column stride out: no broadcast or padding
+    // one 2D weight matrix in and a plain column stride out: no broadcast or padding
     if (!ggml_is_contiguous(wu) || !ggml_is_contiguous(wg) || !ggml_is_contiguous(act) ||
         !ggml_is_contiguous(glu)) {
         return false;
@@ -52,6 +59,10 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     }
     // mat-vec only: one column per decoded token, up to the batch the reorder kernels cover
     if (act->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+    // the q8_0 reorder GLU kernel is instantiated for one and two columns
+    if (wu->type == GGML_TYPE_Q8_0 && act->ne[1] > 2) {
         return false;
     }
 
