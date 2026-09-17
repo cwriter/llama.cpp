@@ -15,6 +15,23 @@
 
 #include "common.hpp"
 
+struct ggml_sycl_moe_route_order {
+    const uint32_t * expert_offsets;
+    const uint32_t * sorted_routes;
+    int              n_experts;
+};
+
+void ggml_sycl_build_moe_route_order(
+    const int32_t * ids_dev,
+    size_t          ids_token_stride,
+    int             n_experts,
+    int             n_experts_used,
+    int             n_tokens,
+    uint32_t *      expert_counts,
+    uint32_t *      expert_offsets,
+    uint32_t *      expert_cursors,
+    uint32_t *      sorted_routes,
+    dpct::queue_ptr stream);
 
 void ggml_sycl_op_mul_mat_vec_q(
     ggml_backend_sycl_context & ctx,
@@ -30,14 +47,19 @@ bool ggml_sycl_mul_mat_vec_q_id(
     enum ggml_type     src0_type,
     const void *       vx_base,             // start of stacked expert weights
     const void *       vy,                  // pre-quantized src1 (Q8_1)
-    const int32_t *    ids_dev,             // device-side int32, length n_experts_used
+    const int32_t *    ids_dev,
     float *            dst_base,
     int                ncols,
     int                nrows,
     int                n_experts_used,
+    int                n_tokens,
     size_t             expert_weight_stride, // bytes between experts in vx_base
     size_t             dst_row_stride,       // bytes between dst rows
-    size_t             src1_row_stride,      // 0 = shared src1, else per-expert stride in bytes
+    size_t             src1_row_stride,      // 0 = shared src1 within a token
+    size_t             ids_token_stride,
+    size_t             dst_token_stride,
+    size_t             src1_token_stride,
+    const ggml_sycl_moe_route_order * route_order,
     dpct::queue_ptr    stream);
 
 // Reorder (SoA) variant of the fused MoE expert GEMV.
@@ -52,9 +74,14 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
     int                ncols,
     int                nrows,
     int                n_experts_used,
+    int                n_tokens,
     size_t             expert_weight_stride,
     size_t             dst_row_stride,
     size_t             src1_row_stride,
+    size_t             ids_token_stride,
+    size_t             dst_token_stride,
+    size_t             src1_token_stride,
+    const ggml_sycl_moe_route_order * route_order,
     dpct::queue_ptr    stream);
 
 // Fused dense-FFN GEMV: writes glu(gate . y, up . y) instead of the two mat-vec results.
