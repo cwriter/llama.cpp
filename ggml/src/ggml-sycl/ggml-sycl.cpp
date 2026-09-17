@@ -5111,6 +5111,10 @@ static bool ggml_sycl_mul_mat_id_mmvq_shape_ok(
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
+    // Above this the grouped path wins: it gathers rows per expert and issues a dense GEMM,
+    // reusing activations across tokens, which a mat-vec per route cannot. Measured on
+    // 3x Arc Pro B60 at ubatch 1024: taking the device path for a whole prefill ubatch is
+    // 145 t/s against 323 for the grouped fallback.
     if (ne12 > 8) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
