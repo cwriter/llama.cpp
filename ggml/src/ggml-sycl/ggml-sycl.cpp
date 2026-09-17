@@ -131,6 +131,8 @@ static int ggml_sycl_get_env_precision(const char * name, int def) {
     GGML_LOG_WARN("%s: unknown %s=%s, using %s\n", __func__, name, env, ggml_sycl_dynamic_precision_names[def]);
     return def;
 }
+int g_ggml_sycl_moe_reorder = -1;
+int g_ggml_sycl_moe_xmx = 1;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -434,6 +436,8 @@ static void ggml_check_sycl() try {
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
         g_ggml_sycl_dynamic_required_precision =
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_REQUIRED_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_F32);
+        g_ggml_sycl_moe_reorder = ggml_sycl_get_env("GGML_SYCL_MOE_REORDER", -1);
+        g_ggml_sycl_moe_xmx = ggml_sycl_get_env("GGML_SYCL_MOE_XMX", 1);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -549,6 +553,8 @@ static void ggml_check_sycl() try {
                       ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_precision]);
         GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_REQUIRED_PRECISION: %s\n",
                       ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_required_precision]);
+        GGML_LOG_INFO("  GGML_SYCL_MOE_REORDER: %d\n", g_ggml_sycl_moe_reorder);
+        GGML_LOG_INFO("  GGML_SYCL_MOE_XMX: %d\n", g_ggml_sycl_moe_xmx);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -5325,7 +5331,7 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
     }
 }
 
-// Fused MoE TG fast path. Returns false to fall back to the per-expert loop below.
+// Device-side MoE path. Returns false to fall back to the per-expert loop below.
 static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
     const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst)
@@ -5333,13 +5339,13 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const int64_t ne10 = src1->ne[0];
     const int64_t ne11 = src1->ne[1];
     const int64_t ne12 = src1->ne[2];
-    if (ne12 != 1) return false;
+    if (ne12 > 8) return false;
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) return false;
     if (ne10 != src0->ne[0] || ne10 % QK8_1 != 0) return false;
     if (!ggml_is_contiguous(src1)) return false;
 
     const int64_t n_ids_per_group = ids->ne[0];
-    if (ids->ne[1] != 1) return false;
+    if (ids->ne[1] != ne12 || ids->nb[0] != sizeof(int32_t)) return false;
     if (ne11 != 1 && ne11 != n_ids_per_group) return false;
 
     const queue_ptr stream           = ctx.stream();
@@ -5355,35 +5361,62 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
 
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
-        (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+        (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
     if (use_reorder) {
         quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     } else {
         quantize_row_q8_1_sycl<quantize_q8_1>(
-            (const float *) src1->data, src1_ddq, (int) ne10, (int) ne11,
+            (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12),
             src1_padded_cols, stream);
     }
 
     const size_t bytes_per_qrow = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
     const size_t src1_row_stride = (ne11 == 1) ? 0 : bytes_per_qrow;
+    const size_t src1_token_stride = (size_t) ne11 * bytes_per_qrow;
+
+    const int n_experts = (int) src0->ne[2];
+    const int64_t n_routes = ne12 * n_ids_per_group;
+    // building the route order costs a few dispatches, and the serial prefix sum over every
+    // expert is the bulk of it, so only take the ordered path once enough routes share a bucket
+    const bool use_route_order = g_ggml_sycl_moe_reorder > 0 ||
+        (g_ggml_sycl_moe_reorder < 0 && n_routes >= 64);
+    ggml_sycl_pool_alloc<uint32_t> expert_counts(ctx.pool());
+    ggml_sycl_pool_alloc<uint32_t> expert_offsets(ctx.pool());
+    ggml_sycl_pool_alloc<uint32_t> expert_cursors(ctx.pool());
+    ggml_sycl_pool_alloc<uint32_t> sorted_routes(ctx.pool());
+    ggml_sycl_moe_route_order route_order = {};
+    const ggml_sycl_moe_route_order * route_order_ptr = nullptr;
+
+    if (use_route_order) {
+        GGML_ASSERT(n_experts > 0 && n_routes > 0 && n_routes <= UINT32_MAX);
+        expert_counts.alloc(n_experts);
+        expert_offsets.alloc((size_t) n_experts + 1);
+        expert_cursors.alloc(n_experts);
+        sorted_routes.alloc(n_routes);
+        ggml_sycl_build_moe_route_order(
+            (const int32_t *) ids->data, ids->nb[1], n_experts, n_experts_used, (int) ne12,
+            expert_counts.get(), expert_offsets.get(), expert_cursors.get(), sorted_routes.get(), stream);
+        route_order = { expert_offsets.get(), sorted_routes.get(), n_experts };
+        route_order_ptr = &route_order;
+    }
 
     if (use_reorder) {
         return ggml_sycl_mul_mat_vec_q_id_reorder(
             src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
-            (float *) dst->data, (int) ne10, nrows, n_experts_used,
+            (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) ne12,
             /*expert_weight_stride=*/ src0->nb[2],
             /*dst_row_stride=*/ dst->nb[1],
-            src1_row_stride, stream);
+            src1_row_stride, ids->nb[1], dst->nb[2], src1_token_stride, route_order_ptr, stream);
     }
     return ggml_sycl_mul_mat_vec_q_id(
         src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
-        (float *) dst->data, (int) ne10, nrows, n_experts_used,
+        (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) ne12,
         /*expert_weight_stride=*/ src0->nb[2],
         /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, stream);
+        src1_row_stride, ids->nb[1], dst->nb[2], src1_token_stride, route_order_ptr, stream);
 }
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
@@ -5442,10 +5475,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ne12 == 1) {
-        if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
-            return;
-        }
+    if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+        return;
     }
 
     // The per-expert loop below reads the experts in whatever layout they have: reorder MXFP4 here as well, so prompt processing does not depend on a single-token decode having run first.
