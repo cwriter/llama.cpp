@@ -696,6 +696,15 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+#ifndef _WIN32
+// Staging the mmap()ed source through a host buffer works around an mmap() issue on PVC,
+// at the cost of a malloc and a full copy of every weight on the way to the device.
+static bool ggml_sycl_set_tensor_needs_staging(int device) {
+    const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
+    return arch == gpu_arch::intel_gpu_pvc || arch == gpu_arch::intel_gpu_pvc_vg;
+}
+#endif
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -708,15 +717,15 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
 #ifndef _WIN32
-    // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
-    // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
-    char * host_buf = (char *) malloc(size);
-    memcpy(host_buf, data, size);
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
-    free(host_buf);
-#else
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
+    if (ggml_sycl_set_tensor_needs_staging(ctx->device)) {
+        char * host_buf = (char *) malloc(size);
+        memcpy(host_buf, data, size);
+        SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
+        free(host_buf);
+        return;
+    }
 #endif
+    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
