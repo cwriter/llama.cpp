@@ -2819,10 +2819,31 @@ static bool ggml_sycl_moe_q8_xmx_supported(dpct::queue_ptr stream) {
     return false;
 }
 
-template <int experts_used>
+// weight formats the XMX MoE kernel can stage: one f16 scale per 32-value block, int8 quants
+template <typename block_q_t> struct moe_xmx_traits;
+
+template <> struct moe_xmx_traits<block_q8_0> {
+    using block_t = block_q8_0;
+    static constexpr int qk = QK8_0;
+    static __dpct_inline__ int8_t quant(const block_t & b, int k) { return b.qs[k]; }
+    static __dpct_inline__ float  scale(const block_t & b) { return (float) b.d; }
+};
+
+template <> struct moe_xmx_traits<block_iq4_nl> {
+    using block_t = block_iq4_nl;
+    static constexpr int qk = QK4_NL;
+    // qs[j] holds element j in the low nibble and element j+16 in the high nibble
+    static __dpct_inline__ int8_t quant(const block_t & b, int k) {
+        const uint8_t q = b.qs[k & 15];
+        return kvalues_iq4nl[k < 16 ? (q & 0xf) : (q >> 4)];
+    }
+    static __dpct_inline__ float scale(const block_t & b) { return (float) b.d; }
+};
+
+template <typename traits, int experts_used>
 [[sycl::reqd_sub_group_size(WARP_SIZE)]]
-static void mul_mat_vec_q8_0_moe_ordered_xmx(
-    const block_q8_0 * __restrict__ vx_base,
+static void mul_mat_vec_moe_ordered_xmx(
+    const typename traits::block_t * __restrict__ vx_base,
     const void * __restrict__ vy_base,
     float * __restrict__ dst_base,
     const uint32_t * __restrict__ expert_offsets,
@@ -2865,8 +2886,9 @@ static void mul_mat_vec_q8_0_moe_ordered_xmx(
     }
 
     const auto sg = item.get_sub_group();
-    const block_q8_0 * x = (const block_q8_0 *) ((const char *) vx_base + (size_t) expert * expert_weight_stride);
-    const int blocks_per_row = ncols / QK8_0;
+    const typename traits::block_t * x =
+        (const typename traits::block_t *) ((const char *) vx_base + (size_t) expert * expert_weight_stride);
+    const int blocks_per_row = ncols / traits::qk;
     float sums[tile_m] = {};
 
     for (uint32_t route_base = begin; route_base < end; route_base += tile_n) {
@@ -2881,11 +2903,11 @@ static void mul_mat_vec_q8_0_moe_ordered_xmx(
                 const int row_local = index / tile_k;
                 const int k = index - row_local * tile_k;
                 const int row = row_base + row_local;
-                tile_a[index] = row < nrows ? x[row * blocks_per_row + block].qs[k] : 0;
+                tile_a[index] = row < nrows ? traits::quant(x[row * blocks_per_row + block], k) : 0;
             }
             for (int row_local = lane; row_local < tile_m; row_local += WARP_SIZE) {
                 const int row = row_base + row_local;
-                scales_a[row_local] = row < nrows ? (float) x[row * blocks_per_row + block].d : 0.0f;
+                scales_a[row_local] = row < nrows ? traits::scale(x[row * blocks_per_row + block]) : 0.0f;
             }
 
             for (int index = lane; index < tile_k * tile_n; index += WARP_SIZE) {
@@ -2958,8 +2980,8 @@ static void mul_mat_vec_q8_0_moe_ordered_xmx(
     }
 }
 
-template <int experts_used>
-static void launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl(
+template <typename traits, int experts_used>
+static void launch_mul_mat_vec_moe_ordered_xmx_impl(
     const void * vx_base, const void * vy, float * dst_base,
     const ggml_sycl_moe_route_order & route_order,
     const int ncols, const int nrows, const int n_experts_used,
@@ -2983,8 +3005,8 @@ static void launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl(
             sycl::nd_range<2>(sycl::range<2>(n_expert_slices, block_num_y * WARP_SIZE),
                               sycl::range<2>(1, WARP_SIZE)),
             [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q8_0_moe_ordered_xmx<experts_used>(
-                    (const block_q8_0 *) vx_base, vy, dst_base,
+                mul_mat_vec_moe_ordered_xmx<traits, experts_used>(
+                    (const typename traits::block_t *) vx_base, vy, dst_base,
                     route_order.expert_offsets, route_order.sorted_routes,
                     route_order.active_experts, route_order.n_active,
                     ncols, nrows, n_experts_used, expert_weight_stride,
@@ -2994,7 +3016,8 @@ static void launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl(
     });
 }
 
-static void launch_mul_mat_vec_q8_0_moe_ordered_xmx(
+template <typename traits>
+static void launch_mul_mat_vec_moe_ordered_xmx(
     const void * vx_base, const void * vy, float * dst_base,
     const ggml_sycl_moe_route_order & route_order,
     const int ncols, const int nrows, const int n_experts_used,
@@ -3003,22 +3026,22 @@ static void launch_mul_mat_vec_q8_0_moe_ordered_xmx(
     const size_t src1_token_stride, dpct::queue_ptr stream) {
     switch (n_experts_used) {
         case 2:
-            launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl<2>(vx_base, vy, dst_base, route_order, ncols, nrows,
+            launch_mul_mat_vec_moe_ordered_xmx_impl<traits, 2>(vx_base, vy, dst_base, route_order, ncols, nrows,
                 n_experts_used, expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
                 src1_token_stride, stream);
             break;
         case 4:
-            launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl<4>(vx_base, vy, dst_base, route_order, ncols, nrows,
+            launch_mul_mat_vec_moe_ordered_xmx_impl<traits, 4>(vx_base, vy, dst_base, route_order, ncols, nrows,
                 n_experts_used, expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
                 src1_token_stride, stream);
             break;
         case 8:
-            launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl<8>(vx_base, vy, dst_base, route_order, ncols, nrows,
+            launch_mul_mat_vec_moe_ordered_xmx_impl<traits, 8>(vx_base, vy, dst_base, route_order, ncols, nrows,
                 n_experts_used, expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
                 src1_token_stride, stream);
             break;
         default:
-            launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl<0>(vx_base, vy, dst_base, route_order, ncols, nrows,
+            launch_mul_mat_vec_moe_ordered_xmx_impl<traits, 0>(vx_base, vy, dst_base, route_order, ncols, nrows,
                 n_experts_used, expert_weight_stride, dst_row_stride, src1_row_stride, dst_token_stride,
                 src1_token_stride, stream);
             break;
@@ -3393,10 +3416,10 @@ static void launch_mul_mat_vec_q_moe(
     dpct::queue_ptr stream) {
 
     if (route_order != nullptr) {
-        if constexpr (std::is_same_v<block_q_t, block_q8_0>) {
+        if constexpr (std::is_same_v<block_q_t, block_q8_0> || std::is_same_v<block_q_t, block_iq4_nl>) {
             const int average_routes = n_tokens * n_experts_used / route_order->n_experts;
             if (g_ggml_sycl_moe_xmx && average_routes >= 8 && ggml_sycl_moe_q8_xmx_supported(stream)) {
-                launch_mul_mat_vec_q8_0_moe_ordered_xmx(
+                launch_mul_mat_vec_moe_ordered_xmx<moe_xmx_traits<block_q_t>>(
                     vx_base, vy, dst_base, *route_order, ncols, nrows, n_experts_used,
                     expert_weight_stride, dst_row_stride, src1_row_stride,
                     dst_token_stride, src1_token_stride, stream);
