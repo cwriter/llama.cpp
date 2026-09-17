@@ -134,6 +134,7 @@ static int ggml_sycl_get_env_precision(const char * name, int def) {
 }
 int g_ggml_sycl_moe_reorder = -1;
 int g_ggml_sycl_moe_xmx = 1;
+int g_ggml_sycl_fused_gemm = 1;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -444,6 +445,7 @@ static void ggml_check_sycl() try {
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_REQUIRED_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_F32);
         g_ggml_sycl_moe_reorder = ggml_sycl_get_env("GGML_SYCL_MOE_REORDER", -1);
         g_ggml_sycl_moe_xmx = ggml_sycl_get_env("GGML_SYCL_MOE_XMX", 1);
+        g_ggml_sycl_fused_gemm = ggml_sycl_get_env("GGML_SYCL_FUSED_GEMM", 1);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -561,6 +563,7 @@ static void ggml_check_sycl() try {
                       ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_required_precision]);
         GGML_LOG_INFO("  GGML_SYCL_MOE_REORDER: %d\n", g_ggml_sycl_moe_reorder);
         GGML_LOG_INFO("  GGML_SYCL_MOE_XMX: %d\n", g_ggml_sycl_moe_xmx);
+        GGML_LOG_INFO("  GGML_SYCL_FUSED_GEMM: %d\n", g_ggml_sycl_fused_gemm);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -3166,6 +3169,12 @@ inline void ggml_sycl_op_mul_mat_sycl(
         const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
                 ? (const sycl::half *)src1->data + src1_padded_row_size
                                          : src1_as_f16.get();
+
+        // dequantize inside the GEMM instead of writing the f16 weights out and reading them back
+        if (g_ggml_sycl_fused_gemm && src0->type != GGML_TYPE_F16 &&
+            ggml_sycl_fused_dequant_gemm_f16(src0->type, src0_dd_i, src1_ptr, dst_dd_i, row_diff, src1_ncols, ne10, ldc, ctx.pool(), stream)) {
+            return;
+        }
 
         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
         if (src0->type != GGML_TYPE_F16) {
