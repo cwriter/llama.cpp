@@ -19,6 +19,12 @@ struct ggml_sycl_moe_route_order {
     const uint32_t * expert_offsets;
     const uint32_t * sorted_routes;
     int              n_experts;
+    // Experts that actually have routes, compacted, with the count in *n_active. The
+    // mat-vec grid is sized by n_active_max (a host-side bound) instead of by every
+    // expert, so work-groups are not launched for experts no token selected.
+    const uint32_t * active_experts;
+    const uint32_t * n_active;
+    int              n_active_max;
 };
 
 void ggml_sycl_build_moe_route_order(
@@ -31,6 +37,7 @@ void ggml_sycl_build_moe_route_order(
     uint32_t *      expert_offsets,
     uint32_t *      expert_cursors,
     uint32_t *      sorted_routes,
+    uint32_t *      active_experts,
     dpct::queue_ptr stream);
 
 void ggml_sycl_op_mul_mat_vec_q(

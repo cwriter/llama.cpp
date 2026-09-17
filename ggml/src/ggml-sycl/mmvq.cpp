@@ -2718,12 +2718,15 @@ void ggml_sycl_build_moe_route_order(
     uint32_t *      expert_offsets,
     uint32_t *      expert_cursors,
     uint32_t *      sorted_routes,
+    uint32_t *      active_experts,
     dpct::queue_ptr stream) {
     const uint32_t n_routes = (uint32_t) n_tokens * n_experts_used;
     constexpr uint32_t block_size = 256;
     const uint32_t global_size = ((n_routes + block_size - 1) / block_size) * block_size;
 
     stream->memset(expert_counts, 0, (size_t) n_experts * sizeof(uint32_t));
+    // active_experts[n_experts] doubles as the counter for the compaction below
+    stream->memset(active_experts + n_experts, 0, sizeof(uint32_t));
     stream->parallel_for(
         sycl::nd_range<1>(global_size, block_size),
         [=](sycl::nd_item<1> item) {
@@ -2741,15 +2744,37 @@ void ggml_sycl_build_moe_route_order(
             }
         });
 
-    stream->single_task([=]() {
-        uint32_t offset = 0;
-        for (int expert = 0; expert < n_experts; ++expert) {
-            expert_offsets[expert] = offset;
-            expert_cursors[expert] = offset;
-            offset += expert_counts[expert];
-        }
-        expert_offsets[n_experts] = offset;
-    });
+    // Offsets are an exclusive scan of the counts. The group form does this in one
+    // work-group; the previous single_task walked all n_experts serially on one lane,
+    // which is the fixed cost that keeps route ordering off for small route counts.
+    constexpr uint32_t scan_wg = 256;
+    stream->parallel_for(
+        sycl::nd_range<1>(scan_wg, scan_wg),
+        [=](sycl::nd_item<1> item) {
+            const auto     grp      = item.get_group();
+            const uint32_t local_id = (uint32_t) item.get_local_id(0);
+
+            sycl::joint_exclusive_scan(grp, expert_counts, expert_counts + n_experts,
+                                       expert_offsets, 0u, sycl::plus<uint32_t>());
+            sycl::group_barrier(grp);
+
+            for (uint32_t expert = local_id; expert < (uint32_t) n_experts; expert += scan_wg) {
+                expert_cursors[expert] = expert_offsets[expert];
+                // compaction order is arbitrary: each active expert is visited once, and
+                // the mat-vec kernel writes only its own rows
+                if (expert_counts[expert] != 0) {
+                    const uint32_t slot =
+                        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space>(active_experts[n_experts])
+                            .fetch_add(1);
+                    active_experts[slot] = expert;
+                }
+            }
+            if (local_id == 0) {
+                expert_offsets[n_experts] =
+                    expert_offsets[n_experts - 1] + expert_counts[n_experts - 1];
+            }
+        });
 
     stream->parallel_for(
         sycl::nd_range<1>(global_size, block_size),
@@ -2800,6 +2825,8 @@ static void mul_mat_vec_q8_0_moe_ordered_xmx(
     float * __restrict__ dst_base,
     const uint32_t * __restrict__ expert_offsets,
     const uint32_t * __restrict__ sorted_routes,
+    const uint32_t * __restrict__ active_experts,
+    const uint32_t * __restrict__ n_active,
     const int ncols,
     const int nrows,
     const int n_experts_used,
@@ -2948,6 +2975,7 @@ static void launch_mul_mat_vec_q8_0_moe_ordered_xmx_impl(
                 mul_mat_vec_q8_0_moe_ordered_xmx<experts_used>(
                     (const block_q8_0 *) vx_base, vy, dst_base,
                     route_order.expert_offsets, route_order.sorted_routes,
+                    route_order.active_experts, route_order.n_active,
                     ncols, nrows, n_experts_used, expert_weight_stride,
                     dst_row_stride, src1_row_stride, dst_token_stride, src1_token_stride,
                     tile_a, tile_b, scales_a, scales_b, tile_c, item);
@@ -3006,6 +3034,8 @@ static void mul_mat_vec_q_moe_ordered_slm(
     float * __restrict__ dst_base,
     const uint32_t * __restrict__ expert_offsets,
     const uint32_t * __restrict__ sorted_routes,
+    const uint32_t * __restrict__ active_experts,
+    const uint32_t * __restrict__ n_active,
     const int ncols,
     const int nrows,
     const sycl::uint3 rows_fastdiv,      // wg_idx -> (expert, group_y) without an integer divide
@@ -3025,8 +3055,14 @@ static void mul_mat_vec_q_moe_ordered_slm(
 
     const int wg_idx     = item.get_group(0);
     const sycl::uint2 eg = fast_div_modulo((uint32_t) wg_idx, rows_fastdiv);
-    const int expert     = (int) eg.x();
+    const int slot       = (int) eg.x();
     const int group_y    = (int) eg.y();
+    // with a compacted list the grid covers only the routed experts; slots past the
+    // actual count exist because the grid is sized by a host-side bound
+    if (active_experts != nullptr && (uint32_t) slot >= *n_active) {
+        return;
+    }
+    const int expert = active_experts != nullptr ? (int) active_experts[slot] : slot;
     const int sg_id      = item.get_local_id(0) / WARP_SIZE;
     const int lane_id    = item.get_local_id(0) % WARP_SIZE;
     const int row        = group_y * (item.get_local_range(0) / WARP_SIZE) + sg_id;
@@ -3145,7 +3181,10 @@ static void launch_mul_mat_vec_q_moe_ordered_impl(
     const size_t src1_token_stride, dpct::queue_ptr stream) {
     constexpr int rows_per_wg = 8;
     const int block_num_y = (nrows + rows_per_wg - 1) / rows_per_wg;
-    const int total_wgs   = route_order.n_experts * block_num_y;
+    // grid covers the routed experts when the compacted list is available
+    const int n_expert_slices = route_order.active_experts != nullptr ? route_order.n_active_max
+                                                                     : route_order.n_experts;
+    const int total_wgs   = n_expert_slices * block_num_y;
     const sycl::range<1> local_range(rows_per_wg * WARP_SIZE);
     const sycl::range<1> global_range(total_wgs * local_range[0]);
 
@@ -3162,6 +3201,7 @@ static void launch_mul_mat_vec_q_moe_ordered_impl(
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                 mul_mat_vec_q_moe_ordered_slm<qk, qi, block_q_t, vdr, vec_dot_q_sycl, aligned>(
                     vx_base, vy, dst_base, route_order.expert_offsets, route_order.sorted_routes,
+                    route_order.active_experts, route_order.n_active,
                     ncols, nrows, rows_fastdiv, experts_fastdiv, expert_weight_stride,
                     dst_row_stride, src1_row_stride, dst_token_stride, src1_token_stride,
                     get_pointer(tile_x), get_pointer(tile_y), item);
@@ -3551,6 +3591,8 @@ static void mul_mat_vec_q_moe_reorder_ordered(
     float * __restrict__ dst_base,
     const uint32_t * __restrict__ expert_offsets,
     const uint32_t * __restrict__ sorted_routes,
+    const uint32_t * __restrict__ active_experts,
+    const uint32_t * __restrict__ n_active,
     const int ncols,
     const int nrows,
     const sycl::uint3 rows_fastdiv,      // wg_idx -> (expert, group_y) without an integer divide
@@ -3566,8 +3608,14 @@ static void mul_mat_vec_q_moe_reorder_ordered(
 
     const int wg_idx     = item.get_group(0);
     const sycl::uint2 eg = fast_div_modulo((uint32_t) wg_idx, rows_fastdiv);
-    const int expert     = (int) eg.x();
+    const int slot       = (int) eg.x();
     const int group_y    = (int) eg.y();
+    // with a compacted list the grid covers only the routed experts; slots past the
+    // actual count exist because the grid is sized by a host-side bound
+    if (active_experts != nullptr && (uint32_t) slot >= *n_active) {
+        return;
+    }
+    const int expert = active_experts != nullptr ? (int) active_experts[slot] : slot;
     const int sg_id      = item.get_local_id(0) / WARP_SIZE;
     const int row        = group_y * (item.get_local_range(0) / WARP_SIZE) + sg_id;
     const uint32_t begin = expert_offsets[expert];
@@ -3628,7 +3676,10 @@ static void launch_mul_mat_vec_q_moe_reorder_ordered(
     const size_t src1_token_stride, dpct::queue_ptr stream) {
     constexpr int rows_per_wg = 8;
     const int block_num_y = (nrows + rows_per_wg - 1) / rows_per_wg;
-    const int total_wgs   = route_order.n_experts * block_num_y;
+    // grid covers the routed experts when the compacted list is available
+    const int n_expert_slices = route_order.active_experts != nullptr ? route_order.n_active_max
+                                                                     : route_order.n_experts;
+    const int total_wgs   = n_expert_slices * block_num_y;
     const sycl::range<1> local_range(rows_per_wg * WARP_SIZE);
     const sycl::range<1> global_range(total_wgs * local_range[0]);
     const sycl::uint3 rows_fastdiv    = init_fastdiv_values((uint32_t) block_num_y);
@@ -3639,6 +3690,7 @@ static void launch_mul_mat_vec_q_moe_reorder_ordered(
         [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             mul_mat_vec_q_moe_reorder_ordered<reorder_vec_dot_q_sycl>(
                 vx_base, vy, dst_base, route_order.expert_offsets, route_order.sorted_routes,
+                    route_order.active_experts, route_order.n_active,
                 ncols, nrows, rows_fastdiv, experts_fastdiv, expert_weight_stride,
                 dst_row_stride, src1_row_stride, dst_token_stride, src1_token_stride, item);
         });

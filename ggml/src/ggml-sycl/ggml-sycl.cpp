@@ -5095,6 +5095,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     ggml_sycl_pool_alloc<uint32_t> expert_offsets(ctx.pool());
     ggml_sycl_pool_alloc<uint32_t> expert_cursors(ctx.pool());
     ggml_sycl_pool_alloc<uint32_t> sorted_routes(ctx.pool());
+    ggml_sycl_pool_alloc<uint32_t> active_experts(ctx.pool());
     ggml_sycl_moe_route_order route_order = {};
     const ggml_sycl_moe_route_order * route_order_ptr = nullptr;
 
@@ -5104,10 +5105,15 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         expert_offsets.alloc((size_t) n_experts + 1);
         expert_cursors.alloc(n_experts);
         sorted_routes.alloc(n_routes);
+        active_experts.alloc((size_t) n_experts + 1);   // last slot is the active count
         ggml_sycl_build_moe_route_order(
             (const int32_t *) ids->data, ids->nb[1], n_experts, n_experts_used, (int) ne12,
-            expert_counts.get(), expert_offsets.get(), expert_cursors.get(), sorted_routes.get(), stream);
-        route_order = { expert_offsets.get(), sorted_routes.get(), n_experts };
+            expert_counts.get(), expert_offsets.get(), expert_cursors.get(), sorted_routes.get(),
+            active_experts.get(), stream);
+        // at most one distinct expert per route, so this bounds the compacted list
+        const int n_active_max = (int) std::min<int64_t>(n_experts, n_routes);
+        route_order = { expert_offsets.get(), sorted_routes.get(), n_experts,
+                        active_experts.get(), active_experts.get() + n_experts, n_active_max };
         route_order_ptr = &route_order;
     }
 
