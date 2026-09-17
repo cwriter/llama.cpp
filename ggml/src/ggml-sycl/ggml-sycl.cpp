@@ -5112,10 +5112,14 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
 
     const int n_experts = (int) src0->ne[2];
     const int64_t n_routes = ne12 * n_ids_per_group;
-    // building the route order costs a few dispatches, and the serial prefix sum over every
-    // expert is the bulk of it, so only take the ordered path once enough routes share a bucket
+    // The floor exists because building the route order costs a few dispatches. It used to
+    // be 64 because the offsets came from a serial prefix sum over every expert; that is a
+    // group scan now, so the build is much cheaper and the sorted order (and the compacted
+    // expert grid that comes with it) pays off at far fewer routes. At one token this is
+    // what lets the ordered path engage at all: a decode step has only n_experts_used routes.
+    constexpr int64_t route_order_min_routes = 8;
     const bool use_route_order = g_ggml_sycl_moe_reorder > 0 ||
-        (g_ggml_sycl_moe_reorder < 0 && n_routes >= 64);
+        (g_ggml_sycl_moe_reorder < 0 && n_routes >= route_order_min_routes);
     ggml_sycl_pool_alloc<uint32_t> expert_counts(ctx.pool());
     ggml_sycl_pool_alloc<uint32_t> expert_offsets(ctx.pool());
     ggml_sycl_pool_alloc<uint32_t> expert_cursors(ctx.pool());
