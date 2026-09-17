@@ -32,16 +32,22 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
         return false;
     }
 
-    // fused GEMVs walk whole QK_K super-blocks: the reorder kernel covers same-type
-    // q4_K, the plain-layout kernel covers q5_K / iq4_xs pairs incl. mixed gate/up types
-    const bool reorder_pair = wu->type == GGML_TYPE_Q4_K && wg->type == GGML_TYPE_Q4_K;
+    // fused GEMVs walk whole blocks: the reorder kernel covers same-type q4_K and q8_0,
+    // the plain-layout kernel covers q5_K / iq4_xs pairs incl. mixed gate/up types
+    const bool reorder_pair = wu->type == wg->type && (wu->type == GGML_TYPE_Q4_K || wu->type == GGML_TYPE_Q8_0);
     const bool plain_pair   = (wu->type == GGML_TYPE_Q5_K || wu->type == GGML_TYPE_IQ4_XS) &&
                             (wg->type == GGML_TYPE_Q5_K || wg->type == GGML_TYPE_IQ4_XS);
-    if ((!reorder_pair && !plain_pair) || wu->ne[0] % QK_K != 0) {
+    if (!reorder_pair && !plain_pair) {
+        return false;
+    }
+    if (wu->type == GGML_TYPE_Q8_0 && glu_op != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    if (wu->ne[0] % (wu->type == GGML_TYPE_Q8_0 ? QK8_0 : QK_K) != 0) {
         return false;
     }
 
-    // one 2D reorder-layout matrix in, a plain column stride out: no broadcast or padding
+    // one 2D weight matrix in and a plain column stride out: no broadcast or padding
     if (!ggml_is_contiguous(wu) || !ggml_is_contiguous(wg) || !ggml_is_contiguous(act) ||
         !ggml_is_contiguous(glu)) {
         return false;
@@ -58,6 +64,10 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     }
     // mat-vec only: one column per decoded token, up to the batch the reorder kernels cover
     if (act->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+    // the q8_0 reorder GLU kernel is instantiated for one and two columns
+    if (wu->type == GGML_TYPE_Q8_0 && act->ne[1] > 2) {
         return false;
     }
 
