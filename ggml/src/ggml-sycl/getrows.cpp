@@ -10,10 +10,22 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 
+#include <type_traits>
+
 #include "ggml-impl.h"
 #include "common.hpp"
 #include "dequantize.hpp"
 #include "getrows.hpp"
+
+// sycl::vec tops out at 16; a 16 wide float vector is one 64 byte cache line per work item
+static constexpr int GET_ROWS_MAX_VEC_WIDTH = 16;
+
+// Vectorising trades work items for wider messages, so only widen while the grid still has
+// enough work items left to fill the device. Measured on 3x Arc Pro B60: 4 is the best of
+// 1, 2, 4, 8, 16, 32, 64 (20.81 t/s; 1 picks width 16 and gives 20.52, 16+ falls back to
+// scalar and gives 20.42).
+static constexpr int GET_ROWS_WORK_GROUPS_PER_CU = 4;
+
 
 
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -104,7 +116,7 @@ static void k_get_rows_f32(
     dst_row[iybs + iqs + y_offset] = (dst_t) v1;
 }
 
-template<typename src0_t, typename dst_t>
+template<typename src0_t, typename dst_t, int vec_width>
 static void k_get_rows_float(
             const src0_t * src0, const int32_t * src1, dst_t * dst,
             int64_t ne00, /*int64_t ne01, int64_t ne02, int64_t ne03,*/
@@ -134,7 +146,20 @@ static void k_get_rows_float(
     dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
     const src0_t * src0_row = (const src0_t *)((const char *)src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
-    dst_row[i00] = src0_row[i00];
+    if constexpr (vec_width > 1) {
+        // one vec_width element message per work item instead of that many scalar ones; the
+        // launcher only picks a width the row length, the row strides and the bases divide
+        const sycl::vec<src0_t, vec_width> in =
+            *(const sycl::vec<src0_t, vec_width> *) (src0_row + vec_width*i00);
+        sycl::vec<dst_t, vec_width> out;
+#pragma unroll
+        for (int j = 0; j < vec_width; ++j) {
+            out[j] = (dst_t) in[j];
+        }
+        *(sycl::vec<dst_t, vec_width> *) (dst_row + vec_width*i00) = out;
+    } else {
+        dst_row[i00] = src0_row[i00];
+    }
 }
 
 template <int qk, int qr, dequantize_kernel_t dq>
@@ -214,8 +239,29 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // a w element message per work item needs the row length, every row stride and both
+    // bases to divide by w. take the widest that fits, down to one element per work item.
+    const auto fits = [&](int w) {
+        return ne00 % w == 0 &&
+            nb1 % (w*sizeof(dst_t)) == 0 && nb2 % (w*sizeof(dst_t)) == 0 && nb3 % (w*sizeof(dst_t)) == 0 &&
+            nb01 % (w*sizeof(src0_t)) == 0 && nb02 % (w*sizeof(src0_t)) == 0 && nb03 % (w*sizeof(src0_t)) == 0 &&
+            ((uintptr_t) src0_dd) % (w*sizeof(src0_t)) == 0 &&
+            ((uintptr_t) dst_dd)  % (w*sizeof(dst_t))  == 0;
+    };
+    const int64_t n_rows    = ne10 * ne11 * ne12;
+    const int64_t min_items = (int64_t) ggml_sycl_info().devices[ctx.device].nsm * 16 *
+                              GET_ROWS_WORK_GROUPS_PER_CU * SYCL_GET_ROWS_BLOCK_SIZE;
+    int width = 1;
+    for (int w : { 16, 8, 4, 2 }) {
+        if (w <= GET_ROWS_MAX_VEC_WIDTH && fits(w) && (ne00 / w) * n_rows >= min_items) {
+            width = w;
+            break;
+        }
+    }
+    const int64_t ne00_dispatch = ne00 / width;
+
     const sycl::range<3> block_dims(1, 1, SYCL_GET_ROWS_BLOCK_SIZE);
-    const int block_num_x = (ne00 + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE;
+    const int block_num_x = (ne00_dispatch + SYCL_GET_ROWS_BLOCK_SIZE - 1) / SYCL_GET_ROWS_BLOCK_SIZE;
     const sycl::range<3> block_nums(ne11 * ne12, ne10, block_num_x);
 
     // strides in elements
@@ -233,12 +279,23 @@ static void get_rows_sycl_float(ggml_backend_sycl_context & ctx, const ggml_tens
         dpct::has_capability_or_fail(stream->get_device(),
                                      {sycl::aspect::fp16});
 
-        stream->parallel_for(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) {
-                k_get_rows_float(src0_dd, src1_dd, dst_dd, ne00, ne12, s1, s2,
-                                 s3, nb01, nb02, nb03, s10, s11, s12, item_ct1);
-            });
+        auto launch = [&](auto width) {
+            stream->parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) {
+                    k_get_rows_float<src0_t, dst_t, decltype(width)::value>(
+                        src0_dd, src1_dd, dst_dd, ne00_dispatch, ne12, s1, s2,
+                        s3, nb01, nb02, nb03, s10, s11, s12, item_ct1);
+                });
+        };
+
+        switch (width) {
+            case 16: launch(std::integral_constant<int, 16>{}); break;
+            case  8: launch(std::integral_constant<int,  8>{}); break;
+            case  4: launch(std::integral_constant<int,  4>{}); break;
+            case  2: launch(std::integral_constant<int,  2>{}); break;
+            default: launch(std::integral_constant<int,  1>{}); break;
+        }
     }
 
     GGML_UNUSED(dst);
