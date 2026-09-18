@@ -320,61 +320,93 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx, const ggml_t
 
 // A cast of an f16 tensor feeding an ADD is the flash-attention mask being promoted so it can
 // be added to f32 scores. The f32 copy is only ever read by that ADD, so read the f16 source
-// directly instead: one launch and one full-size write less. The copy is still allocated -
-// ggml-alloc reserves every node before the backend gets to fuse - so this buys time, not VRAM.
-int ggml_sycl_fuse_cast_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
-    if (!g_ggml_sycl_fuse_cast_add) {
-        return 0;
+// directly instead: one launch and one full-size write less. The cast is also reported to
+// ggml-alloc through the fusion_absorbs callback, so its dst buffer is never reserved.
+//
+// ggml_can_fuse_subgraph cannot express this shape: the reshape between the cast and the ADD
+// is a view, and the nodes do not share one shape. So match the chain by hand.
+static bool ggml_sycl_cast_add_shape(const ggml_cgraph * cgraph, int i, int * span) {
+    if (i + 1 >= cgraph->n_nodes) {
+        return false;
     }
 
     ggml_tensor * cast = cgraph->nodes[i];
     if (cast->op != GGML_OP_CPY || cast->type != GGML_TYPE_F32 || cast->src[0]->type != GGML_TYPE_F16) {
-        return 0;
+        return false;
     }
-
-    // diagnostic: report the real neighbourhood of every f16->f32 cast, so a non-matching
-    // node order is visible instead of silently returning 0
-    static std::atomic<int> diag_left{ getenv("GGML_SYCL_CAST_ADD_DIAG") ? 8 : 0 };
-    if (diag_left.fetch_sub(1) > 0) {
-        fprintf(stderr, "[CASTDIAG] i=%d %s ne=[%ld,%ld] next:", i, cast->name,
-                (long) cast->ne[0], (long) cast->ne[1]);
-        for (int k = 1; k <= 3 && i + k < cgraph->n_nodes; ++k) {
-            ggml_tensor * nx = cgraph->nodes[i + k];
-            fprintf(stderr, " %s(%s)", ggml_op_name(nx->op), nx->name);
-        }
-        fprintf(stderr, "\n");
-    }
-    if (!ggml_is_contiguous(cast) || !ggml_is_contiguous(cast->src[0])) {
-        return 0;
+    if (cast->view_src || !ggml_is_contiguous(cast) || !ggml_is_contiguous(cast->src[0])) {
+        return false;
     }
 
     // the ADD may read a reshape of the cast rather than the cast itself
     int n = 0;
-    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_ADD }, { i + 2 })) {
-        n = 3;
-    } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CPY, GGML_OP_ADD }, { i + 1 })) {
-        n = 2;
+    ggml_tensor * rhs = nullptr;
+    if (cgraph->nodes[i + 1]->op == GGML_OP_RESHAPE) {
+        n   = 3;
+        rhs = cgraph->nodes[i + 1];
+        if (rhs->src[0] != cast || rhs->view_src != cast || !ggml_is_contiguous(rhs)) {
+            return false;
+        }
+        if (ggml_node_get_use_count(cgraph, i + 1) != 1) {
+            return false;
+        }
     } else {
-        return 0;
+        n   = 2;
+        rhs = cast;
+    }
+    if (i + n > cgraph->n_nodes) {
+        return false;
+    }
+
+    // ggml_cast sets src[1] to the node itself, so the graph walk counts one extra use
+    const int32_t self_ref = (cast->src[1] == cast) ? 1 : 0;
+    if (ggml_node_get_use_count(cgraph, i) != 1 + self_ref) {
+        return false;
+    }
+
+    for (int k = 0; k < n - 1; ++k) {
+        ggml_tensor * node = cgraph->nodes[i + k];
+        if (node->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT)) {
+            return false;
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
     }
 
     ggml_tensor * add = cgraph->nodes[i + n - 1];
-    ggml_tensor * acc = add->src[0];
-    ggml_tensor * rhs = add->src[1];
+    if (add->op != GGML_OP_ADD || (add->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
 
     // only the promoted operand may be the cast: the accumulator has to stay f32
-    if (rhs != cgraph->nodes[i + n - 2] || acc == cgraph->nodes[i + n - 2]) {
-        return 0;
+    ggml_tensor * acc = add->src[0];
+    if (add->src[1] != rhs || acc == rhs || acc == cast) {
+        return false;
     }
     if (acc->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || rhs->type != GGML_TYPE_F32) {
-        return 0;
+        return false;
     }
     if (!ggml_is_contiguous(rhs) || ggml_nelements(rhs) != ggml_nelements(cast->src[0])) {
-        return 0;
+        return false;
     }
 
-    // the f16 source with the shape the ADD expects; contiguous on both sides, so recomputing
-    // the strides for the narrower type is enough
+    if (span) {
+        *span = n;
+    }
+    return true;
+}
+
+bool ggml_sycl_can_fuse_cast_add(const ggml_cgraph * cgraph, int i, int * span) {
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_cast_add) {
+        return false;
+    }
+    return ggml_sycl_cast_add_shape(cgraph, i, span);
+}
+
+// the f16 source with the shape the ADD expects; contiguous on both sides, so recomputing
+// the strides for the narrower type is enough
+static ggml_tensor ggml_sycl_cast_add_rhs_f16(const ggml_tensor * cast, const ggml_tensor * rhs) {
     ggml_tensor rhs_f16 = *rhs;
     rhs_f16.type = GGML_TYPE_F16;
     rhs_f16.data = cast->src[0]->data;
@@ -382,14 +414,149 @@ int ggml_sycl_fuse_cast_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
     rhs_f16.nb[1] = rhs_f16.nb[0]*rhs_f16.ne[0];
     rhs_f16.nb[2] = rhs_f16.nb[1]*rhs_f16.ne[1];
     rhs_f16.nb[3] = rhs_f16.nb[2]*rhs_f16.ne[2];
+    return rhs_f16;
+}
 
-    static std::atomic<int> trace_left{ getenv("GGML_SYCL_MV_FUSE_TRACE") || getenv("GGML_SYCL_CAST_ADD_TRACE") ? 3 : 0 };
+int ggml_sycl_fuse_cast_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    int n = 0;
+    if (!ggml_sycl_can_fuse_cast_add(cgraph, i, &n)) {
+        return 0;
+    }
+
+    ggml_tensor * cast = cgraph->nodes[i];
+    ggml_tensor * add  = cgraph->nodes[i + n - 1];
+    ggml_tensor * acc  = add->src[0];
+    ggml_tensor * rhs  = add->src[1];
+
+    ggml_tensor rhs_f16 = ggml_sycl_cast_add_rhs_f16(cast, rhs);
+
+    // GGML_SYCL_CAST_ADD_TRACE gives the number of firings to report
+    static std::atomic<int> trace_left{ getenv("GGML_SYCL_CAST_ADD_TRACE") ? std::max(1, atoi(getenv("GGML_SYCL_CAST_ADD_TRACE"))) :
+                                        getenv("GGML_SYCL_MV_FUSE_TRACE") ? 3 : 0 };
     if (trace_left.fetch_sub(1) > 0) {
-        fprintf(stderr, "[CASTADD] fused span=%d ne=[%ld,%ld,%ld,%ld]\n", n,
-                (long) rhs->ne[0], (long) rhs->ne[1], (long) rhs->ne[2], (long) rhs->ne[3]);
+        fprintf(stderr, "[CASTADD] fused span=%d ne=[%ld,%ld,%ld,%ld] cast_use=%d cast_data=%p rhs_data=%p\n", n,
+                (long) rhs->ne[0], (long) rhs->ne[1], (long) rhs->ne[2], (long) rhs->ne[3],
+                (int) ggml_node_get_use_count(cgraph, i), (void *) cast->data, (void *) rhs->data);
     }
 
     ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_add>>(ctx, acc, &rhs_f16, add);
+    return n - 1;
+}
+
+// A CONT of a permuted tensor that only an ADD reads is a full-size transpose copy whose
+// result is consumed once. The bin_bcast kernel already indexes src0 with nb00, so the ADD
+// can walk the permuted view itself: one launch and one full-size write less. The CONT is
+// also reported through fusion_absorbs, so ggml-alloc never reserves its dst.
+//
+// Shape: CONT, then either the ADD, or the f16 mask cast chain that ggml_sycl_fuse_cast_add
+// matches and then the ADD. The cast chain is matched structurally, so this stays independent
+// of GGML_SYCL_FUSE_CAST_ADD: whoever absorbs the cast, the ADD reads the same f16 bytes.
+bool ggml_sycl_can_fuse_cont_add(const ggml_cgraph * cgraph, int i, int * span, int * cast_span) {
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_cont_add) {
+        return false;
+    }
+    if (i + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * cont = cgraph->nodes[i];
+    if (cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (cont->view_src || !ggml_is_contiguous(cont)) {
+        return false;
+    }
+    if (cont->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT)) {
+        return false;
+    }
+    if ((cont->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1) {
+        return false;
+    }
+
+    // the source the ADD would read instead: same shape, only the strides differ
+    const ggml_tensor * perm = cont->src[0];
+    if (!perm || perm->type != cont->type || !ggml_are_same_shape(perm, cont)) {
+        return false;
+    }
+    if (!ggml_is_permuted(perm) || ggml_is_contiguous(perm)) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(perm->type);
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        if (perm->nb[d] % ts != 0) {
+            return false;
+        }
+    }
+
+    // an optional f16->f32 cast of the other operand sits between the CONT and the ADD
+    int cs = 0;
+    if (ggml_sycl_cast_add_shape(cgraph, i + 1, &cs)) {
+        if (i + 1 + cs > cgraph->n_nodes) {
+            return false;
+        }
+    } else {
+        cs = 1;
+    }
+
+    const int n = 1 + cs;
+    ggml_tensor * add = cgraph->nodes[i + n - 1];
+    if (add->op != GGML_OP_ADD || (add->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    // only the accumulator may be the CONT: src1 drives the broadcast and is indexed modulo
+    if (add->src[0] != cont || add->src[1] == cont) {
+        return false;
+    }
+    if (add->type != GGML_TYPE_F32 || !ggml_are_same_shape(add, cont)) {
+        return false;
+    }
+
+    if (span) {
+        *span = n;
+    }
+    if (cast_span) {
+        *cast_span = (cs > 1) ? cs : 0;
+    }
+    return true;
+}
+
+int ggml_sycl_fuse_cont_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    int n = 0;
+    int cs = 0;
+    if (!ggml_sycl_can_fuse_cont_add(cgraph, i, &n, &cs)) {
+        return 0;
+    }
+
+    ggml_tensor * cont = cgraph->nodes[i];
+    ggml_tensor * add  = cgraph->nodes[i + n - 1];
+    ggml_tensor * rhs  = add->src[1];
+
+    // the permuted view in place of the copy: same ne, the strides of the source
+    ggml_tensor acc = *cont;
+    acc.data = cont->src[0]->data;
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        acc.nb[d] = cont->src[0]->nb[d];
+    }
+
+    ggml_tensor rhs_f16;
+    if (cs > 0) {
+        rhs_f16 = ggml_sycl_cast_add_rhs_f16(cgraph->nodes[i + 1], rhs);
+        rhs     = &rhs_f16;
+    }
+
+    // GGML_SYCL_CONT_ADD_TRACE gives the number of firings to report
+    static std::atomic<int> trace_left{ getenv("GGML_SYCL_CONT_ADD_TRACE") ?
+                                        std::max(1, atoi(getenv("GGML_SYCL_CONT_ADD_TRACE"))) : 0 };
+    if (trace_left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[CONTADD] fused span=%d cast_span=%d ne=[%ld,%ld,%ld,%ld] nb0=%zu cont_data=%p perm_data=%p\n",
+                n, cs, (long) cont->ne[0], (long) cont->ne[1], (long) cont->ne[2], (long) cont->ne[3],
+                acc.nb[0], (void *) cont->data, (void *) acc.data);
+    }
+
+    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_add>>(ctx, &acc, rhs, add);
     return n - 1;
 }
 

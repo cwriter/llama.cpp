@@ -68,9 +68,21 @@ inline bool ggml_sycl_add_kernel_supports(enum ggml_type src0, enum ggml_type sr
     return false;
 }
 
+// True if node i starts an f16->f32 cast that the following ADD can read directly.
+// span, if given, gets the number of nodes in the chain (2 without a reshape, 3 with one).
+bool ggml_sycl_can_fuse_cast_add(const ggml_cgraph * cgraph, int i, int * span);
+
 // Fuses an f16->f32 cast into the ADD that consumes it, reading the f16 source directly.
 // Returns the number of extra nodes consumed, or 0 if the pattern does not match.
 int ggml_sycl_fuse_cast_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i);
+
+// True if node i is a CONT of a permuted tensor that only the following ADD reads.
+// span gets the number of nodes in the chain, cast_span the part an f16 mask cast takes.
+bool ggml_sycl_can_fuse_cont_add(const ggml_cgraph * cgraph, int i, int * span, int * cast_span);
+
+// Fuses that CONT into the ADD, which walks the permuted view instead of a copy.
+// Returns the number of extra nodes consumed, or 0 if the pattern does not match.
+int ggml_sycl_fuse_cont_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i);
 
 #endif //GGML_SYCL_BINBCAST_HPP
 
