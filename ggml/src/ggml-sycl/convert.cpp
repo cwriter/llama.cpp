@@ -177,12 +177,15 @@ static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int
     dpct::has_capability_or_fail(stream->get_device(),
                                     {sycl::aspect::fp16});
 
-    int constexpr WARP_K = WARP_SIZE * QK8_0;
-    const int n_warp = (k + WARP_K - 1) / WARP_K;
+    // one block per work item; a single sub group per work group left the memory pipe
+    // mostly idle, so dispatch several sub groups instead
+    constexpr int wg_size = 256;
+    const int64_t n_blocks = (k + QK8_0 - 1) / QK8_0;
+    const int64_t n_wg     = (n_blocks + wg_size - 1) / wg_size;
     GGML_ASSERT(k % QK8_0 == 0);
-    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_warp) *
-        sycl::range<3>(1, 1, WARP_SIZE),
-        sycl::range<3>(1, 1, WARP_SIZE)),
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_wg) *
+        sycl::range<3>(1, 1, wg_size),
+        sycl::range<3>(1, 1, wg_size)),
         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]]{
             dequantize_block_q8_0_reorder(vx, y, k, item_ct1);
         });

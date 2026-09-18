@@ -68,5 +68,9 @@ inline bool ggml_sycl_add_kernel_supports(enum ggml_type src0, enum ggml_type sr
     return false;
 }
 
+// Fuses an f16->f32 cast into the ADD that consumes it, reading the f16 source directly.
+// Returns the number of extra nodes consumed, or 0 if the pattern does not match.
+int ggml_sycl_fuse_cast_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i);
+
 #endif //GGML_SYCL_BINBCAST_HPP
 
