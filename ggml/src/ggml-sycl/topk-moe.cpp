@@ -1,4 +1,7 @@
+#include <algorithm>
+#include <atomic>
 #include <cfloat>
+#include <cstdlib>
 #include <initializer_list>
 #include <vector>
 
@@ -6,7 +9,9 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "binbcast.hpp"
+#include "getrows.hpp"
 #include "topk-moe.hpp"
+#include "topk-radix.hpp"
 
 // SYCL port of ggml-cuda/topk-moe.cu. The kernel is a translation of the CUDA no-bias, no-PDL
 // path of topk_moe_cuda; the fusion-detection helpers below are ported near-verbatim from
@@ -221,6 +226,137 @@ static void launch_topk_moe(queue_ptr stream, const float * logits, float * weig
                          });
 }
 
+/*
+    Same contract as topk_moe_kernel, but one work-group per row and the selection done by the
+    shared radix select. The iterative argmax costs n_expert_used passes over n_experts/WARP_SIZE
+    registers held by a single sub-group; radix costs four passes over the row by the whole group,
+    so it stops scaling with the expert count and uses far more of the device.
+
+    Softmax and sigmoid are monotonic, so the winning experts are the same on the raw logits;
+    only the weights need the transform. The indices come out in no particular order, which is
+    fine because ids[i] and weights[i] stay paired.
+*/
+// Two deliberate differences from topk_moe_kernel, neither reachable from a healthy graph:
+// NaN logits are ordered by their radix key (a positive NaN sorts above +inf) instead of being
+// sanitized to -FLT_MAX, so a NaN would be selected rather than excluded; and exact ties may pick
+// a different tied expert. Ties carry the same weight, so only the NaN case changes behaviour.
+static void topk_moe_radix_kernel(const float * __restrict__ logits,
+                                  float * __restrict__       weights,
+                                  int32_t * __restrict__     ids,
+                                  const int                  n_experts,
+                                  const int                  n_expert_used,
+                                  const float                clamp_val,
+                                  const float                scale_val,
+                                  const topk_moe_config      config,
+                                  uint32_t * __restrict__    slm,
+                                  float * __restrict__       s_wt,
+                                  const sycl::nd_item<1> &   item_ct1) {
+    const int  row = item_ct1.get_group(0);
+    const int  tid = item_ct1.get_local_id(0);
+    const int  bs  = item_ct1.get_local_range(0);
+    const auto grp = item_ct1.get_group();
+
+    logits  += (size_t) n_experts * row;
+    weights += (size_t) n_expert_used * row;
+    ids     += (size_t) n_experts * row;  // ids row stride is n_experts (matches the argsort tensor)
+
+    top_k_radix_select_f32(logits, ids, n_experts, n_expert_used, slm, item_ct1);
+    // ids is global memory filled by the whole group; the gather below crosses lanes.
+    item_ct1.barrier(sycl::access::fence_space::global_and_local);
+
+    // Without norm the weight is the softmax over every expert, so the full denominator is still
+    // needed. With norm it would cancel, but the clamp on the selected sum does not, so the
+    // arithmetic stays the same as the sub-group kernel either way.
+    float max_all = 0.f;
+    float inv_all = 1.f;
+    if (!config.delayed_softmax && !config.use_sigmoid) {
+        float m = -INFINITY;
+        for (int e = tid; e < n_experts; e += bs) {
+            m = sycl::fmax(m, logits[e]);
+        }
+        m = sycl::reduce_over_group(grp, m, sycl::maximum<float>());
+
+        float sum = 0.f;
+        for (int e = tid; e < n_experts; e += bs) {
+            sum += sycl::exp(logits[e] - m);
+        }
+        sum = sycl::reduce_over_group(grp, sum, sycl::plus<float>());
+
+        max_all = m;
+        inv_all = 1.0f / sum;
+    }
+
+    // s_wt entries are private to the thread that writes them, so no barrier is needed below.
+    for (int i = tid; i < n_expert_used; i += bs) {
+        const float l = logits[ids[i]];
+        s_wt[i] = config.delayed_softmax ? l :
+                  config.use_sigmoid     ? 1.0f / (1.0f + sycl::exp(-l)) :
+                                           sycl::exp(l - max_all) * inv_all;
+    }
+
+    if (config.with_norm) {
+        float sum = 0.f;
+        for (int i = tid; i < n_expert_used; i += bs) {
+            sum += s_wt[i];
+        }
+        sum = sycl::reduce_over_group(grp, sum, sycl::plus<float>());
+
+        const float inv = 1.0f / sycl::fmax(sum, clamp_val);
+        for (int i = tid; i < n_expert_used; i += bs) {
+            s_wt[i] *= inv;
+        }
+    }
+
+    if (config.delayed_softmax) {
+        float m = -INFINITY;
+        for (int i = tid; i < n_expert_used; i += bs) {
+            m = sycl::fmax(m, s_wt[i]);
+        }
+        m = sycl::reduce_over_group(grp, m, sycl::maximum<float>());
+
+        float sum = 0.f;
+        for (int i = tid; i < n_expert_used; i += bs) {
+            const float e = sycl::exp(s_wt[i] - m);
+            s_wt[i]       = e;
+            sum += e;
+        }
+        sum = sycl::reduce_over_group(grp, sum, sycl::plus<float>());
+
+        const float inv = 1.0f / sum;
+        for (int i = tid; i < n_expert_used; i += bs) {
+            s_wt[i] *= inv;
+        }
+    }
+
+    for (int i = tid; i < n_expert_used; i += bs) {
+        weights[i] = s_wt[i] * scale_val;
+    }
+}
+
+// The group must cover the 256 buckets of the radix scan. Past the row width the extra lanes only
+// idle through every sweep, so the group stops there.
+static void launch_topk_moe_radix(ggml_backend_sycl_context & ctx, const float * logits, float * weights,
+                                  int32_t * ids, int n_rows, int n_experts, int n_expert_used, float clamp_val,
+                                  float scale_val, const topk_moe_config & config) {
+    const int max_wg     = ggml_sycl_info().max_work_group_sizes[ctx.device];
+    const int block_size = std::min(max_wg, std::max(SYCL_TOP_K_RADIX_BUCKETS, n_experts));
+    GGML_ASSERT(block_size >= SYCL_TOP_K_RADIX_BUCKETS);
+
+    const sycl::range<1> block_dims(block_size);
+    const sycl::range<1> block_nums(n_rows);
+
+    ctx.stream()->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<uint32_t, 1> slm(sycl::range<1>(SYCL_TOP_K_RADIX_SLM_WORDS), cgh);
+        sycl::local_accessor<float, 1>    s_wt(sycl::range<1>(n_expert_used), cgh);
+
+        cgh.parallel_for(sycl::nd_range<1>(block_nums * block_dims, block_dims), [=](sycl::nd_item<1> item_ct1) {
+            topk_moe_radix_kernel(logits, weights, ids, n_experts, n_expert_used, clamp_val, scale_val, config,
+                                  slm.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                  s_wt.get_multi_ptr<sycl::access::decorated::no>().get(), item_ct1);
+        });
+    });
+}
+
 static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
                                   const ggml_tensor *             logits,
                                   ggml_tensor *                   weights,
@@ -253,6 +389,20 @@ static void ggml_sycl_op_topk_moe(ggml_backend_sycl_context &     ctx,
 
     queue_ptr stream = ctx.stream();
     ggml_sycl_set_device(ctx.device);
+
+    // Below 256 experts the group would be wider than the row and the iterative argmax scans at
+    // most 16 registers per lane, so the radix path only pays for itself at the top of the range.
+    if (g_ggml_sycl_topk_moe_radix && n_experts >= SYCL_TOP_K_RADIX_BUCKETS) {
+        static std::atomic<int> tm_trace_left{ getenv("GGML_SYCL_TM_TRACE") ? 6 : 0 };
+        if (tm_trace_left.fetch_sub(1) > 0) {
+            fprintf(stderr, "[TM] radix fired n_experts=%d n_expert_used=%d n_rows=%d sigmoid=%d norm=%d delayed=%d\n",
+                    n_experts, n_expert_used, n_rows, (int) config.use_sigmoid, (int) config.with_norm,
+                    (int) config.delayed_softmax);
+        }
+        launch_topk_moe_radix(ctx, logits_d, weights_d, ids_d, n_rows, n_experts, n_expert_used, clamp_val, scale_val,
+                              config);
+        return;
+    }
 
     switch (n_experts) {
         case 1:
@@ -450,7 +600,8 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx, 
 
         args.norm = true;
         for (const ggml_op op : norm_ops) {
-            if (nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+            // the tail is optional, so a graph that simply ends here is a match without it
+            if (node_idx < n_nodes && nodes[node_idx]->op == op && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
                 node_idx++;
             } else {
                 args.norm = false;
@@ -459,21 +610,22 @@ static bool ggml_sycl_topk_moe_fusion(const ggml_cgraph * cgraph, int node_idx, 
         }
 
         // DIV <- CLAMP, RESHAPE
-        if (nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_DIV || nodes[node_idx]->src[1] != nodes[node_idx - 1] ||
             nodes[node_idx]->src[0] != nodes[node_idx - 3]) {
             args.norm = false;
             return true;
         }
         node_idx++;
 
-        if (nodes[node_idx]->op != GGML_OP_RESHAPE || nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
+        if (node_idx >= n_nodes || nodes[node_idx]->op != GGML_OP_RESHAPE ||
+            nodes[node_idx]->src[0] != nodes[node_idx - 1]) {
             args.norm = false;
             return true;
         }
         node_idx++;
     }
 
-    if (nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
+    if (node_idx < n_nodes && nodes[node_idx]->op == GGML_OP_SCALE && nodes[node_idx]->src[0] == nodes[node_idx - 1]) {
         args.scale = true;
     }
 
@@ -543,6 +695,14 @@ static bool ggml_sycl_check_fusion_memory_ranges(const ggml_cgraph * cgraph, con
 int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     if (!g_ggml_sycl_enable_fusion) {
         return 0;
+    }
+
+    if (const int n = ggml_sycl_fuse_qsa_gather(ctx, cgraph, i)) {
+        return n;
+    }
+
+    if (const int n = ggml_sycl_fuse_cont_add(ctx, cgraph, i)) {
+        return n;
     }
 
     if (const int n = ggml_sycl_fuse_cast_add(ctx, cgraph, i)) {
