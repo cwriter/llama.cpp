@@ -105,10 +105,18 @@ int g_ggml_sycl_memtrace_step = 64;
 int g_ggml_sycl_enable_vmm = 1;
 int g_ggml_sycl_enable_fusion = 1;
 int g_ggml_sycl_enable_esimd = 1;
+int g_ggml_sycl_esimd_q8_0 = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_moe_reorder = -1;
 int g_ggml_sycl_moe_xmx = 1;
 int g_ggml_sycl_fused_gemm = 1;
+int g_ggml_sycl_grouped_gemm = 1;
+// Fallback for q8_0 mat-vec when the ESIMD kernel is unavailable or disabled: ESIMD claims
+// q8_0 first, so this only runs otherwise. Bit-identical results, ~5% decode on its own.
+int g_ggml_sycl_mmvq_wide = 1;
+int g_ggml_sycl_fuse_cast_add = 1;
+int g_ggml_sycl_small_gemm = 1;
+int g_ggml_sycl_mv_fuse = 1;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -187,7 +195,15 @@ static ggml_sycl_device_info ggml_sycl_init() {
 #endif
 
         info.max_work_group_sizes[i] = prop.get_max_work_group_size();
-        info.devices[i].max_wg_per_cu = info.max_work_group_sizes[i] / prop.get_max_compute_units();
+        // Work-groups resident per Xe-core. The old formula divided the max work-group SIZE by
+        // the compute-unit COUNT (1024/160 = 6 on BMG), which is not a meaningful quantity and
+        // under-sized every flash-attention grid derived from it. Xe2 has 8 XVEs per Xe-core and
+        // 8 threads per XVE, so a 4-sub-group work-group fits about 16 times.
+        // NOTE: nsm above is still computed with the Xe-HPG ratio (16 EUs/Xe-core) and so reads
+        // half the true Xe-core count on Xe2. It is left alone deliberately: getrows.cpp,
+        // topk-radix.cpp and count-equal.cpp have empirically tuned constants that absorbed that
+        // error, and correcting nsm without re-tuning them would regress those paths.
+        info.devices[i].max_wg_per_cu = ggml_sycl_get_env("GGML_SYCL_MAX_WG_PER_CU", 16);
         info.devices[i].hw_info = get_device_hw_info(&device);
 
         // Only check GPU devices; CPU devices use OpenCL and would otherwise
@@ -367,10 +383,16 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
         g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
+        g_ggml_sycl_esimd_q8_0 = ggml_sycl_get_env("GGML_SYCL_ESIMD_Q8_0", 1);
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_moe_reorder = ggml_sycl_get_env("GGML_SYCL_MOE_REORDER", -1);
         g_ggml_sycl_moe_xmx = ggml_sycl_get_env("GGML_SYCL_MOE_XMX", 1);
         g_ggml_sycl_fused_gemm = ggml_sycl_get_env("GGML_SYCL_FUSED_GEMM", 1);
+        g_ggml_sycl_grouped_gemm = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM", 1);
+        g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
+        g_ggml_sycl_fuse_cast_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CAST_ADD", 1);
+        g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
+        g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -477,6 +499,11 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_MOE_REORDER: %d\n", g_ggml_sycl_moe_reorder);
         GGML_LOG_INFO("  GGML_SYCL_MOE_XMX: %d\n", g_ggml_sycl_moe_xmx);
         GGML_LOG_INFO("  GGML_SYCL_FUSED_GEMM: %d\n", g_ggml_sycl_fused_gemm);
+        GGML_LOG_INFO("  GGML_SYCL_GROUPED_GEMM: %d\n", g_ggml_sycl_grouped_gemm);
+        GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_CAST_ADD: %d\n", g_ggml_sycl_fuse_cast_add);
+        GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
+        GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -491,6 +518,8 @@ static void ggml_check_sycl() try {
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_ESIMD: %d disabled by compile flag\n", g_ggml_sycl_enable_esimd);
 #endif
+
+        GGML_LOG_INFO("  GGML_SYCL_ESIMD_Q8_0: %d\n", g_ggml_sycl_esimd_q8_0);
 
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
 
@@ -3125,6 +3154,11 @@ inline void ggml_sycl_op_mul_mat_sycl(
             else
 #endif
             {
+                // one split-K kernel in place of the library GEMM for the small shapes
+                if (g_ggml_sycl_small_gemm &&
+                    ggml_sycl_small_gemm_f32(src0_ddf_i, src1_ddf1_i, dst_dd_i, row_diff, src1_ncols, ne10, ne00, ldc, stream)) {
+                    return;
+                }
                 const float alpha = 1.0f;
                 const float beta  = 0.0f;
                 SYCL_CHECK(CHECK_TRY_ERROR(oneapi::mkl::blas::column_major::gemm(
@@ -4148,6 +4182,11 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
 
 static bool ggml_sycl_supports_reorder_esimd(enum ggml_type type) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    // q8_0 keeps its own switch: unlike the K-quants it also has a reorder MMVQ kernel,
+    // so the two are worth A/B testing in one binary
+    if (type == GGML_TYPE_Q8_0) {
+        return g_ggml_sycl_esimd_q8_0 != 0;
+    }
     switch (type) {
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -4799,11 +4838,17 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 }
 
 // Lazily reorder supported MoE expert weights once their fused path is used.
+// The only types opt_for_reorder_id() reorders. Shared with the graph compatibility check so
+// the two cannot drift: MUL_MAT_ID has its own, narrower list than MUL_MAT.
+static constexpr bool ggml_sycl_mul_mat_id_reorders_type(enum ggml_type type) {
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+}
+
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
-    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
+    if (!ggml_sycl_mul_mat_id_reorders_type(src0->type)) {
         return;
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
@@ -5136,11 +5181,19 @@ static bool ggml_sycl_mul_mat_id_mmvq_shape_ok(
     return true;
 }
 
-// Device-side MoE path. Returns false to fall back to the per-expert loop below.
+// Device-side MoE path. `nodes` are MUL_MAT_ID nodes that share src[1] and src[2] and have the
+// same weight geometry; more than one of them is computed by a single launch.
+// Returns false to fall back to the per-expert loop below.
 static bool ggml_sycl_mul_mat_id_mmvq_fused(
-    ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
-    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst)
+    ggml_backend_sycl_context & ctx, ggml_tensor * const * nodes, int n_nodes)
 {
+    GGML_ASSERT(n_nodes >= 1 && n_nodes <= GGML_SYCL_MMVQ_MULTI_MAX);
+
+    ggml_tensor *       dst  = nodes[0];
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
     if (!ggml_sycl_mul_mat_id_mmvq_shape_ok(src0, src1, ids, dst)) {
         return false;
     }
@@ -5161,6 +5214,22 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
 
+    // building the route order costs a few dispatches, and the serial prefix sum over every
+    // expert is the bulk of it, so only take the ordered path once enough routes share a bucket
+    const int64_t n_routes_hint = (int64_t) ne12 * n_ids_per_group;
+    const bool    ordered_hint  = g_ggml_sycl_moe_reorder > 0 ||
+        (g_ggml_sycl_moe_reorder < 0 && n_routes_hint >= 64);
+    // only the plain mat-vec grid stacks several weights; decline so the caller runs them singly
+    if (n_nodes > 1 && (use_reorder || ordered_hint)) {
+        return false;
+    }
+    for (int k = 1; k < n_nodes; ++k) {
+        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(nodes[k]->src[0]->extra);
+        if (extra && extra->optimized_feature.reorder) {
+            return false;  // one block layout serves the whole group
+        }
+    }
+
     ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
         (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
     char * src1_ddq = src1_q8_alloc.get();
@@ -5179,11 +5248,8 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     const size_t src1_token_stride = (size_t) ne11 * bytes_per_qrow;
 
     const int n_experts = (int) src0->ne[2];
-    const int64_t n_routes = ne12 * n_ids_per_group;
-    // building the route order costs a few dispatches, and the serial prefix sum over every
-    // expert is the bulk of it, so only take the ordered path once enough routes share a bucket
-    const bool use_route_order = g_ggml_sycl_moe_reorder > 0 ||
-        (g_ggml_sycl_moe_reorder < 0 && n_routes >= 64);
+    const int64_t n_routes = n_routes_hint;
+    const bool use_route_order = ordered_hint;
     ggml_sycl_pool_alloc<uint32_t> expert_counts(ctx.pool());
     ggml_sycl_pool_alloc<uint32_t> expert_offsets(ctx.pool());
     ggml_sycl_pool_alloc<uint32_t> expert_cursors(ctx.pool());
@@ -5219,12 +5285,20 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
             /*dst_row_stride=*/ dst->nb[1],
             src1_row_stride, ids->nb[1], dst->nb[2], src1_token_stride, route_order_ptr, stream);
     }
+
+    ggml_sycl_mmvq_moe_multi mats = {};
+    mats.n_mats = n_nodes;
+    for (int k = 0; k < n_nodes; ++k) {
+        mats.vx_base[k]  = nodes[k]->src[0]->data;
+        mats.dst_base[k] = (float *) nodes[k]->data;
+    }
+
     return ggml_sycl_mul_mat_vec_q_id(
         src0->type, src0->data, src1_ddq, (const int32_t *) ids->data,
         (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) ne12,
         /*expert_weight_stride=*/ src0->nb[2],
         /*dst_row_stride=*/ dst->nb[1],
-        src1_row_stride, ids->nb[1], dst->nb[2], src1_token_stride, route_order_ptr, stream);
+        src1_row_stride, ids->nb[1], dst->nb[2], src1_token_stride, route_order_ptr, &mats, stream);
 }
 
 // counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
@@ -5283,7 +5357,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
-    if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, src0, src1, ids, dst)) {
+    if (ggml_sycl_mul_mat_id_mmvq_fused(ctx, &dst, 1)) {
         return;
     }
 
@@ -5384,7 +5458,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
-        for (int64_t i02 = 0; i02 < n_as; i02++) {
+        // one launch for all experts instead of one GEMM per expert
+        bool grouped = false;
+        if (g_ggml_sycl_grouped_gemm && ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
+            dst->type == GGML_TYPE_F32 && dst->op_params[0] == GGML_PREC_DEFAULT &&
+            nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
+            grouped = ggml_sycl_grouped_dequant_gemm_f16(src0->type, src0_original, nb02,
+                                                         (const float *) src1_contiguous.get(), (float *) dst_contiguous.get(),
+                                                         expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
+                                                         ctx.mmid_tile_schedule_host, ctx.pool(), stream);
+        }
+
+        for (int64_t i02 = 0; i02 < n_as && !grouped; i02++) {
             const int64_t num_src1_rows = expert_row_counts[i02];
 
             if (num_src1_rows == 0) {
@@ -6180,6 +6265,249 @@ static int ggml_sycl_try_add_n_fusion(ggml_backend_sycl_context & ctx, ggml_cgra
     return n_nodes - 1 + (scale != nullptr ? 1 : 0);
 }
 
+// Conservative byte-range test; ggml-alloc reuses buffers, so two nodes can share an address.
+static bool ggml_sycl_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * ab = (const char *) a->data;
+    const char * bb = (const char *) b->data;
+    return ab != nullptr && bb != nullptr && ab < bb + ggml_nbytes(b) && bb < ab + ggml_nbytes(a);
+}
+
+// GGML_SYCL_MV_FUSE_TRACE=N is the line budget of each trace below; unset or 0 means silent.
+static int ggml_sycl_mv_fuse_trace_budget() {
+    const char * env = getenv("GGML_SYCL_MV_FUSE_TRACE");
+    return env ? atoi(env) : 0;
+}
+
+// Proof that a group formed, rather than an assumption that it did.
+static void ggml_sycl_mv_fuse_trace(const char * what, ggml_tensor * const * group, int count, int span) {
+    static std::atomic<int> trace_left{ ggml_sycl_mv_fuse_trace_budget() };
+    if (trace_left.fetch_sub(1) <= 0) {
+        return;
+    }
+
+    char names[320];
+    int  off = 0;
+    for (int k = 0; k < count && off >= 0 && off < (int) sizeof(names); ++k) {
+        off += snprintf(names + off, sizeof(names) - off, "%s%s[rows=%d]", k ? " + " : "",
+                        group[k]->src[0]->name, (int) group[k]->src[0]->ne[1]);
+    }
+    GGML_LOG_INFO("[MV] fused %d %s K=%d cols=%d span=%d nodes : %s\n", count, what,
+                  (int) group[0]->src[1]->ne[0], (int) group[0]->src[1]->ne[1], span, names);
+}
+
+// Why a group did not form: name the next node that reads the same activation, how many
+// launches sit between, and whether moving it up here would be safe. Diagnostic only.
+static void ggml_sycl_mv_fuse_trace_miss(const ggml_cgraph * cgraph, int node_idx) {
+    static std::atomic<int> trace_left{ ggml_sycl_mv_fuse_trace_budget() };
+    if (trace_left.load(std::memory_order_relaxed) <= 0) {
+        return;
+    }
+
+    const ggml_tensor * first = cgraph->nodes[node_idx];
+    const ggml_tensor * act   = first->src[1];
+
+    constexpr int max_between = 48;
+    const ggml_tensor * between[max_between];
+    int                 n_between = 0;
+
+    for (int j = node_idx + 1; j < cgraph->n_nodes && n_between < max_between; ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (nj->op == first->op && nj->src[1] == act && nj->src[0]->type == first->src[0]->type) {
+            // it could move up to node_idx only if nothing in between writes what it reads,
+            // and nothing reads or writes where it would write
+            bool hoistable = true;
+            for (int b = 0; b < n_between && hoistable; ++b) {
+                const ggml_tensor * nb = between[b];
+                hoistable = !ggml_sycl_tensors_overlap(nj, nb);
+                for (int t = 0; t < GGML_MAX_SRC && hoistable; ++t) {
+                    if (nb->src[t]) {
+                        hoistable = !ggml_sycl_tensors_overlap(nj, nb->src[t]);
+                    }
+                    if (nj->src[t] && hoistable) {
+                        hoistable = !ggml_sycl_tensors_overlap(nj->src[t], nb);
+                    }
+                }
+            }
+            if (trace_left.fetch_sub(1) > 0) {
+                GGML_LOG_INFO("[MV] miss %s + %s : %d launches between, hoist %s\n", first->src[0]->name,
+                              nj->src[0]->name, n_between, hoistable ? "safe" : "blocked");
+            }
+            return;
+        }
+        between[n_between++] = nj;
+    }
+}
+
+// Group adjacent mat-vecs that read the same activation: one quantize and one launch serve
+// them all. Returns the number of extra graph nodes consumed, or 0 if it declined.
+static int ggml_sycl_mul_mat_multi_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_mv_fuse || g_ggml_sycl_prioritize_dmmv) {
+        return 0;
+    }
+
+    ggml_tensor *        first = cgraph->nodes[node_idx];
+    const ggml_tensor *  act   = first->src[1];
+    const enum ggml_type wtype = first->src[0]->type;
+
+    if (!ggml_sycl_supports_reorder_mmvq(wtype) || !ggml_sycl_mul_mat_vec_q_multi_reorder_supports_type(wtype)) {
+        return 0;
+    }
+    // for these the unfused path takes the ESIMD dequantize kernel, which is the faster one
+    if (g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(wtype) &&
+        can_use_dequantize_mul_mat_vec(first->src[0], act, first)) {
+        return 0;
+    }
+    if (act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || act->ne[2] != 1 || act->ne[3] != 1 ||
+        act->ne[1] > MMVQ_MAX_BATCH_SIZE || act->ne[0] % (int64_t) ggml_blck_size(wtype) != 0) {
+        return 0;
+    }
+
+    ggml_tensor * group[GGML_SYCL_MMVQ_MULTI_MAX];
+    int           count = 0;
+    int           last  = node_idx;
+
+    for (int j = node_idx; j < cgraph->n_nodes && count < GGML_SYCL_MMVQ_MULTI_MAX; ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;  // not a launch; cannot break a run of siblings
+        }
+        if (nj->op != GGML_OP_MUL_MAT || nj->src[1] != act) {
+            break;
+        }
+        const ggml_tensor * w = nj->src[0];
+        // the fused launch writes nj->data directly, so split weights are out
+        if (w->type != wtype || ggml_backend_buffer_is_sycl_split(w->buffer) || !ggml_is_contiguous(w) ||
+            w->ne[0] != act->ne[0] || w->ne[2] != 1 || w->ne[3] != 1) {
+            break;
+        }
+        if (nj->type != GGML_TYPE_F32 || !ggml_is_contiguous(nj) || nj->ne[0] != w->ne[1] ||
+            nj->ne[1] != act->ne[1] || nj->ne[2] != 1 || nj->ne[3] != 1) {
+            break;
+        }
+        bool indep = true;
+        for (int k = 0; k < count && indep; ++k) {
+            indep = !ggml_sycl_tensors_overlap(nj, group[k]);
+        }
+        if (!indep) {
+            break;  // the group writes its destinations concurrently
+        }
+        group[count++] = nj;
+        last           = j;
+    }
+
+    if (count < 2) {
+        ggml_sycl_mv_fuse_trace_miss(cgraph, node_idx);
+        return 0;
+    }
+
+    // install the reorder (SoA) layout the fused kernel needs, as the unfused mmvq path would
+    for (int k = 0; k < count; ++k) {
+        opt_for_reorder(&ctx, group[k]->src[0], act, group[k], mul_mat_algo::MMVQ);
+        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(group[k]->src[0]->extra);
+        if (!extra || !extra->optimized_feature.reorder) {
+            return 0;
+        }
+    }
+
+    scope_op_debug_print scope_dbg_print(__func__, first, /*num_src=*/2, " : fused mat-vec group");
+
+    ggml_sycl_mmvq_multi mats = {};
+    mats.n_mats              = count;
+    for (int k = 0; k < count; ++k) {
+        mats.vx[k]             = group[k]->src[0]->data;
+        mats.dst[k]            = (float *) group[k]->data;
+        mats.nrows[k]          = (int) group[k]->src[0]->ne[1];
+        mats.row_begin[k]      = mats.nrows_total;
+        mats.stride_col_dst[k] = (int) group[k]->ne[0];
+        mats.nrows_total      += mats.nrows[k];
+    }
+
+    const int64_t   ne00             = act->ne[0];
+    const int64_t   ne11             = act->ne[1];
+    const queue_ptr stream           = ctx.stream();
+    const int       src1_padded_cols = GGML_PAD((int) ne00, MATRIX_ROW_PADDING);
+
+    // one activation, quantized once and fully consumed into src1_ddq before the GEMV on this
+    // in-order queue, so a destination aliasing the dead activation needs no range check
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(ctx.pool(),
+                                             (size_t) ne11 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char *                     src1_ddq = src1_q8_alloc.get();
+
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>((const float *) act->data, src1_ddq, (int) ne00, (int) ne11,
+                                                          src1_padded_cols, stream);
+
+    if (!ggml_sycl_mul_mat_vec_q_multi_reorder(wtype, mats, src1_ddq, (int) ne00, (int) ne11,
+                                               src1_padded_cols * (int) sizeof(block_q8_1) / QK8_1, stream)) {
+        return 0;
+    }
+
+    ggml_sycl_mv_fuse_trace("mul_mat", group, count, last - node_idx + 1);
+    return last - node_idx;
+}
+
+// MUL_MAT_ID counterpart: adjacent expert mat-vecs that share the activation and the id table.
+static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph,
+                                                 int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_mv_fuse) {
+        return 0;
+    }
+
+    ggml_tensor *       first = cgraph->nodes[node_idx];
+    const ggml_tensor * act   = first->src[1];
+    const ggml_tensor * ids   = first->src[2];
+    const ggml_tensor * w0    = first->src[0];
+
+    if (!ggml_sycl_mul_mat_vec_q_id_supports_type(w0->type)) {
+        return 0;
+    }
+
+    ggml_tensor * group[GGML_SYCL_MMVQ_MULTI_MAX];
+    int           count = 0;
+    int           last  = node_idx;
+
+    for (int j = node_idx; j < cgraph->n_nodes && count < GGML_SYCL_MMVQ_MULTI_MAX; ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;  // not a launch; cannot break a run of siblings
+        }
+        if (nj->op != GGML_OP_MUL_MAT_ID || nj->src[1] != act || nj->src[2] != ids) {
+            break;
+        }
+        // one grid, one set of block offsets and one set of destination strides for the group
+        const ggml_tensor * w = nj->src[0];
+        if (w->type != w0->type || !ggml_are_same_shape(w, w0) || !ggml_are_same_stride(w, w0) ||
+            nj->type != first->type || !ggml_are_same_shape(nj, first) || !ggml_are_same_stride(nj, first)) {
+            break;
+        }
+        bool indep = true;
+        for (int k = 0; k < count && indep; ++k) {
+            indep = !ggml_sycl_tensors_overlap(nj, group[k]);
+        }
+        if (!indep) {
+            break;  // the group writes its destinations concurrently
+        }
+        group[count++] = nj;
+        last           = j;
+    }
+
+    if (count < 2) {
+        ggml_sycl_mv_fuse_trace_miss(cgraph, node_idx);
+        return 0;
+    }
+
+    scope_op_debug_print scope_dbg_print(__func__, first, /*num_src=*/3, " : fused mat-vec group");
+
+    if (!ggml_sycl_mul_mat_id_mmvq_fused(ctx, group, count)) {
+        return 0;
+    }
+
+    ggml_sycl_mv_fuse_trace("mul_mat_id", group, count, last - node_idx + 1);
+    return last - node_idx;
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -6273,6 +6601,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
             i += 2;
             continue;
+        }
+
+        // after the GLU fusion above: that one also absorbs the GLU, so it wins when both match
+        if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+            const int mv_skip = node->op == GGML_OP_MUL_MAT
+                                    ? ggml_sycl_mul_mat_multi_mmvq_fused(*sycl_ctx, cgraph, i)
+                                    : ggml_sycl_mul_mat_id_multi_mmvq_fused(*sycl_ctx, cgraph, i);
+            if (mv_skip > 0) {
+                i += mv_skip;
+                continue;
+            }
         }
 
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
@@ -6396,7 +6735,10 @@ static bool mul_mat_id_runs_on_device(const ggml_tensor * dst) {
     if (!ggml_sycl_mul_mat_vec_q_id_supports_type(src0->type)) {
         return false;
     }
-    return !ggml_sycl_supports_reorder_mmvq(src0->type) ||
+    // only a type opt_for_reorder_id() actually reorders can end up on the reorder variant,
+    // which covers fewer types than the plain one. ggml_sycl_supports_reorder_mmvq() is the
+    // MUL_MAT list and is wider, so it is the wrong question to ask here.
+    return !ggml_sycl_mul_mat_id_reorders_type(src0->type) ||
            ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(src0->type);
 }
 
@@ -6448,13 +6790,6 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
         switch (node_op) {
             default:
                 break;
-            case GGML_OP_CONCAT:
-                // ggml_sycl_op_concat() does a blocking host wait after memcpy operations,
-                // but wait() can't be called on the events returned by a queue recording
-                // to a graph.
-                GGML_LOG_DEBUG("%s: disabling SYCL graphs due to unsupported node type %s\n", __func__,
-                               ggml_op_name(node_op));
-                return false;
             case GGML_OP_MUL_MAT_ID:
                 // the fallback path of ggml_sycl_mul_mat_id() does a blocking host wait on the
                 // sycl queue after submitting a memcpy operation, but wait() can't be called on
