@@ -1,12 +1,14 @@
 #include "binbcast.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
 #include "ggml.h"
+#include "ggml-impl.h"
 
 template<float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename dst_t>
 static void k_bin_bcast(const src0_t * src0, const src1_t * src1, dst_t * dst,
@@ -274,6 +276,13 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx, const ggml_t
              ne02, ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13,
              nb0, nb1, nb2, nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_permuted(src0), ggml_is_permuted(src1),
              main_stream);
+    } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
+        // f32 accumulator plus an f16 operand: lets a caller add a flash-attention mask
+        // (f16 by requirement) to f32 scores without materializing an f32 copy of it
+        op()((const float *) src0->data, (const sycl::half *) src1->data, (float *) dst->data, ne00, ne01, ne02, ne03,
+             ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1, nb2,
+             nb3, ggml_is_contiguous(src0), ggml_is_contiguous(src1), ggml_is_permuted(src0), ggml_is_permuted(src1),
+             main_stream);
     } else if (src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
         op()((const sycl::half *) src0->data, (const float *) src1->data, (sycl::half *) dst->data, ne00, ne01, ne02,
              ne03, ne10, ne11, ne12, ne13, ne0, ne1, ne2, ne3, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13, nb0, nb1,
@@ -306,6 +315,82 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx, const ggml_t
                 ggml_type_name(src0->type), ggml_type_name(src1->type));
         GGML_ABORT("fatal error");
     }
+}
+
+
+// A cast of an f16 tensor feeding an ADD is the flash-attention mask being promoted so it can
+// be added to f32 scores. The f32 copy is only ever read by that ADD, so read the f16 source
+// directly instead: one launch and one full-size write less. The copy is still allocated -
+// ggml-alloc reserves every node before the backend gets to fuse - so this buys time, not VRAM.
+int ggml_sycl_fuse_cast_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!g_ggml_sycl_fuse_cast_add) {
+        return 0;
+    }
+
+    ggml_tensor * cast = cgraph->nodes[i];
+    if (cast->op != GGML_OP_CPY || cast->type != GGML_TYPE_F32 || cast->src[0]->type != GGML_TYPE_F16) {
+        return 0;
+    }
+
+    // diagnostic: report the real neighbourhood of every f16->f32 cast, so a non-matching
+    // node order is visible instead of silently returning 0
+    static std::atomic<int> diag_left{ getenv("GGML_SYCL_CAST_ADD_DIAG") ? 8 : 0 };
+    if (diag_left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[CASTDIAG] i=%d %s ne=[%ld,%ld] next:", i, cast->name,
+                (long) cast->ne[0], (long) cast->ne[1]);
+        for (int k = 1; k <= 3 && i + k < cgraph->n_nodes; ++k) {
+            ggml_tensor * nx = cgraph->nodes[i + k];
+            fprintf(stderr, " %s(%s)", ggml_op_name(nx->op), nx->name);
+        }
+        fprintf(stderr, "\n");
+    }
+    if (!ggml_is_contiguous(cast) || !ggml_is_contiguous(cast->src[0])) {
+        return 0;
+    }
+
+    // the ADD may read a reshape of the cast rather than the cast itself
+    int n = 0;
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CPY, GGML_OP_RESHAPE, GGML_OP_ADD }, { i + 2 })) {
+        n = 3;
+    } else if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_CPY, GGML_OP_ADD }, { i + 1 })) {
+        n = 2;
+    } else {
+        return 0;
+    }
+
+    ggml_tensor * add = cgraph->nodes[i + n - 1];
+    ggml_tensor * acc = add->src[0];
+    ggml_tensor * rhs = add->src[1];
+
+    // only the promoted operand may be the cast: the accumulator has to stay f32
+    if (rhs != cgraph->nodes[i + n - 2] || acc == cgraph->nodes[i + n - 2]) {
+        return 0;
+    }
+    if (acc->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32 || rhs->type != GGML_TYPE_F32) {
+        return 0;
+    }
+    if (!ggml_is_contiguous(rhs) || ggml_nelements(rhs) != ggml_nelements(cast->src[0])) {
+        return 0;
+    }
+
+    // the f16 source with the shape the ADD expects; contiguous on both sides, so recomputing
+    // the strides for the narrower type is enough
+    ggml_tensor rhs_f16 = *rhs;
+    rhs_f16.type = GGML_TYPE_F16;
+    rhs_f16.data = cast->src[0]->data;
+    rhs_f16.nb[0] = ggml_type_size(GGML_TYPE_F16);
+    rhs_f16.nb[1] = rhs_f16.nb[0]*rhs_f16.ne[0];
+    rhs_f16.nb[2] = rhs_f16.nb[1]*rhs_f16.ne[1];
+    rhs_f16.nb[3] = rhs_f16.nb[2]*rhs_f16.ne[2];
+
+    static std::atomic<int> trace_left{ getenv("GGML_SYCL_MV_FUSE_TRACE") || getenv("GGML_SYCL_CAST_ADD_TRACE") ? 3 : 0 };
+    if (trace_left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[CASTADD] fused span=%d ne=[%ld,%ld,%ld,%ld]\n", n,
+                (long) rhs->ne[0], (long) rhs->ne[1], (long) rhs->ne[2], (long) rhs->ne[3]);
+    }
+
+    ggml_sycl_op_bin_bcast<bin_bcast_sycl<op_add>>(ctx, acc, &rhs_f16, add);
+    return n - 1;
 }
 
 inline void ggml_sycl_op_add(ggml_backend_sycl_context & ctx, ggml_tensor *dst) {

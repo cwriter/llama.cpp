@@ -415,6 +415,40 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0> {
     };
 };
 
+// Same dot product as reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>, but issuing one 16-byte load
+// per operand instead of eight 2-byte loads (get_int_from_int8 splits every dword) plus four
+// 4-byte ones. A lane's vdr_mmvq dwords are contiguous and q8_0's reorder layout places them
+// at ibx*32 + iqs*4, so the base is 16-byte aligned and the sub-group issues one coalesced
+// message per 256-byte run rather than gathering at a 16-byte stride.
+struct reorder_vec_dot_q8_0_wide {
+    static constexpr ggml_type gtype = GGML_TYPE_Q8_0;
+
+    using q8_0_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_Q8_0>;
+    using q8_0_traits = typename q8_0_block::traits;
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+        static_assert(q8_0_traits::vdr_mmvq == 4, "the wide load moves exactly four dwords");
+
+        const uint8_t * base = static_cast<const uint8_t *>(vbq);
+        const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
+        const ggml_half d    = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
+
+        const sycl::int4 v = *reinterpret_cast<const sycl::int4 *>(qs + sizeof(int) * iqs);
+        const sycl::int4 u = *reinterpret_cast<const sycl::int4 *>(q8_1_quant_ptr + sizeof(int) * iqs);
+
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sumi = dpct::dp4a(v[i], u[i], sumi);
+        }
+
+        const sycl::half2 ds_values = *q8_1_ds;
+        return static_cast<float>(d) * static_cast<float>(ds_values[0]) * sumi;
+    }
+};
+
 template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
     static constexpr ggml_type gtype = GGML_TYPE_Q8_0;
 
