@@ -153,6 +153,11 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) how many nodes starting at node_idx this backend fuses away without ever writing
+        // their dst, so that ggml-alloc can skip reserving them. must be exact and must not depend on
+        // mutable state: a node reported here is guaranteed to have data == NULL at compute time
+        int (*fusion_absorbs)(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int node_idx);
     };
 
     struct ggml_backend {

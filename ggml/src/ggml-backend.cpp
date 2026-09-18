@@ -804,6 +804,8 @@ struct ggml_backend_sched {
     int * prev_node_backend_ids; // [graph_size]
     int * prev_leaf_backend_ids; // [graph_size]
 
+    bool * fusion_absorbed; // [nodes_size], nodes the backends fuse away
+
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
 
@@ -1059,6 +1061,57 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
+    }
+}
+
+// ask each backend which nodes it fuses away, and hand the answer to ggml-alloc so that those
+// dst buffers are never reserved. the splits are views of the user graph, which is where the use
+// counts live, while ggml-alloc works on sched->graph - so map the answer over by tensor
+static void ggml_backend_sched_build_fusion_plan(ggml_backend_sched_t sched) {
+    // an eval callback cuts each split into single nodes, which breaks every multi-node fusion.
+    // the absorbed nodes would then run for real and write to a dst that was never reserved
+    if (sched->callback_eval) {
+        ggml_gallocr_set_fusion_plan(sched->galloc, NULL, 0);
+        return;
+    }
+
+    struct ggml_cgraph * graph_copy = &sched->graph;
+
+    std::vector<ggml_tensor *> absorbed;
+
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        ggml_backend_t backend = sched->backends[split->backend_id];
+        if (backend->iface.fusion_absorbs == NULL) {
+            continue;
+        }
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            const int n = backend->iface.fusion_absorbs(backend, &split->graph, j);
+            GGML_ASSERT(n >= 0 && j + n <= split->graph.n_nodes);
+            for (int k = 0; k < n; k++) {
+                absorbed.push_back(split->graph.nodes[j + k]);
+            }
+        }
+    }
+
+    if (absorbed.empty()) {
+        ggml_gallocr_set_fusion_plan(sched->galloc, NULL, 0);
+        return;
+    }
+
+    for (int i = 0; i < graph_copy->n_nodes; i++) {
+        sched->fusion_absorbed[i] = std::find(absorbed.begin(), absorbed.end(), graph_copy->nodes[i]) != absorbed.end();
+    }
+    ggml_gallocr_set_fusion_plan(sched->galloc, sched->fusion_absorbed, graph_copy->n_nodes);
+
+    if (sched->debug > 1) {
+        size_t total = 0;
+        for (ggml_tensor * t : absorbed) {
+            total += ggml_nbytes(t);
+            GGML_LOG_DEBUG("%s: absorbed %s [%ld,%ld,%ld,%ld] %.2f MiB\n", __func__, t->name,
+                    (long) t->ne[0], (long) t->ne[1], (long) t->ne[2], (long) t->ne[3], ggml_nbytes(t) / 1024.0 / 1024.0);
+        }
+        GGML_LOG_DEBUG("%s: %zu nodes absorbed by backend fusion, %.2f MiB\n", __func__, absorbed.size(), total / 1024.0 / 1024.0);
     }
 }
 
@@ -1586,6 +1639,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+
+    ggml_backend_sched_build_fusion_plan(sched);
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1883,6 +1938,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
     sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
+    sched->fusion_absorbed = (bool *) calloc(nodes_size, sizeof(sched->fusion_absorbed[0]));
 
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
@@ -1936,6 +1992,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
+    free(sched->fusion_absorbed);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);

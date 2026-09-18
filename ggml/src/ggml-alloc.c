@@ -301,6 +301,22 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     }
 #endif
 
+    // GGML_ALLOC_PEAK_DEBUG names every tensor that raises a chunk's peak. Only a peak setter
+    // decides the buffer size, so this tells you which tensor is worth removing.
+    if (addr.offset + size > chunk->max_size) {
+        static int peak_dbg = -1;
+        if (peak_dbg < 0) {
+            const char * e = getenv("GGML_ALLOC_PEAK_DEBUG");
+            peak_dbg = e ? atoi(e) : 0;
+        }
+        if (peak_dbg) {
+            fprintf(stderr, "[PEAK] chunk %d %8.2f MiB <- %-32s (%.2f MiB) op=%-10s ne=[%ld,%ld,%ld,%ld] src0=%s\n",
+                    addr.chunk, (addr.offset + size) / 1024.0 / 1024.0, tensor->name, size / 1024.0 / 1024.0,
+                    ggml_op_name(tensor->op), (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2],
+                    (long) tensor->ne[3], tensor->src[0] ? tensor->src[0]->name : "-");
+        }
+    }
+
     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
 
     return addr;
@@ -462,12 +478,14 @@ struct hash_node {
     int buffer_id;
     struct buffer_address addr;
     bool allocated;
+    bool absorbed; // the backend fuses this node away, so it gets no buffer
 };
 
 struct tensor_alloc {
     int buffer_id;
     struct buffer_address addr;
     size_t size_max; // 0 = pre-allocated, unused, or view
+    bool absorbed;
 };
 
 struct leaf_alloc {
@@ -493,6 +511,9 @@ struct ggml_gallocr {
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+
+    bool * fusion_absorbed; // [fusion_n_nodes], NULL if no plan
+    int fusion_n_nodes;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -576,14 +597,44 @@ void ggml_gallocr_free(ggml_gallocr_t galloc) {
     free(galloc->buf_tallocs);
     free(galloc->node_allocs);
     free(galloc->leaf_allocs);
+    free(galloc->fusion_absorbed);
     free(galloc);
 }
 
 typedef struct ggml_gallocr * ggml_gallocr_t;
 
+void ggml_gallocr_set_fusion_plan(ggml_gallocr_t galloc, const bool * absorbed, int n_nodes) {
+    if (absorbed == NULL || n_nodes <= 0) {
+        galloc->fusion_n_nodes = 0;
+        return;
+    }
+
+    if (galloc->fusion_n_nodes < n_nodes) {
+        free(galloc->fusion_absorbed);
+        galloc->fusion_absorbed = malloc(sizeof(bool) * n_nodes);
+        GGML_ASSERT(galloc->fusion_absorbed != NULL);
+    }
+    galloc->fusion_n_nodes = n_nodes;
+    memcpy(galloc->fusion_absorbed, absorbed, sizeof(bool) * n_nodes);
+}
+
+// the plan is indexed by node, so it only applies to the graph it was built for
+static bool ggml_gallocr_is_absorbed(ggml_gallocr_t galloc, const struct ggml_cgraph * graph, int i) {
+    return galloc->fusion_n_nodes > 0 && galloc->fusion_n_nodes == graph->n_nodes && galloc->fusion_absorbed[i];
+}
+
 static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct ggml_tensor * t) {
     size_t i = ggml_hash_find_or_insert(&galloc->hash_set, t);
     return &galloc->hash_values[i];
+}
+
+// GGML_ALLOC_INPLACE_VIEWS lets an inplace op reuse the buffer behind a view parent
+// (e.g. relu(reshape(mul_mat))), which the ownership test would otherwise reject.
+static bool ggml_gallocr_inplace_views(ggml_gallocr_t galloc) {
+    GGML_UNUSED(galloc);
+    static int en = -1;
+    if (en < 0) { const char * e = getenv("GGML_ALLOC_INPLACE_VIEWS"); en = e ? atoi(e) : 0; }
+    return en != 0;
 }
 
 static bool ggml_gallocr_is_own(ggml_gallocr_t galloc, struct ggml_tensor * t) {
@@ -628,6 +679,13 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
         hn->allocated = true;
         assert(hn->addr.offset == 0);
 
+        // GGML_ALLOC_INPLACE_DEBUG reports why a large tensor failed to reuse a parent inplace.
+#define INPL_DIAG(...) do { \
+        static int inpl_dbg = -1; \
+        if (inpl_dbg < 0) { const char * e = getenv("GGML_ALLOC_INPLACE_DEBUG"); inpl_dbg = e ? atoi(e) : 0; } \
+        if (inpl_dbg && ggml_nbytes(node) >= (256ll << 20)) { fprintf(stderr, __VA_ARGS__); } \
+    } while (0)
+
         // try to reuse a parent's buffer (inplace)
         if (ggml_op_can_inplace(node->op)) {
             for (int i = 0; i < GGML_MAX_SRC; i++) {
@@ -636,8 +694,15 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                     continue;
                 }
 
+                // a view parent is never marked allocated itself: its storage belongs to view_src.
+                // Test ownership on whichever tensor actually owns the bytes.
+                struct ggml_tensor * p_owner = ggml_impl_is_view(parent) ? parent->view_src : parent;
+                if (ggml_impl_is_view(parent) && !ggml_gallocr_inplace_views(galloc)) {
+                    continue;
+                }
+
                 // if the node's data is external, then we cannot re-use it
-                if (!ggml_gallocr_is_own(galloc, parent)) {
+                if (!ggml_gallocr_is_own(galloc, p_owner)) {
                     AT_PRINTF("not reusing parent %s for %s as %p is external\n", parent->name, node->name, parent->data);
                     continue;
                 }
@@ -654,15 +719,21 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
 
                 struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+                INPL_DIAG("[INPL] %s (%.0f MiB) parent %s: n_children=%d n_views=%d is_view=%d\n",
+                        node->name, ggml_nbytes(node)/1048576.0, parent->name,
+                        p_hn->n_children, p_hn->n_views, ggml_impl_is_view(parent));
                 if (p_hn->n_children == 1 && p_hn->n_views == 0) {
                     if (ggml_impl_is_view(parent)) {
                         struct ggml_tensor * view_src = parent->view_src;
                         struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
-                        if (view_src_hn->n_views == 1 && view_src_hn->n_children == 0 && view_src->data == parent->data) {
+                        INPL_DIAG("[INPL]   view_src %s: n_children=%d n_views=%d same_data=%d\n",
+                                view_src->name, view_src_hn->n_children, view_src_hn->n_views,
+                                view_src->data == parent->data);
+                        if (view_src_hn->n_views == 1 && view_src_hn->n_children == 0 &&
+                                parent->view_offs == 0 && ggml_nbytes(view_src) == ggml_nbytes(parent)) {
                             AT_PRINTF("reusing view parent %s (%s) for %s\n", parent->name, view_src->name, node->name);
-                            assert(view_src_hn->addr.chunk == p_hn->addr.chunk && view_src_hn->addr.offset == p_hn->addr.offset);
-                            hn->buffer_id = p_hn->buffer_id;
-                            hn->addr = p_hn->addr;
+                            hn->buffer_id = view_src_hn->buffer_id;
+                            hn->addr = view_src_hn->addr;
                             p_hn->allocated = false; // avoid freeing the parent
                             view_src_hn->allocated = false;
                             ggml_gallocr_free_extra_space(galloc, node, view_src);
@@ -679,6 +750,8 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
                 }
             }
         }
+#undef INPL_DIAG
+
         // allocate tensor from the buffer
         struct ggml_dyn_tallocr * alloc = galloc->buf_tallocs[buffer_id];
         ggml_backend_buffer_type_t buft = galloc->bufts[buffer_id];
@@ -715,6 +788,47 @@ static int get_node_buffer_id(const int * node_buffer_ids, int i) {
     return node_buffer_ids ? node_buffer_ids[i] : 0;
 }
 
+// Drop one reference to parent and free whatever that makes unreachable. An absorbed parent
+// is fused away and never runs, so its consumer is the real reader of ITS sources: recurse.
+static void ggml_gallocr_release_parent(ggml_gallocr_t galloc, struct ggml_tensor * parent, int depth) {
+    struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
+    p_hn->n_children -= 1;
+
+    AT_PRINTF("parent %s: %d children, %d views, allocated: %d\n",
+        parent->name, p_hn->n_children, p_hn->n_views, p_hn->allocated);
+
+    if (p_hn->n_children != 0 || p_hn->n_views != 0) {
+        return;
+    }
+
+    struct ggml_tensor * owner = parent;
+    if (ggml_impl_is_view(parent)) {
+        owner = parent->view_src;
+        struct hash_node * owner_hn = ggml_gallocr_hash_get(galloc, owner);
+        owner_hn->n_views -= 1;
+        AT_PRINTF("view_src %s: %d children, %d views\n",
+            owner->name, owner_hn->n_children, owner_hn->n_views);
+        if (owner_hn->n_views != 0 || owner_hn->n_children != 0) {
+            return;
+        }
+        if (owner_hn->allocated) {
+            ggml_gallocr_free_node(galloc, owner);
+        }
+    } else if (p_hn->allocated) {
+        ggml_gallocr_free_node(galloc, parent);
+    }
+
+    // fusions are a handful of nodes, so the cap only guards against a malformed plan
+    if (depth < GGML_MAX_SRC && ggml_gallocr_hash_get(galloc, owner)->absorbed) {
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            struct ggml_tensor * src = owner->src[j];
+            if (src != NULL && src != owner) {
+                ggml_gallocr_release_parent(galloc, src, depth + 1);
+            }
+        }
+    }
+}
+
 static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
@@ -739,6 +853,10 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         if (ggml_impl_is_view(node) && node->op != GGML_OP_NONE) {
             struct ggml_tensor * view_src = node->view_src;
             ggml_gallocr_hash_get(galloc, view_src)->n_views += 1;
+        }
+
+        if (ggml_gallocr_is_absorbed(galloc, graph, i)) {
+            ggml_gallocr_hash_get(galloc, node)->absorbed = true;
         }
 
         if (node->flags & GGML_TENSOR_FLAG_INPUT) {
@@ -771,11 +889,18 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
             if (parent == NULL) {
                 continue;
             }
+            // a view of an absorbed node resolves to it here, so check before allocating
+            struct ggml_tensor * src = ggml_impl_is_view(parent) ? parent->view_src : parent;
+            if (ggml_gallocr_hash_get(galloc, src)->absorbed) {
+                continue;
+            }
             ggml_gallocr_allocate_node(galloc, parent, buffer_id);
         }
 
         // allocate node
-        ggml_gallocr_allocate_node(galloc, node, buffer_id);
+        if (!ggml_gallocr_hash_get(galloc, node)->absorbed) {
+            ggml_gallocr_allocate_node(galloc, node, buffer_id);
+        }
 
         AT_PRINTF("exec: %s (%s) <= ", ggml_op_desc(node), node->name);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -790,34 +915,15 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
         }
         AT_PRINTF("\n");
 
-        // update parents
+        // update parents. an absorbed node never runs, so what it reads stays live until its
+        // consumer releases it - only a self reference is settled here
+        const bool node_absorbed = ggml_gallocr_hash_get(galloc, node)->absorbed;
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * parent = node->src[j];
-            if (parent == NULL) {
+            if (parent == NULL || (node_absorbed && parent != node)) {
                 continue;
             }
-            struct hash_node * p_hn = ggml_gallocr_hash_get(galloc, parent);
-            p_hn->n_children -= 1;
-
-            AT_PRINTF("parent %s: %d children, %d views, allocated: %d\n",
-                parent->name, p_hn->n_children, p_hn->n_views, p_hn->allocated);
-
-            if (p_hn->n_children == 0 && p_hn->n_views == 0) {
-                if (ggml_impl_is_view(parent)) {
-                    struct ggml_tensor * view_src = parent->view_src;
-                    struct hash_node * view_src_hn = ggml_gallocr_hash_get(galloc, view_src);
-                    view_src_hn->n_views -= 1;
-                    AT_PRINTF("view_src %s: %d children, %d views\n",
-                        view_src->name, view_src_hn->n_children, view_src_hn->n_views);
-                    if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
-                        ggml_gallocr_free_node(galloc, view_src);
-                    }
-                }
-                else if (p_hn->allocated) {
-                    ggml_gallocr_free_node(galloc, parent);
-                }
-            }
-            AT_PRINTF("\n");
+            ggml_gallocr_release_parent(galloc, parent, 0);
         }
     }
 }
@@ -857,7 +963,8 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
-        if (node->view_src || node->data) {
+        node_alloc->dst.absorbed = ggml_gallocr_hash_get(galloc, node)->absorbed;
+        if (node->view_src || node->data || node_alloc->dst.absorbed) {
             node_alloc->dst.buffer_id = -1;
             node_alloc->dst.addr = GGML_BUFFER_ADDRESS_INVALID;
             node_alloc->dst.size_max = 0;
@@ -869,7 +976,8 @@ static bool ggml_gallocr_reserve_n_impl(
         }
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
-            if (!src || src->view_src || src->data) {
+            node_alloc->src[j].absorbed = src && ggml_gallocr_hash_get(galloc, src)->absorbed;
+            if (!src || src->view_src || src->data || node_alloc->src[j].absorbed) {
                 node_alloc->src[j].buffer_id = -1;
                 node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
                 node_alloc->src[j].size_max = 0;
@@ -890,6 +998,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct hash_node * hn = ggml_gallocr_hash_get(galloc, leaf);
+        galloc->leaf_allocs[i].leaf.absorbed = false;
         if (leaf->view_src || leaf->data) {
             galloc->leaf_allocs[i].leaf.buffer_id = -1;
             galloc->leaf_allocs[i].leaf.addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -968,6 +1077,13 @@ bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph *graph) {
 }
 
 static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor * tensor, struct tensor_alloc * tensor_alloc) {
+    // the backend fuses this node away and never writes it: leave data NULL so a wrong
+    // prediction faults instead of reading a buffer that nothing filled in
+    if (tensor_alloc->absorbed) {
+        GGML_ASSERT(tensor->data == NULL);
+        return;
+    }
+
     int buffer_id = tensor_alloc->buffer_id;
     assert(tensor->data || tensor->view_src || ggml_backend_buft_get_alloc_size(galloc->bufts[buffer_id], tensor) <= tensor_alloc->size_max);
 
@@ -995,6 +1111,9 @@ static void ggml_gallocr_init_tensor(ggml_gallocr_t galloc, struct ggml_tensor *
 }
 
 static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_tensor * node, struct tensor_alloc * talloc) {
+    if (talloc->absorbed) {
+        return true;
+    }
     size_t node_size = 0;
     if (!node->data && !node->view_src) {
         // If we previously had data but don't now then reallocate
@@ -1024,6 +1143,14 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+
+        // the plan the buffers were reserved with must match the one in force now
+        if (node_alloc->dst.absorbed != ggml_gallocr_is_absorbed(galloc, graph, i)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: fusion plan changed for node %s\n", __func__, node->name);
+#endif
+            return true;
+        }
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
 #ifndef NDEBUG

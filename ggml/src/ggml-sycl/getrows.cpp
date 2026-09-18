@@ -10,6 +10,7 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 
+#include <atomic>
 #include <type_traits>
 
 #include "ggml-impl.h"
@@ -422,4 +423,166 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
             GGML_LOG_ERROR("%s: unsupported type: %s\n", __func__, ggml_type_name(dst->src[0]->type));
             GGML_ABORT("fatal error");
     }
+}
+
+// The QSA indexer gives every cell the score of its block. get_rows only gathers along ne1,
+// so the model graph transposes the scores, gathers, and transposes back:
+//   CONT(PERMUTE(score)) -> GET_ROWS -> PERMUTE -> CONT
+// The whole chain is expanded[c, t] = score[idx[c], t]. One kernel writes that final layout
+// directly, so neither transposed copy nor the gather output is ever written; the first CONT
+// and the GET_ROWS are reported through fusion_absorbs so ggml-alloc reserves nothing for them.
+// Every test below is structural, so the answer is the same before and after allocation.
+bool ggml_sycl_can_fuse_qsa_gather(const ggml_cgraph * cgraph, int i) {
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_qsa_gather) {
+        return false;
+    }
+    if (i + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * cont_in  = cgraph->nodes[i];
+    ggml_tensor * rows     = cgraph->nodes[i + 1];
+    ggml_tensor * perm_out = cgraph->nodes[i + 2];
+    ggml_tensor * cont_out = cgraph->nodes[i + 3];
+
+    if (cont_in->op != GGML_OP_CONT || rows->op != GGML_OP_GET_ROWS || perm_out->op != GGML_OP_PERMUTE ||
+        cont_out->op != GGML_OP_CONT) {
+        return false;
+    }
+    for (const ggml_tensor * n : { cont_in, rows, perm_out, cont_out }) {
+        if (n->type != GGML_TYPE_F32 || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+    }
+
+    // an empty node is skipped by the compute loop, which would leave an absorbed dst unwritten
+    if (ggml_is_empty(cont_in) || ggml_is_empty(rows) || ggml_is_empty(cont_out)) {
+        return false;
+    }
+
+    // the chain must be linear and only cont_out may leave it
+    if (cont_in->view_src || rows->view_src || cont_out->view_src) {
+        return false;
+    }
+    if ((cont_in->flags | rows->flags | perm_out->flags) & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, i) != 1 || ggml_node_get_use_count(cgraph, i + 1) != 1 ||
+        ggml_node_get_use_count(cgraph, i + 2) != 1) {
+        return false;
+    }
+    if (rows->src[0] != cont_in || perm_out->src[0] != rows || perm_out->view_src != rows ||
+        perm_out->view_offs != 0 || cont_out->src[0] != perm_out) {
+        return false;
+    }
+
+    // the kernel reads the score through the permuted view, so only its strides matter
+    const ggml_tensor * src = cont_in->src[0];
+    const ggml_tensor * idx = rows->src[1];
+    if (!src || !idx || src->type != GGML_TYPE_F32 || idx->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(src, cont_in) || src->ne[2] != 1 || src->ne[3] != 1) {
+        return false;
+    }
+    if (idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1 || idx->nb[0] != ggml_type_size(GGML_TYPE_I32)) {
+        return false;
+    }
+    const size_t ts = ggml_type_size(GGML_TYPE_F32);
+    if (src->nb[0] % ts != 0 || src->nb[1] % ts != 0) {
+        return false;
+    }
+
+    // get_rows output, then the exact ne0/ne1 swap of it
+    if (rows->ne[0] != cont_in->ne[0] || rows->ne[1] != idx->ne[0] || rows->ne[2] != 1 || rows->ne[3] != 1) {
+        return false;
+    }
+    if (!ggml_is_contiguous(cont_in) || !ggml_is_contiguous(rows) || !ggml_is_contiguous(cont_out)) {
+        return false;
+    }
+    if (perm_out->ne[0] != rows->ne[1] || perm_out->ne[1] != rows->ne[0] || perm_out->ne[2] != 1 ||
+        perm_out->ne[3] != 1 || perm_out->nb[0] != rows->nb[1] || perm_out->nb[1] != rows->nb[0]) {
+        return false;
+    }
+    if (!ggml_are_same_shape(cont_out, perm_out)) {
+        return false;
+    }
+
+    return true;
+}
+
+template <int width>
+static void k_qsa_gather(const char * src, const int32_t * idx, float * dst,
+                         int64_t n_idx, size_t nb0, size_t nb1, const sycl::nd_item<2> & item) {
+    const int64_t t = item.get_global_id(0);
+    const int64_t c = (int64_t) item.get_global_id(1) * width;
+    if (c >= n_idx) {
+        return;
+    }
+
+    const char * row = src + t*nb0;
+    float *      out = dst + t*n_idx + c;
+
+    if constexpr (width > 1) {
+        sycl::vec<float, width> v;
+#pragma unroll
+        for (int j = 0; j < width; ++j) {
+            v[j] = *(const float *) (row + (int64_t) idx[c + j]*nb1);
+        }
+        *(sycl::vec<float, width> *) out = v;
+    } else {
+        *out = *(const float *) (row + (int64_t) idx[c]*nb1);
+    }
+}
+
+// Runs the chain matched by ggml_sycl_can_fuse_qsa_gather(); returns the extra nodes consumed.
+int ggml_sycl_fuse_qsa_gather(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_sycl_can_fuse_qsa_gather(cgraph, i)) {
+        return 0;
+    }
+
+    const ggml_tensor * src      = cgraph->nodes[i]->src[0];
+    const ggml_tensor * idx      = cgraph->nodes[i + 1]->src[1];
+    ggml_tensor *       cont_out = cgraph->nodes[i + 3];
+
+    const int64_t n_idx  = cont_out->ne[0];
+    const int64_t n_cols = cont_out->ne[1];
+
+    // one 16 byte store per work item when the destination rows line up for it
+    const int width = (n_idx % 4 == 0 && ((uintptr_t) cont_out->data) % 16 == 0) ? 4 : 1;
+
+    constexpr int block = 256;
+    const int64_t items = (n_idx + width - 1) / width;
+    const sycl::range<2> local(1, block);
+    const sycl::range<2> global(n_cols, ((items + block - 1) / block) * block);
+
+    const char *    src_dd = (const char *) src->data;
+    const int32_t * idx_dd = (const int32_t *) idx->data;
+    float *         dst_dd = (float *) cont_out->data;
+    const size_t    nb0    = src->nb[0];
+    const size_t    nb1    = src->nb[1];
+
+    // GGML_SYCL_QSA_GATHER_TRACE gives the number of firings to report
+    static std::atomic<int> trace_left{ getenv("GGML_SYCL_QSA_GATHER_TRACE") ?
+                                        std::max(1, atoi(getenv("GGML_SYCL_QSA_GATHER_TRACE"))) : 0 };
+    if (trace_left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[QSAGATHER] n_idx=%ld n_cols=%ld width=%d nb0=%zu nb1=%zu src=%p idx=%p dst=%p cont_in=%p rows=%p\n",
+                (long) n_idx, (long) n_cols, width, nb0, nb1, (const void *) src_dd, (const void *) idx_dd,
+                (void *) dst_dd, (void *) cgraph->nodes[i]->data, (void *) cgraph->nodes[i + 1]->data);
+    }
+
+    GGML_ASSERT(src_dd && idx_dd && dst_dd);
+
+    auto launch = [&](auto w) {
+        ctx.stream()->parallel_for(sycl::nd_range<2>(global, local), [=](sycl::nd_item<2> item) {
+            k_qsa_gather<decltype(w)::value>(src_dd, idx_dd, dst_dd, n_idx, nb0, nb1, item);
+        });
+    };
+    if (width == 4) {
+        launch(std::integral_constant<int, 4>{});
+    } else {
+        launch(std::integral_constant<int, 1>{});
+    }
+
+    return 3;
 }

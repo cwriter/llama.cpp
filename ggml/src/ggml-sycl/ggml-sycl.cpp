@@ -115,8 +115,11 @@ int g_ggml_sycl_grouped_gemm = 1;
 // q8_0 first, so this only runs otherwise. Bit-identical results, ~5% decode on its own.
 int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_fuse_cast_add = 1;
+int g_ggml_sycl_fuse_cont_add = 0;
+int g_ggml_sycl_fuse_qsa_gather = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
+int g_ggml_sycl_topk_moe_radix = 1;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -391,8 +394,11 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_grouped_gemm = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM", 1);
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
         g_ggml_sycl_fuse_cast_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CAST_ADD", 1);
+        g_ggml_sycl_fuse_cont_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CONT_ADD", 0);
+        g_ggml_sycl_fuse_qsa_gather = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_GATHER", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
+        g_ggml_sycl_topk_moe_radix = ggml_sycl_get_env("GGML_SYCL_TOPK_MOE_RADIX", 1);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -502,8 +508,11 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_GROUPED_GEMM: %d\n", g_ggml_sycl_grouped_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_CAST_ADD: %d\n", g_ggml_sycl_fuse_cast_add);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_CONT_ADD: %d\n", g_ggml_sycl_fuse_cont_add);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_GATHER: %d\n", g_ggml_sycl_fuse_qsa_gather);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
+        GGML_LOG_INFO("  GGML_SYCL_TOPK_MOE_RADIX: %d\n", g_ggml_sycl_topk_moe_radix);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -6969,6 +6978,23 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
     std::exit(1);
 }
 
+// report the copies that a fusion reads through, so ggml-alloc never reserves their dst.
+// every predicate here is purely structural, so it holds for every later execution
+static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
+    GGML_UNUSED(backend);
+    // the transposed score copy and the gather output that the QSA kernel writes straight past
+    if (ggml_sycl_can_fuse_qsa_gather(cgraph, node_idx)) {
+        return 2;
+    }
+    if (ggml_sycl_can_fuse_cast_add(cgraph, node_idx, NULL)) {
+        return 1;
+    }
+    if (ggml_sycl_can_fuse_cont_add(cgraph, node_idx, NULL, NULL)) {
+        return 1;
+    }
+    return 0;
+}
+
 static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_name                = */ ggml_backend_sycl_get_name,
     /* .free                    = */ ggml_backend_sycl_free,
@@ -6988,6 +7014,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .event_record            = */ ggml_backend_sycl_event_record,
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
     /* .graph_optimize          = */ NULL,
+    /* .fusion_absorbs          = */ ggml_backend_sycl_fusion_absorbs,
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {
