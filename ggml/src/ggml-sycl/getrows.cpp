@@ -537,10 +537,7 @@ void ggml_sycl_op_get_rows_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
 // directly, so neither transposed copy nor the gather output is ever written; the first CONT
 // and the GET_ROWS are reported through fusion_absorbs so ggml-alloc reserves nothing for them.
 // Every test below is structural, so the answer is the same before and after allocation.
-bool ggml_sycl_can_fuse_qsa_gather(const ggml_cgraph * cgraph, int i) {
-    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_qsa_gather) {
-        return false;
-    }
+bool ggml_sycl_qsa_gather_shape(const ggml_cgraph * cgraph, int i) {
     if (i + 3 >= cgraph->n_nodes) {
         return false;
     }
@@ -614,6 +611,10 @@ bool ggml_sycl_can_fuse_qsa_gather(const ggml_cgraph * cgraph, int i) {
     }
 
     return true;
+}
+
+bool ggml_sycl_can_fuse_qsa_gather(const ggml_cgraph * cgraph, int i) {
+    return g_ggml_sycl_enable_fusion && g_ggml_sycl_fuse_qsa_gather && ggml_sycl_qsa_gather_shape(cgraph, i);
 }
 
 template <int width>

@@ -325,7 +325,7 @@ inline void ggml_sycl_op_bin_bcast(ggml_backend_sycl_context & ctx, const ggml_t
 //
 // ggml_can_fuse_subgraph cannot express this shape: the reshape between the cast and the ADD
 // is a view, and the nodes do not share one shape. So match the chain by hand.
-static bool ggml_sycl_cast_add_shape(const ggml_cgraph * cgraph, int i, int * span) {
+bool ggml_sycl_cast_add_shape(const ggml_cgraph * cgraph, int i, int * span) {
     if (i + 1 >= cgraph->n_nodes) {
         return false;
     }

@@ -68,6 +68,9 @@ inline bool ggml_sycl_add_kernel_supports(enum ggml_type src0, enum ggml_type sr
     return false;
 }
 
+// Shape-only test for the f16->f32 cast chain that ends in an ADD, without the flag gate.
+bool ggml_sycl_cast_add_shape(const ggml_cgraph * cgraph, int i, int * span);
+
 // True if node i starts an f16->f32 cast that the following ADD can read directly.
 // span, if given, gets the number of nodes in the chain (2 without a reshape, 3 with one).
 bool ggml_sycl_can_fuse_cast_add(const ggml_cgraph * cgraph, int i, int * span);
