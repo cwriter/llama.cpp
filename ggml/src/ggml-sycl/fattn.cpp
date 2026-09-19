@@ -19,7 +19,7 @@
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
 #include "fattn-onednn.hpp"
-
+#include "fattn-sparse.hpp"
 
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
@@ -103,6 +103,69 @@ enum best_fattn_kernel {
 };
 
 
+// The shape envelope the oneMKL kernel is validated for. Split out of the dispatcher so the
+// staging budget below can ask the same question before it declines oneDNN.
+static bool ggml_sycl_fattn_mkl_supported(const ggml_tensor * dst) {
+    if (g_ggml_sycl_enable_mkl_fa != 1) {
+        return false;
+    }
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    if (!Q || !K || !V || !mask || sinks || K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+
+    float max_bias = 0.0f, logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    if (Q->ne[2] / K->ne[2] < 2 || Q->ne[0] < 64 || Q->ne[0] > 512 || Q->ne[0] % 64 != 0 ||
+        Q->ne[0] != V->ne[0] || Q->ne[1] < 32 || K->ne[1] < 1024 ||
+        max_bias != 0.0f || logit_softcap != 0.0f ||
+        (Q->ne[3] != K->ne[3] && K->ne[3] != 1)) {
+        return false;
+    }
+    // F16 K/V strides must be a multiple of ne[0]*2 (the natural row size
+    // in bytes). This passes both dense (nb1 == ne0*2) and interleaved
+    // (nb1 == H * ne0*2). Only pathological test strides like nb1=32 or
+    // nb1=75 for ne0=40 fall through to TILE.
+    for (const ggml_tensor * t : {K, V}) {
+        if (t->type == GGML_TYPE_F16 && t->nb[1] % (t->ne[0] * 2) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// oneDNN SDPA and TILE both stage an F16 copy of the WHOLE KV cache, which the graph allocator
+// has to reserve, and which grows with the context and not with the batch. At the
+// GGML_SYCL_FA_MAX_MEM_MIB ceiling the node goes to the oneMKL kernel instead: it walks the cache
+// in chunks sized to fit the same ceiling, so it reserves nothing.
+//
+// Size the decision from the whole KV cache, not from this graph's n_kv. The reservation is made
+// on a worst-case graph at the full context while real graphs are shorter, so a decision that
+// read n_kv would clamp the reservation and then not clamp the graph that runs, and the
+// reservation would stop bounding it.
+bool ggml_sycl_fattn_stage_capped(const ggml_tensor * dst) {
+    if (g_ggml_sycl_fa_max_mem_mib <= 0 || dst->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    if (!K || !V || ggml_sycl_fattn_onednn_binds_kv(K, V)) {
+        return false;
+    }
+    const ggml_tensor * Kc = K->view_src ? K->view_src : K;
+    const ggml_tensor * Vc = V->view_src ? V->view_src : V;
+    // count both even when V aliases K: oneDNN stages them apart, only TILE shares the copy
+    const size_t stage = (size_t) (ggml_nelements(Kc) + ggml_nelements(Vc)) * 2;
+    return stage >= (size_t) g_ggml_sycl_fa_max_mem_mib * 1024 * 1024 && ggml_sycl_fattn_mkl_supported(dst);
+}
+
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
 #ifndef SYCL_FLASH_ATTN
     GGML_UNUSED(dst);
@@ -116,23 +179,20 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
-    const ggml_tensor * sinks = dst->src[4];
-
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
-    float logit_softcap = 0.0f;
-    memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
-
     bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
     // XMX-accelerated path: oneDNN SDPA (native F16 and dequant+non-F16).
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
     // calling _supported() on every decode FA call.
-    if (Q->ne[1] >= 32
+    const bool stage_capped = ggml_sycl_fattn_stage_capped(dst);
+
+    if (Q->ne[1] >= 32 && !stage_capped
         && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
@@ -152,26 +212,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // head_dim 512, so the cap must include it. Head sizes not a multiple of
     // 64 (72/80/96), MHA (gqa_ratio == 1), and MLA (DKQ != DV, e.g. 576/512)
     // fall through to TILE/VEC; see follow-up work.
-    if (g_ggml_sycl_enable_mkl_fa == 1 && mask && !sinks && gqa_ratio >= 2 &&
-        Q->ne[0] >= 64 && Q->ne[0] <= 512 && Q->ne[0] % 64 == 0 &&
-        Q->ne[0] == V->ne[0] &&
-        Q->ne[1] >= 32 && K->ne[1] >= 1024 &&
-        max_bias == 0.0f && logit_softcap == 0.0f &&
-        (Q->ne[3] == K->ne[3] || K->ne[3] == 1)) {
-        // F16 K/V strides must be a multiple of ne[0]*2 (the natural row size
-        // in bytes). This passes both dense (nb1 == ne0*2) and interleaved
-        // (nb1 == H * ne0*2). Only pathological test strides like nb1=32 or
-        // nb1=75 for ne0=40 fall through to TILE.
-        bool kv_strides_ok = true;
-        for (const ggml_tensor * t : {K, V}) {
-            if (t->type == GGML_TYPE_F16 && t->nb[1] % (t->ne[0] * 2) != 0) {
-                kv_strides_ok = false;
-                break;
-            }
-        }
-        if (kv_strides_ok) {
-            return BEST_FATTN_KERNEL_MKL;
-        }
+    if (ggml_sycl_fattn_mkl_supported(dst)) {
+        return BEST_FATTN_KERNEL_MKL;
     }
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
@@ -247,7 +289,7 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
     // Fused-XMX path: oneDNN Graph SDPA (flash attention). Strictly
     // additive -- taken only when statically supported, otherwise falls through to VEC/TILE below.
-    if (ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+    if (!stage_capped && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
 
@@ -275,6 +317,11 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
+
+    // sparse nodes are gathered down to n_kv_max rows and re-dispatched here
+    if (ggml_sycl_flash_attn_ext_sparse(ctx, dst)) {
+        return;
+    }
 
     // n_kv watchdog: log when n_kv differs from the last FA call with
     // the same D — helps detect cache-truncation issues.
@@ -413,11 +460,13 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     const int64_t H = Q->ne[2];
     const int64_t q = Q->ne[1];
 
-    // calculate the worst-case memory consumption across all kernels
-    const bool onednn_supported = ggml_sycl_flash_attn_ext_onednn_supported(dst, /* use_shape_limit */ false);
+    // calculate the worst-case memory consumption across all kernels. A capped node runs on
+    // the chunked oneMKL kernel, which takes its scratch from the pool, so it reserves nothing.
+    const bool capped = ggml_sycl_fattn_stage_capped(dst);
+    const bool onednn_supported = !capped && ggml_sycl_flash_attn_ext_onednn_supported(dst, /* use_shape_limit */ false);
 
-    const bool tile_needs_K = K->type != GGML_TYPE_F16;
-    const bool tile_needs_V = V->type != GGML_TYPE_F16;
+    const bool tile_needs_K = !capped && K->type != GGML_TYPE_F16;
+    const bool tile_needs_V = !capped && V->type != GGML_TYPE_F16;
 
     const bool V_is_K_view = V->view_src &&
         (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));

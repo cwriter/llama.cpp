@@ -67,6 +67,8 @@
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
+#include "ggml-sycl/qsa-mask.hpp"
+#include "ggml-sycl/qsa-score.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/set_rows.hpp"
@@ -100,6 +102,7 @@ int g_ggml_sycl_enable_dnn = 1;
 int g_ggml_sycl_fa_onednn = 1;
 int g_ggml_sycl_fa_onednn_max_kv = 0;
 int g_ggml_sycl_enable_mkl_fa = 1;
+int g_ggml_sycl_fa_max_mem_mib = 256;
 int g_ggml_sycl_memtrace = 0;
 int g_ggml_sycl_memtrace_step = 64;
 int g_ggml_sycl_enable_vmm = 1;
@@ -117,6 +120,9 @@ int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_fuse_cast_add = 1;
 int g_ggml_sycl_fuse_cont_add = 0;
 int g_ggml_sycl_fuse_qsa_gather = 0;
+int g_ggml_sycl_fuse_qsa_topk = 0;
+int g_ggml_sycl_fuse_qsa_score = 0;
+int g_ggml_sycl_fuse_qsa_mask = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
 int g_ggml_sycl_topk_moe_radix = 1;
@@ -129,6 +135,9 @@ int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
 int g_ggml_sycl_get_mem_api = MEMORY_API_TYPE_LEVEL_ZERO;
+int g_ggml_sycl_enable_sparse_fa = 0;
+int g_ggml_sycl_debug_sparse_fa = 0;
+int g_ggml_sycl_sparse_fa_margin = 256;
 
 static ggml_sycl_device_info ggml_sycl_init() {
     GGML_SYCL_DEBUG("[SYCL] call ggml_sycl_init\n");
@@ -381,6 +390,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fa_onednn = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN", 1);
         g_ggml_sycl_fa_onednn_max_kv = ggml_sycl_get_env("GGML_SYCL_FA_ONEDNN_MAX_KV", 0);
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
+        g_ggml_sycl_fa_max_mem_mib = ggml_sycl_get_env("GGML_SYCL_FA_MAX_MEM_MIB", 256);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
@@ -396,6 +406,9 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_cast_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CAST_ADD", 1);
         g_ggml_sycl_fuse_cont_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CONT_ADD", 0);
         g_ggml_sycl_fuse_qsa_gather = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_GATHER", 0);
+        g_ggml_sycl_fuse_qsa_topk = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_TOPK", 0);
+        g_ggml_sycl_fuse_qsa_score = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_SCORE", 0);
+        g_ggml_sycl_fuse_qsa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_MASK", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
         g_ggml_sycl_topk_moe_radix = ggml_sycl_get_env("GGML_SYCL_TOPK_MOE_RADIX", 1);
@@ -424,6 +437,10 @@ static void ggml_check_sycl() try {
 
         g_ggml_sycl_host_pinned_mem_2g =
             ggml_sycl_get_env("GGML_SYCL_HOST_PINNED_MEM_2G", 0) & g_ggml_sycl_enable_host_pinned_mem;
+
+        g_ggml_sycl_enable_sparse_fa  = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA", 0);
+        g_ggml_sycl_debug_sparse_fa   = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_DEBUG", 0);
+        g_ggml_sycl_sparse_fa_margin  = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_MARGIN", 256);
 
         GGML_SYCL_DEBUG("[SYCL] call ggml_check_sycl\n");
 
@@ -510,9 +527,13 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FUSE_CAST_ADD: %d\n", g_ggml_sycl_fuse_cast_add);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_CONT_ADD: %d\n", g_ggml_sycl_fuse_cont_add);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_GATHER: %d\n", g_ggml_sycl_fuse_qsa_gather);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_TOPK: %d\n", g_ggml_sycl_fuse_qsa_topk);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_SCORE: %d\n", g_ggml_sycl_fuse_qsa_score);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_MASK: %d\n", g_ggml_sycl_fuse_qsa_mask);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
         GGML_LOG_INFO("  GGML_SYCL_TOPK_MOE_RADIX: %d\n", g_ggml_sycl_topk_moe_radix);
+        GGML_LOG_INFO("  GGML_SYCL_FA_MAX_MEM_MIB: %d\n", g_ggml_sycl_fa_max_mem_mib);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -544,6 +565,10 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_USM_SYSTEM: %d\n", g_ggml_sycl_usm_system);
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_HOST_PINNED_MEM: %d\n", g_ggml_sycl_enable_host_pinned_mem);
         GGML_LOG_INFO("  GGML_SYCL_HOST_PINNED_MEM_2G: %d\n", g_ggml_sycl_host_pinned_mem_2g);
+
+        GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA: %d\n", g_ggml_sycl_enable_sparse_fa);
+        GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA_DEBUG: %d\n", g_ggml_sycl_debug_sparse_fa);
+        GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA_MARGIN: %d\n", g_ggml_sycl_sparse_fa_margin);
 
 /* NOT REMOVE, keep it for next optimize for XMX.
 #if defined(SYCL_USE_XMX)
@@ -6982,6 +7007,18 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 // every predicate here is purely structural, so it holds for every later execution
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
+    // every copy of the QSA indexer chain, which the fused top-k rebuilds instead of reading
+    if (const int n = ggml_sycl_qsa_topk_absorbs(cgraph, node_idx)) {
+        return n;
+    }
+    // the indexer score GEMM, its relu and the head sums that the tiled epilogue replaces
+    if (const int n = ggml_sycl_qsa_score_absorbs(cgraph, node_idx)) {
+        return n;
+    }
+    // the two fills of the QSA mask chain, which the fused select writes past
+    if (const int n = ggml_sycl_qsa_mask_absorbs(cgraph, node_idx)) {
+        return n;
+    }
     // the transposed score copy and the gather output that the QSA kernel writes straight past
     if (ggml_sycl_can_fuse_qsa_gather(cgraph, node_idx)) {
         return 2;

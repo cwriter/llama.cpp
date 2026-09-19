@@ -1,12 +1,18 @@
 #include "topk-radix.hpp"
 
+#include "ggml-impl.h"
+
+#include "binbcast.hpp"
 #include "common.hpp"
+#include "getrows.hpp"
 
 #include <algorithm>
+#include <atomic>
 
+template <typename Rows>
 static void top_k_radix_f32_sycl(
     ggml_backend_sycl_context & ctx,
-    const float * src,
+    const Rows rows,
     int32_t * dst_indices,
     const int64_t ncols,
     const int64_t nrows,
@@ -32,8 +38,8 @@ static void top_k_radix_f32_sycl(
             [=](sycl::nd_item<1> item_ct1) {
                 const int row = item_ct1.get_group(0);
 
-                top_k_radix_select_f32(
-                    src + (int64_t) row * ncols, dst_indices + (int64_t) row * k,
+                top_k_radix_select(
+                    rows.row(row), dst_indices + (int64_t) row * k,
                     (int) ncols, k,
                     slm.get_multi_ptr<sycl::access::decorated::no>().get(),
                     item_ct1);
@@ -104,8 +110,9 @@ using top_k_radix_gatomic = sycl::atomic_ref<uint32_t, sycl::memory_order::relax
                                              sycl::memory_scope::device,
                                              sycl::access::address_space::global_space>;
 
+template <typename Src>
 static void top_k_radix_split_pass_f32(
-    const float *   src,
+    const Src &     src,
     uint32_t *      state,
     const int       ncols,
     const int       k,
@@ -152,7 +159,7 @@ static void top_k_radix_split_pass_f32(
     const int col1  = std::min(ncols, col0 + chunk);
 
     for (int col = col0 + tid; col < col1; col += block_size) {
-        const uint32_t key = top_k_radix_key(src[col]);
+        const uint32_t key = top_k_radix_key(src(col));
         if ((key & mask) == prefix) {
             const uint32_t bucket = (key >> shift) & (SYCL_TOP_K_RADIX_BUCKETS - 1);
             local_atomic(hist[bucket * SYCL_TOP_K_RADIX_HIST_COPIES + copy]).fetch_add(1u);
@@ -213,8 +220,9 @@ static void top_k_radix_split_pass_f32(
     }
 }
 
+template <typename Src>
 static void top_k_radix_split_emit_f32(
-    const float *   src,
+    const Src &     src,
     int32_t *       dst_idx,
     uint32_t *      state,
     const int       ncols,
@@ -262,7 +270,7 @@ static void top_k_radix_split_emit_f32(
     // the inner loop: a per-element global atomic on a single address serialises the whole
     // emit, and at k in the thousands that alone outweighs every read the kernel does.
     for (int col = col0 + tid; col < col1; col += block_size) {
-        const uint32_t kp = top_k_radix_key(src[col]) & mask;
+        const uint32_t kp = top_k_radix_key(src(col)) & mask;
         if (kp > prefix) {
             local_atomic(*s_gt).fetch_add(1u);
         } else if (kp == prefix) {
@@ -285,7 +293,7 @@ static void top_k_radix_split_emit_f32(
     const uint32_t base_eq_g = *s_base_eq;
 
     for (int col = col0 + tid; col < col1; col += block_size) {
-        const uint32_t kp = top_k_radix_key(src[col]) & mask;
+        const uint32_t kp = top_k_radix_key(src(col)) & mask;
         if (kp > prefix) {
             dst_idx[base_gt_g + local_atomic(*s_gt).fetch_add(1u)] = col;
         } else if (kp == prefix) {
@@ -297,9 +305,10 @@ static void top_k_radix_split_emit_f32(
     }
 }
 
+template <typename Rows>
 static void top_k_radix_split_f32_sycl(
     ggml_backend_sycl_context & ctx,
-    const float * src,
+    const Rows rows,
     int32_t * dst_indices,
     const int64_t ncols,
     const int64_t nrows,
@@ -340,7 +349,7 @@ static void top_k_radix_split_f32_sycl(
                     const int part = g % nparts;
 
                     top_k_radix_split_pass_f32(
-                        src + (int64_t) row * ncols,
+                        rows.row(row),
                         state + (int64_t) row * SYCL_TOP_K_RADIX_ROW_WORDS,
                         (int) ncols, k, shift, is_first, part, nparts,
                         slm.get_multi_ptr<sycl::access::decorated::no>().get(),
@@ -360,7 +369,7 @@ static void top_k_radix_split_f32_sycl(
                 const int part = g % nparts;
 
                 top_k_radix_split_emit_f32(
-                    src + (int64_t) row * ncols,
+                    rows.row(row),
                     dst_indices + (int64_t) row * k,
                     state + (int64_t) row * SYCL_TOP_K_RADIX_ROW_WORDS,
                     (int) ncols, k, part, nparts,
@@ -368,6 +377,24 @@ static void top_k_radix_split_f32_sycl(
                     item_ct1);
             });
     });
+}
+
+template <typename Rows>
+static void top_k_radix_rows(
+    ggml_backend_sycl_context & ctx,
+    const Rows      rows,
+    int32_t *       dst_indices,
+    const int64_t   ncols,
+    const int64_t   nrows,
+    const int       k,
+    dpct::queue_ptr main_stream
+) {
+    const int nparts = top_k_radix_split_groups(ctx.device, ncols, nrows);
+    if (nparts > 1) {
+        top_k_radix_split_f32_sycl(ctx, rows, dst_indices, ncols, nrows, k, nparts, main_stream);
+    } else {
+        top_k_radix_f32_sycl(ctx, rows, dst_indices, ncols, nrows, k, main_stream);
+    }
 }
 
 void ggml_sycl_top_k_radix(
@@ -379,10 +406,198 @@ void ggml_sycl_top_k_radix(
     const int       k,
     dpct::queue_ptr main_stream
 ) {
-    const int nparts = top_k_radix_split_groups(ctx.device, ncols, nrows);
-    if (nparts > 1) {
-        top_k_radix_split_f32_sycl(ctx, src, dst_indices, ncols, nrows, k, nparts, main_stream);
-    } else {
-        top_k_radix_f32_sycl(ctx, src, dst_indices, ncols, nrows, k, main_stream);
+    top_k_radix_rows(ctx, top_k_rows_ptr{ src, ncols }, dst_indices, ncols, nrows, k, main_stream);
+}
+
+// The QSA indexer ends in TOP_K over score[cell_blk[c], t] + mask[c, t]. The graph builds that
+// value in full: the gather chain writes one [n_kv, n_tps] copy and the ADD writes another, both
+// read once. The top-k re-reads its row on every digit pass anyway, so the value is cheaper to
+// rebuild from the score and the mask than to materialize: for a fixed token the score is read
+// along its own ne0 and the mask along its ne0, so both stay contiguous in the lane direction.
+//
+// The whole chain is CONT(PERMUTE(score)) -> GET_ROWS -> PERMUTE -> CONT -> [f16 mask cast] ->
+// ADD -> TOP_K. Every copy in it is reported through fusion_absorbs, so ggml-alloc reserves
+// nothing for them. Every test below is structural, so the answer is the same before and after
+// allocation.
+
+// the ADD sits at most this far past the head, through the mask cast and its reshape
+static constexpr int SYCL_QSA_TOPK_MAX_SPAN = 6;
+
+struct qsa_topk_chain {
+    int i_cont_in;
+    int i_rows;
+    int i_cont_out;
+    int i_cast;   // -1 when the mask is already f32
+    int i_add;
+    int i_topk;
+};
+
+static bool ggml_sycl_qsa_topk_shape(const ggml_cgraph * cgraph, int i, qsa_topk_chain * out) {
+    if (!ggml_sycl_qsa_gather_shape(cgraph, i)) {
+        return false;
     }
+
+    ggml_tensor * cont_out = cgraph->nodes[i + 3];
+    if (ggml_node_get_use_count(cgraph, i + 3) != 1) {
+        return false;
+    }
+
+    // the mask reaches the ADD either through an f16 cast chain or through a single reshape
+    int i_cast = -1;
+    int i_add  = i + 4;
+    int cs     = 0;
+    if (i + 4 < cgraph->n_nodes && ggml_sycl_cast_add_shape(cgraph, i + 4, &cs)) {
+        i_cast = i + 4;
+        i_add  = i + 4 + cs - 1;
+    } else if (i + 4 < cgraph->n_nodes && cgraph->nodes[i + 4]->op == GGML_OP_RESHAPE) {
+        if (ggml_node_get_use_count(cgraph, i + 4) != 1) {
+            return false;
+        }
+        i_add = i + 5;
+    }
+    if (i_add + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * add  = cgraph->nodes[i_add];
+    ggml_tensor * topk = cgraph->nodes[i_add + 1];
+    if (add->op != GGML_OP_ADD || topk->op != GGML_OP_TOP_K) {
+        return false;
+    }
+    for (const ggml_tensor * n : { add, topk }) {
+        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || n->view_src) {
+            return false;
+        }
+    }
+    if (add->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    if (ggml_is_empty(add) || ggml_is_empty(topk)) {
+        return false;
+    }
+
+    // only the gathered scores may be the accumulator; src1 is the additive mask and must
+    // not alias them, or the kernel would add the scores to themselves
+    const ggml_tensor * rhs = add->src[1];
+    if (add->src[0] != cont_out || !rhs || rhs == cont_out || rhs->view_src == cont_out) {
+        return false;
+    }
+    if (i_add > i + 4 && rhs != cgraph->nodes[i_add - 1]) {
+        return false;
+    }
+    if (add->type != GGML_TYPE_F32 || rhs->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(add, cont_out) || !ggml_are_same_shape(rhs, add)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(add) || !ggml_is_contiguous(rhs)) {
+        return false;
+    }
+    if (ggml_node_get_use_count(cgraph, i_add) != 1) {
+        return false;
+    }
+
+    // the f16 the cast would promote is what the kernel reads, so it must share ne0 with the ADD
+    if (i_cast >= 0 && cgraph->nodes[i_cast]->src[0]->ne[0] != add->ne[0]) {
+        return false;
+    }
+
+    const int k = (int) topk->ne[0];
+    if (topk->type != GGML_TYPE_I32 || topk->src[0] != add || !ggml_is_contiguous(topk)) {
+        return false;
+    }
+    if (topk->ne[1] != add->ne[1] || topk->ne[2] != add->ne[2] || topk->ne[3] != add->ne[3]) {
+        return false;
+    }
+    // below this k the op picks the scan-merge kernel, which this path does not implement
+    if (k <= SYCL_TOP_K_SCAN_MERGE_MAX_K || k > add->ne[0] || add->ne[0] > INT32_MAX) {
+        return false;
+    }
+
+    if (out) {
+        *out = { i, i + 1, i + 3, i_cast, i_add, i_add + 1 };
+    }
+    return true;
+}
+
+bool ggml_sycl_can_fuse_qsa_topk(const ggml_cgraph * cgraph, int i) {
+    return g_ggml_sycl_enable_fusion && g_ggml_sycl_fuse_qsa_topk && ggml_sycl_qsa_topk_shape(cgraph, i, nullptr);
+}
+
+// The absorbed nodes are not consecutive: the two views inside the chain keep their normal
+// bookkeeping, which is what makes ggml-alloc release the chain's sources at the TOP_K.
+static bool qsa_topk_node_absorbed(const qsa_topk_chain & c, int n) {
+    return n == c.i_cont_in || n == c.i_rows || n == c.i_cont_out || n == c.i_cast || n == c.i_add;
+}
+
+int ggml_sycl_qsa_topk_absorbs(const ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_qsa_topk) {
+        return 0;
+    }
+
+    for (int back = 0; back <= SYCL_QSA_TOPK_MAX_SPAN && node_idx - back >= 0; ++back) {
+        qsa_topk_chain c;
+        if (!ggml_sycl_qsa_topk_shape(cgraph, node_idx - back, &c)) {
+            continue;
+        }
+        // report a run from its first node only, so the caller counts each node once
+        if (qsa_topk_node_absorbed(c, node_idx - 1)) {
+            return 0;
+        }
+        int run = 0;
+        while (qsa_topk_node_absorbed(c, node_idx + run)) {
+            run++;
+        }
+        return run;
+    }
+    return 0;
+}
+
+// Runs the chain matched by ggml_sycl_can_fuse_qsa_topk(); returns the extra nodes consumed.
+int ggml_sycl_fuse_qsa_topk(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    qsa_topk_chain c;
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_qsa_topk || !ggml_sycl_qsa_topk_shape(cgraph, i, &c)) {
+        return 0;
+    }
+
+    const ggml_tensor * src  = cgraph->nodes[c.i_cont_in]->src[0];
+    const ggml_tensor * idx  = cgraph->nodes[c.i_rows]->src[1];
+    const ggml_tensor * add  = cgraph->nodes[c.i_add];
+    ggml_tensor *       topk = cgraph->nodes[c.i_topk];
+
+    const int64_t ncols = add->ne[0];
+    const int64_t nrows = ggml_nrows(add);
+    const int     k     = (int) topk->ne[0];
+
+    const ggml_tensor * mask = c.i_cast >= 0 ? cgraph->nodes[c.i_cast]->src[0] : add->src[1];
+
+    const char *    score_dd = (const char *) src->data;
+    const int32_t * idx_dd   = (const int32_t *) idx->data;
+    const char *    mask_dd  = (const char *) mask->data;
+    int32_t *       dst_dd   = (int32_t *) topk->data;
+
+    // GGML_SYCL_QSA_TOPK_TRACE gives the number of firings to report
+    static std::atomic<int> trace_left{ getenv("GGML_SYCL_QSA_TOPK_TRACE") ?
+                                        std::max(1, atoi(getenv("GGML_SYCL_QSA_TOPK_TRACE"))) : 0 };
+    if (trace_left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[QSATOPK] ncols=%ld nrows=%ld k=%d cast=%d mask=%s score=%p idx=%p mask=%p dst=%p\n",
+                (long) ncols, (long) nrows, k, c.i_cast >= 0, ggml_type_name(mask->type),
+                (const void *) score_dd, (const void *) idx_dd, (const void *) mask_dd, (void *) dst_dd);
+    }
+
+    GGML_ASSERT(score_dd && idx_dd && mask_dd && dst_dd);
+
+    const size_t nb_mask_row = (size_t) ncols * ggml_type_size(mask->type);
+
+    if (mask->type == GGML_TYPE_F16) {
+        top_k_radix_rows(ctx, top_k_rows_qsa<sycl::half>{ score_dd, idx_dd, mask_dd, src->nb[1], src->nb[0], nb_mask_row },
+                         dst_dd, ncols, nrows, k, ctx.stream());
+    } else {
+        GGML_ASSERT(mask->type == GGML_TYPE_F32);
+        top_k_radix_rows(ctx, top_k_rows_qsa<float>{ score_dd, idx_dd, mask_dd, src->nb[1], src->nb[0], nb_mask_row },
+                         dst_dd, ncols, nrows, k, ctx.stream());
+    }
+
+    return c.i_topk - i;
 }

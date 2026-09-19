@@ -64,10 +64,53 @@ static inline uint32_t top_k_radix_key(float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
+// Where a top-k row's values come from. A plain row is a pointer; the QSA indexer fusion
+// builds the value from the block score and the mask instead of reading a materialized row.
+struct top_k_src_ptr {
+    const float * src;
+
+    float operator()(int col) const { return src[col]; }
+};
+
+struct top_k_rows_ptr {
+    const float * src;
+    int64_t       ncols;
+
+    top_k_src_ptr row(int64_t r) const { return { src + r*ncols }; }
+};
+
+// value(c, t) = score[idx[c], t] + mask[c, t]: the QSA indexer chain, without the two
+// full-size copies the graph would otherwise write.
+template <typename mask_t> struct top_k_src_qsa {
+    const char *    score;
+    const int32_t * idx;
+    const mask_t *  mask;
+    size_t          nb_blk;
+
+    float operator()(int col) const {
+        const float s = *(const float *) (score + (int64_t) idx[col]*nb_blk);
+        return s + (float) mask[col];
+    }
+};
+
+template <typename mask_t> struct top_k_rows_qsa {
+    const char *    score;
+    const int32_t * idx;
+    const char *    mask;
+    size_t          nb_blk;
+    size_t          nb_score_row;
+    size_t          nb_mask_row;
+
+    top_k_src_qsa<mask_t> row(int64_t r) const {
+        return { score + r*nb_score_row, idx, (const mask_t *) (mask + r*nb_mask_row), nb_blk };
+    }
+};
+
 // The selection step lives here because the fused topk-moe kernel reuses it: softmax and
 // sigmoid are monotonic, so the routing top-k can be taken on the raw logits.
-static inline void top_k_radix_select_f32(
-    const float *   src,
+template <typename Src>
+static inline void top_k_radix_select(
+    const Src &     src,
     int32_t *       dst_idx,
     const int       ncols,
     const int       k,
@@ -106,7 +149,7 @@ static inline void top_k_radix_select_f32(
         item_ct1.barrier(sycl::access::fence_space::local_space);
 
         for (int col = tid; col < ncols; col += block_size) {
-            const uint32_t key = top_k_radix_key(src[col]);
+            const uint32_t key = top_k_radix_key(src(col));
             if ((key & mask) == prefix) {
                 const uint32_t bucket = (key >> shift) & (SYCL_TOP_K_RADIX_BUCKETS - 1);
                 local_atomic(hist[bucket * SYCL_TOP_K_RADIX_HIST_COPIES + copy]).fetch_add(1u);
@@ -155,7 +198,7 @@ static inline void top_k_radix_select_f32(
     const uint32_t base_eq = (uint32_t) k - need;
 
     for (int col = tid; col < ncols; col += block_size) {
-        const uint32_t kp = top_k_radix_key(src[col]) & mask;
+        const uint32_t kp = top_k_radix_key(src(col)) & mask;
         if (kp > prefix) {
             const uint32_t pos = local_atomic(*s_cnt_gt).fetch_add(1u);
             dst_idx[pos] = col;
@@ -167,3 +210,21 @@ static inline void top_k_radix_select_f32(
         }
     }
 }
+
+static inline void top_k_radix_select_f32(
+    const float *   src,
+    int32_t *       dst_idx,
+    const int       ncols,
+    const int       k,
+    uint32_t *      slm,
+    const sycl::nd_item<1> & item_ct1
+) {
+    top_k_radix_select(top_k_src_ptr{ src }, dst_idx, ncols, k, slm, item_ct1);
+}
+
+// CONT(PERMUTE(score)) -> GET_ROWS -> PERMUTE -> CONT -> [f16 mask cast] -> ADD -> TOP_K:
+// the QSA indexer chain, taken by the top-k straight off the score and the mask.
+// can_fuse() is structural only, so ggml-alloc and the compute loop always agree on it.
+bool ggml_sycl_can_fuse_qsa_topk(const ggml_cgraph * cgraph, int node_idx);
+int  ggml_sycl_qsa_topk_absorbs(const ggml_cgraph * cgraph, int node_idx);
+int  ggml_sycl_fuse_qsa_topk(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx);

@@ -394,13 +394,42 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_ASSERT(max_bias == 0.0f);  // ALiBi not supported
     GGML_ASSERT(Q->ne[3] == K->ne[3] || K->ne[3] == 1);
 
-    const int chunk_size = std::min(MKL_FA_CHUNK_SIZE_KV, n_kv);
+    const bool V_is_K_view = V->view_src
+        && (V->view_src == K || (V->view_src == K->view_src
+            && V->view_offs == K->view_offs));
+
+    static int chunk_env = ggml_sycl_get_env("GGML_SYCL_MKL_FA_CHUNK_KV", MKL_FA_CHUNK_SIZE_KV);
+    int chunk_size = std::min(std::max(1, chunk_env), n_kv);
 
     // Query rows are processed in tiles of q_tile_rows so the score buffers
     // (KQ_f32/S_f16 = q_tile_rows * chunk_size) stay bounded regardless of
     // batch size. n_query_rows <= Q_TILE is a single tile (no extra work).
     static int q_tile_env = ggml_sycl_get_env("GGML_SYCL_MKL_FA_Q_TILE", MKL_FA_Q_TILE);
-    const int q_tile_rows = std::max(1, std::min(q_tile_env, n_query_rows));
+    int q_tile_rows = std::max(1, std::min(q_tile_env, n_query_rows));
+
+    // GGML_SYCL_FA_MAX_MEM_MIB is a ceiling on the scratch this kernel holds at once, and it is
+    // the only knob: the KV chunk and the query tile are both derived from it. The per-row
+    // accumulators do not chunk, so they come off the top. Halve the chunk before letting the
+    // query tile collapse, because a one-row tile makes every GEMM a poor shape.
+    //
+    // Spend a quarter of the ceiling. The whole reason to come here is that the whole-cache copy
+    // did not fit the ceiling, so replacing it with something the same size wins nothing, and a
+    // quarter already buys GEMM shapes that saturate the XMX units.
+    if (g_ggml_sycl_fa_max_mem_mib > 0) {
+        const int64_t budget   = ((int64_t) g_ggml_sycl_fa_max_mem_mib << 20) / 4;
+        const int64_t fixed    = (int64_t) n_query_rows * (DV * 4 + DKQ * 2 + 8);
+        const int64_t kv_bytes = (int64_t) (DKQ + (V_is_K_view ? 0 : DV)) * 2;
+        while (true) {
+            const int64_t avail    = budget - fixed - (int64_t) chunk_size * kv_bytes;
+            const int64_t per_row  = (int64_t) chunk_size * 6 + DV * 4;
+            const int64_t fits     = avail > 0 ? avail / per_row : 0;
+            if (fits >= 64 || chunk_size <= 256) {
+                q_tile_rows = (int) std::max<int64_t>(1, std::min<int64_t>(q_tile_rows, fits));
+                break;
+            }
+            chunk_size = std::max(256, chunk_size / 2);
+        }
+    }
 
     const int64_t wg_size = MKL_FA_WG_SIZE;
 
@@ -412,10 +441,6 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     const int64_t q_row_stride  = Q->nb[1] / sizeof(float);
     const int64_t q_head_stride = Q->nb[2] / sizeof(float);
-
-    const bool V_is_K_view = V->view_src
-        && (V->view_src == K || (V->view_src == K->view_src
-            && V->view_offs == K->view_offs));
 
     // Early interleaved detection for debug output.
     // True interleaved detection happens after dequant (nb12_fp16 == nb11_fp16),

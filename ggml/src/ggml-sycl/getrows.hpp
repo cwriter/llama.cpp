@@ -19,6 +19,7 @@ void ggml_sycl_op_get_rows(ggml_backend_sycl_context & ctx, ggml_tensor *dst);
 
 // CONT(PERMUTE(score)) -> GET_ROWS -> PERMUTE -> CONT at node_idx: the QSA indexer gather.
 // can_fuse() is structural only, so ggml-alloc and the compute loop always agree on it.
+bool ggml_sycl_qsa_gather_shape(const ggml_cgraph * cgraph, int node_idx);
 bool ggml_sycl_can_fuse_qsa_gather(const ggml_cgraph * cgraph, int node_idx);
 int  ggml_sycl_fuse_qsa_gather(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx);
 
