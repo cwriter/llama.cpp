@@ -40,6 +40,10 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst);
 
 size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
 
+// True when GGML_SYCL_FA_MAX_MEM_MIB rejects the whole-cache F16 staging that oneDNN and TILE
+// need, so the chunked oneMKL kernel takes the node instead and nothing has to be reserved.
+bool ggml_sycl_fattn_stage_capped(const ggml_tensor * dst);
+
 void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 #endif // GGML_SYCL_FATTN_HPP
