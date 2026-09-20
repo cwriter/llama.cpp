@@ -1496,6 +1496,42 @@ static void dequantize_block_iq3_xxs(const void * __restrict__ vx, dst_t * __res
 
 }
 
+// reorder layout: qs, gas and d are three streams over the nb superblocks of the tensor.
+// Same decode as dequantize_block_iq3_xxs, only the addresses differ.
+template<typename dst_t>
+static void dequantize_block_iq3_xxs_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                             const sycl::nd_item<3> &item_ct1, const int64_t nb,
+                                             const uint32_t *iq3xxs_grid,
+                                             const uint8_t *ksigns_iq2xs,
+                                             const uint8_t *kmask_iq2xs) {
+
+    const int64_t i = item_ct1.get_group(2);
+
+    const int64_t tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    const uint8_t * base = (const uint8_t *) vx;
+    const uint8_t * qs = base + i*(3*QK_K/8);
+    const ggml_half * dall = (const ggml_half *) (base + nb*(3*QK_K/8));
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint8_t  * q3 = qs + 8*ib;
+    const uint16_t * gas = (const uint16_t *)(qs + QK_K/4) + 2*ib;
+    const uint8_t  * grid1 = (const uint8_t *)(iq3xxs_grid + q3[2*il+0]);
+    const uint8_t  * grid2 = (const uint8_t *)(iq3xxs_grid + q3[2*il+1]);
+    const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    const float d = (float)dall[i] * (0.5f + (aux32 >> 28)) * 0.5f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+    for (int j = 0; j < 4; ++j) {
+        y[j+0] = d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
+        y[j+4] = d * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
+    }
+#else
+    assert(false);
+#endif
+
+}
+
 template <typename dst_t>
 __dpct_inline__ static void
 dequantize_block_iq3_s(const void *__restrict__ vx, dst_t *__restrict__ yy,
@@ -1520,6 +1556,52 @@ dequantize_block_iq3_s(const void *__restrict__ vx, dst_t *__restrict__ yy,
     // y is 8 element aligned, so each half of the group goes out as one 4 wide store. 4 and
     // not 8: a float8 would need 32 byte alignment, which only holds for the f32 instantiation
     // by luck of the base pointer. kmask_iq2xs is 1, 2, 4 ... so the sign bit is just a shift.
+    sycl::vec<dst_t, 4> lo;
+    sycl::vec<dst_t, 4> hi;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float v1 = (float) ((grid1 >> (8*j)) & 0xff);
+        const float v2 = (float) ((grid2 >> (8*j)) & 0xff);
+        lo[j] = d * v1 * ((signs & (1u << (j+0))) ? -1.f : 1.f);
+        hi[j] = d * v2 * ((signs & (1u << (j+4))) ? -1.f : 1.f);
+    }
+    *(sycl::vec<dst_t, 4> *) (y + 0) = lo;
+    *(sycl::vec<dst_t, 4> *) (y + 4) = hi;
+    GGML_UNUSED(kmask_iq2xs);
+#else
+    assert(false);
+#endif
+
+}
+
+// reorder layout: qs, qh, signs and the {d, scales} record are four streams over the nb
+// superblocks of the tensor. Same decode as dequantize_block_iq3_s, only the addresses differ.
+template <typename dst_t>
+__dpct_inline__ static void
+dequantize_block_iq3_s_reorder(const void *__restrict__ vx, dst_t *__restrict__ yy,
+                               const sycl::nd_item<3> &item_ct1, const int64_t nb,
+                               const uint8_t *kmask_iq2xs, const uint32_t *iq3s_grid) {
+
+    const int64_t i = item_ct1.get_group(2);
+
+    const int64_t tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int64_t il = tid/8; // 0...3
+    const int64_t ib = tid%8; // 0...7
+    const uint8_t * base     = (const uint8_t *) vx;
+    const uint8_t * qs       = base + i*(QK_K/4) + 8*ib;
+    const uint8_t * qh       = base + nb*(QK_K/4) + i*(QK_K/32);
+    const uint8_t * signs_b  = base + nb*(QK_K/4 + QK_K/32) + i*(QK_K/8);
+    const uint8_t * metadata = base + nb*(QK_K/4 + QK_K/32 + QK_K/8) + i*(sizeof(ggml_half) + IQ3S_N_SCALE);
+    const ggml_half dq       = *(const ggml_half *) metadata;
+    const uint8_t * scales   = metadata + sizeof(ggml_half);
+
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint32_t grid1 = iq3s_grid[qs[2*il+0] | ((qh[ib] << (8-2*il)) & 256)];
+    const uint32_t grid2 = iq3s_grid[qs[2*il+1] | ((qh[ib] << (7-2*il)) & 256)];
+    const float d = (float)dq * (1 + 2*((scales[ib/2] >> 4*(ib%2)) & 0xf));
+    const uint8_t signs = signs_b[4*ib + il];
+
     sycl::vec<dst_t, 4> lo;
     sycl::vec<dst_t, 4> hi;
 #pragma unroll
