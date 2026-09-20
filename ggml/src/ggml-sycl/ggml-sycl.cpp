@@ -119,10 +119,11 @@ int g_ggml_sycl_grouped_gemm = 1;
 int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_fuse_cast_add = 1;
 int g_ggml_sycl_fuse_cont_add = 0;
-int g_ggml_sycl_fuse_qsa_gather = 0;
-int g_ggml_sycl_fuse_qsa_topk = 0;
-int g_ggml_sycl_fuse_qsa_score = 0;
+int g_ggml_sycl_fuse_qsa_gather = 1;
+int g_ggml_sycl_fuse_qsa_topk = 1;
+int g_ggml_sycl_fuse_qsa_score = 1;
 int g_ggml_sycl_fuse_qsa_mask = 0;
+int g_ggml_sycl_fuse_qsa_fa_mask = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
 int g_ggml_sycl_topk_moe_radix = 1;
@@ -137,7 +138,7 @@ int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
 int g_ggml_sycl_get_mem_api = MEMORY_API_TYPE_LEVEL_ZERO;
-int g_ggml_sycl_enable_sparse_fa = 0;
+int g_ggml_sycl_enable_sparse_fa = 1;
 int g_ggml_sycl_debug_sparse_fa = 0;
 int g_ggml_sycl_sparse_fa_margin = 256;
 
@@ -407,10 +408,11 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
         g_ggml_sycl_fuse_cast_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CAST_ADD", 1);
         g_ggml_sycl_fuse_cont_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CONT_ADD", 0);
-        g_ggml_sycl_fuse_qsa_gather = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_GATHER", 0);
-        g_ggml_sycl_fuse_qsa_topk = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_TOPK", 0);
-        g_ggml_sycl_fuse_qsa_score = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_SCORE", 0);
+        g_ggml_sycl_fuse_qsa_gather = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_GATHER", 1);
+        g_ggml_sycl_fuse_qsa_topk = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_TOPK", 1);
+        g_ggml_sycl_fuse_qsa_score = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_SCORE", 1);
         g_ggml_sycl_fuse_qsa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_MASK", 0);
+        g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
         g_ggml_sycl_topk_moe_radix = ggml_sycl_get_env("GGML_SYCL_TOPK_MOE_RADIX", 1);
@@ -441,7 +443,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_host_pinned_mem_2g =
             ggml_sycl_get_env("GGML_SYCL_HOST_PINNED_MEM_2G", 0) & g_ggml_sycl_enable_host_pinned_mem;
 
-        g_ggml_sycl_enable_sparse_fa  = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA", 0);
+        g_ggml_sycl_enable_sparse_fa  = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA", 1);
         g_ggml_sycl_debug_sparse_fa   = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_DEBUG", 0);
         g_ggml_sycl_sparse_fa_margin  = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_MARGIN", 256);
 
@@ -533,6 +535,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_TOPK: %d\n", g_ggml_sycl_fuse_qsa_topk);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_SCORE: %d\n", g_ggml_sycl_fuse_qsa_score);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_MASK: %d\n", g_ggml_sycl_fuse_qsa_mask);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
         GGML_LOG_INFO("  GGML_SYCL_TOPK_MOE_RADIX: %d\n", g_ggml_sycl_topk_moe_radix);
@@ -6713,6 +6716,9 @@ static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx
 }
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
+    // returns anything a previous graph left behind between a QSA mask chain and its reader
+    sycl_ctx->qsa_sel_reset();
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_sycl_is_view_or_noop(node)) {
@@ -6727,6 +6733,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i += nodes_to_skip;
             continue;
         }
+
+        // flash attention whose dense QSA mask was absorbed: run it off the selection bitmap
+        if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_qsa_fa_mask(*sycl_ctx, cgraph, i)) {
+            continue;
+        }
+
 #ifndef NDEBUG
         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
         for (int j = 0; j < GGML_MAX_SRC; j++) {
