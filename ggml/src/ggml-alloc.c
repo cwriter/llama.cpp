@@ -633,7 +633,7 @@ static struct hash_node * ggml_gallocr_hash_get(ggml_gallocr_t galloc, struct gg
 static bool ggml_gallocr_inplace_views(ggml_gallocr_t galloc) {
     GGML_UNUSED(galloc);
     static int en = -1;
-    if (en < 0) { const char * e = getenv("GGML_ALLOC_INPLACE_VIEWS"); en = e ? atoi(e) : 0; }
+    if (en < 0) { const char * e = getenv("GGML_ALLOC_INPLACE_VIEWS"); en = e ? atoi(e) : 1; }
     return en != 0;
 }
 
@@ -802,16 +802,15 @@ static void ggml_gallocr_release_parent(ggml_gallocr_t galloc, struct ggml_tenso
     }
 
     struct ggml_tensor * owner = parent;
+    bool owner_dead = true;
     if (ggml_impl_is_view(parent)) {
         owner = parent->view_src;
         struct hash_node * owner_hn = ggml_gallocr_hash_get(galloc, owner);
         owner_hn->n_views -= 1;
         AT_PRINTF("view_src %s: %d children, %d views\n",
             owner->name, owner_hn->n_children, owner_hn->n_views);
-        if (owner_hn->n_views != 0 || owner_hn->n_children != 0) {
-            return;
-        }
-        if (owner_hn->allocated) {
+        owner_dead = owner_hn->n_views == 0 && owner_hn->n_children == 0;
+        if (owner_dead && owner_hn->allocated) {
             ggml_gallocr_free_node(galloc, owner);
         }
     } else if (p_hn->allocated) {
@@ -819,7 +818,19 @@ static void ggml_gallocr_release_parent(ggml_gallocr_t galloc, struct ggml_tenso
     }
 
     // fusions are a handful of nodes, so the cap only guards against a malformed plan
-    if (depth < GGML_MAX_SRC && ggml_gallocr_hash_get(galloc, owner)->absorbed) {
+    if (depth >= GGML_MAX_SRC) {
+        return;
+    }
+    // an absorbed view never ran either, so its consumer is the real reader of what it read
+    if (parent != owner && p_hn->absorbed) {
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            struct ggml_tensor * src = parent->src[j];
+            if (src != NULL && src != parent) {
+                ggml_gallocr_release_parent(galloc, src, depth + 1);
+            }
+        }
+    }
+    if (owner_dead && ggml_gallocr_hash_get(galloc, owner)->absorbed) {
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = owner->src[j];
             if (src != NULL && src != owner) {
