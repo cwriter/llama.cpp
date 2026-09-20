@@ -178,6 +178,54 @@ template <> struct block_q_t<GGML_TYPE_Q6_K> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+template <> struct block_q_t<GGML_TYPE_IQ3_XXS> {
+    struct traits {
+        static constexpr uint32_t qk       = QK_K;
+        static constexpr uint32_t qi       = QI3_XXS / 2;
+        static constexpr uint32_t qr       = QR3_XXS;
+        static constexpr uint32_t vdr_mmvq = 1;
+    };
+
+    // Reordered layout: [qs (3*QK_K/8 per block)] [d]
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
+        return { block_index * (3 * QK_K / 8), 0 };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        auto nblocks = (nrows * (ncols / QK_K));
+        return { nblocks * (3 * QK_K / 8) + block_index * sizeof(ggml_half), 0 };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
+template <> struct block_q_t<GGML_TYPE_IQ3_S> {
+    struct traits {
+        static constexpr uint32_t qk       = QK_K;
+        static constexpr uint32_t qi       = QI3_S / 2;
+        static constexpr uint32_t qr       = QR3_S;
+        static constexpr uint32_t vdr_mmvq = 1;
+    };
+
+    // Reordered layout: [qs (QK_K/4)] [qh (QK_K/32)] [signs (QK_K/8)] [{d, scales} (6 bytes)].
+    // d and scales stay together so the dot still needs only two offset pairs.
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int n_blocks) {
+        auto qs_offset = block_index * (QK_K / 4);
+        auto qh_offset = n_blocks * (QK_K / 4) + block_index * (QK_K / 32);
+        return { qs_offset, qh_offset };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        auto nblocks       = (nrows * (ncols / QK_K));
+        auto signs_base    = nblocks * (QK_K / 4 + QK_K / 32);
+        auto metadata_base = signs_base + nblocks * (QK_K / 8);
+        return { signs_base + block_index * (QK_K / 8),
+                 metadata_base + block_index * (int) (sizeof(ggml_half) + IQ3S_N_SCALE) };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
 template <> struct block_q_t<GGML_TYPE_Q8_0> {
     struct traits {
         static constexpr uint32_t qk       = QK8_0;      // 32

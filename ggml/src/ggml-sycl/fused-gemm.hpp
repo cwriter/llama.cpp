@@ -15,6 +15,12 @@ constexpr bool ggml_sycl_fused_dequant_gemm_f16_type_ok(ggml_type src0_type, int
            (src0_type == GGML_TYPE_IQ3_S && QK_K == 256 && K % QK_K == 0);
 }
 
+// weight formats whose A stage also reads the reorder (SoA) layout. A reordered weight of any
+// other type must not reach the fused kernels: the decode would be silently wrong.
+constexpr bool ggml_sycl_fused_dequant_gemm_f16_reorder_ok(ggml_type src0_type) {
+    return src0_type == GGML_TYPE_IQ3_S;
+}
+
 constexpr bool ggml_sycl_fused_dequant_gemm_f16_shape_ok(ggml_type src0_type, int64_t M, int64_t N, int64_t K,
                                                          int64_t ldd) {
     return ggml_sycl_fused_dequant_gemm_f16_type_ok(src0_type, K) && M > 0 && N > 0 && K > 0 &&
@@ -41,18 +47,21 @@ bool ggml_sycl_small_gemm_f32_device_ok(dpct::queue_ptr stream);
 
 // dst[n*ldd + m] = sum_k dequant(src0)[m*K + k] * src1_f16[n*K + k]
 // Returns false when the case is not handled (type, device, or shape).
+// `reordered` says src0 is in the reorder (SoA) layout; src0 must then be the base of the whole
+// reordered region, because the SoA offsets are relative to it.
 bool ggml_sycl_fused_dequant_gemm_f16(ggml_type src0_type, const void * src0, const sycl::half * src1_f16, float * dst,
-                                      int64_t M, int64_t N, int64_t K, int64_t ldd, ggml_sycl_pool & pool,
-                                      dpct::queue_ptr stream);
+                                      int64_t M, int64_t N, int64_t K, int64_t ldd, bool reordered,
+                                      ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
 // One launch for every expert of a MUL_MAT_ID: rows of src1/dst are grouped by expert, expert e
 // owns rows [expert_row_offsets[e], expert_row_offsets[e+1]) and reads its weights at
 // src0_base + e*expert_stride. tiles is host scratch that must stay alive until the queue drains.
 // dst[n*M + m] = sum_k dequant(src0_e)[m*K + k] * src1[n*K + k]
 // Returns false when the case is not handled (type, device, or shape).
+// `reordered` says every expert slice is in the reorder (SoA) layout, reordered per slice.
 bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_base, size_t expert_stride,
                                         const float * src1, float * dst, const int64_t * expert_row_offsets,
-                                        int64_t n_as, int64_t M, int64_t K, int64_t total_rows,
+                                        int64_t n_as, int64_t M, int64_t K, int64_t total_rows, bool reordered,
                                         std::vector<ggml_sycl_gg_tile> & tiles, ggml_sycl_pool & pool,
                                         dpct::queue_ptr stream);
 
