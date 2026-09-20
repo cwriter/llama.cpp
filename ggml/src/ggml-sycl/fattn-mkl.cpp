@@ -119,6 +119,7 @@ static void mkl_fa_init_softmax_state(
 // identical to the original one-item-per-row kernel: softcap before
 // mask, native::exp, -1e30 sentinel, half-precision S. Only the float
 // summation order differs (tree vs serial), i.e. last-ulp level.
+template <int SEL>
 static void mkl_fa_online_softmax_chunk(
     dpct::queue_ptr stream,
     float * __restrict KQ_f32,
@@ -131,6 +132,7 @@ static void mkl_fa_online_softmax_chunk(
     int kvh_head,
     const sycl::half * mask_data, int64_t mask_head_stride,
     int64_t mask_row_stride, int mask_n_heads,
+    const uint32_t * sel_bits, int64_t sel_words,
     float logit_softcap, int64_t wg_size) {
 
     // One work-group per query row: exactly q_rows groups of wg_size
@@ -156,21 +158,29 @@ static void mkl_fa_online_softmax_chunk(
                     + jc_abs * (int64_t)DV;
                 const sycl::half * mask_h = nullptr;
                 int64_t m_stride = 0;
-                if (mask_data) {
+                if (SEL != 2 && mask_data) {
                     int m_head = (mask_n_heads > 1)
                         ? (kvh_head + gqa_group) : 0;
                     mask_h   = mask_data + (int64_t)m_head * mask_head_stride;
                     m_stride = mask_row_stride;
                 }
-                // Score at chunk offset i — original per-element math.
+                const uint32_t * __restrict sel_row = SEL ? sel_bits + q_row * sel_words : nullptr;
+                // Score at chunk offset i - original per-element math.
                 auto score = [&](int i) {
+                    const int c = chunk_start + i;
+                    if (SEL) {
+                        const uint32_t w = sel_row[c >> 5];
+                        if (((w >> (c & 31)) & 1u) == 0) {
+                            return -INFINITY;
+                        }
+                    }
                     float s = KQ_row[i];
                     if (logit_softcap != 0.0f) {
                         s = logit_softcap * sycl::tanh(s);
                     }
-                    if (mask_h) {
-                        s += (float)mask_h[q_row * m_stride
-                            + (chunk_start + i)];
+                    // SEL 2 folds the causal mask into the bit, so the dense mask is not read
+                    if (SEL != 2 && mask_h) {
+                        s += (float)mask_h[q_row * m_stride + c];
                     }
                     return s;
                 };
@@ -360,7 +370,8 @@ static void mkl_fa_dequant_chunk(
 //   pack GQA Q heads → MKL GEMM KQ → online softmax →
 //   MKL GEMM VKQ → accumulate → normalize → scatter to dst
 // ---------------------------------------------------------------------------
-void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                  const uint32_t * sel_bits, int64_t sel_words, int sel_mode) {
 
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -409,8 +420,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     // GGML_SYCL_FA_MAX_MEM_MIB is a ceiling on the scratch this kernel holds at once, and it is
     // the only knob: the KV chunk and the query tile are both derived from it. The per-row
-    // accumulators do not chunk, so they come off the top. Halve the chunk before letting the
-    // query tile collapse, because a one-row tile makes every GEMM a poor shape.
+    // accumulators do not chunk, so they come off the top.
     //
     // Spend a quarter of the ceiling. The whole reason to come here is that the whole-cache copy
     // did not fit the ceiling, so replacing it with something the same size wins nothing, and a
@@ -419,11 +429,15 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
         const int64_t budget   = ((int64_t) g_ggml_sycl_fa_max_mem_mib << 20) / 4;
         const int64_t fixed    = (int64_t) n_query_rows * (DV * 4 + DKQ * 2 + 8);
         const int64_t kv_bytes = (int64_t) (DKQ + (V_is_K_view ? 0 : DV)) * 2;
+        // The softmax gets its parallelism from the work group, not from the tile width, so prefer
+        // the widest chunk the ceiling allows: fewer dequant calls and a longer GEMM K. Narrow the
+        // chunk only when the tile would otherwise be too thin for a sane GEMM.
+        const int64_t want = std::min<int64_t>(64, q_tile_rows);
         while (true) {
             const int64_t avail    = budget - fixed - (int64_t) chunk_size * kv_bytes;
             const int64_t per_row  = (int64_t) chunk_size * 6 + DV * 4;
             const int64_t fits     = avail > 0 ? avail / per_row : 0;
-            if (fits >= 64 || chunk_size <= 256) {
+            if (fits >= want || chunk_size <= 256) {
                 q_tile_rows = (int) std::max<int64_t>(1, std::min<int64_t>(q_tile_rows, fits));
                 break;
             }
@@ -438,6 +452,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     mkl_call_count++;
     static int mkl_debug = ggml_sycl_get_env("GGML_SYCL_MKL_FA_DEBUG", 0);
     const bool do_print = (mkl_debug == 1);
+    static int mkl_fa_drain = ggml_sycl_get_env("GGML_SYCL_MKL_FA_DRAIN", 0);
 
     const int64_t q_row_stride  = Q->nb[1] / sizeof(float);
     const int64_t q_head_stride = Q->nb[2] / sizeof(float);
@@ -475,10 +490,14 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     dpct::queue_ptr stream = ctx.stream();
 
 #define MKL_TAKE_TIME(t0)  auto t0 = std::chrono::steady_clock::now()
-#define MKL_ACCUM(acc, t0) do { if (do_print) { \
+// The queue is in order, so no stage needs a drain. Drain only in debug mode, to keep the
+// breakdown below attributing device time to the stage that caused it.
+#define MKL_ACCUM(acc, t0) do { if (mkl_fa_drain) { stream->wait(); } if (do_print) { \
     acc += (int64_t)std::chrono::duration_cast \
     <std::chrono::microseconds>(std::chrono::steady_clock::now() - (t0)).count(); \
 } } while(0)
+
+    MKL_TAKE_TIME(t_all);
 
     int64_t gemm_kq_time_us  = 0;
     int64_t gemm_vkq_time_us = 0;
@@ -570,6 +589,12 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 + m_batch * (mask->nb[3] / 2);  // 2 = actual fp16 device size
         }
 
+        // the bitmap is packed the same way as the mask: one plane of n_queries rows per batch
+        const uint32_t * sel_batch = sel_bits;
+        if (sel_bits && mask && mask->ne[3] > 1) {
+            sel_batch += (int64_t)ib * n_queries * sel_words;
+        }
+
         for (int ikvh = 0; ikvh < n_kv_heads; ikvh++) {
             int kvh_base_head = ikvh * gqa_ratio;
 
@@ -585,8 +610,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
                 n_query_rows, DV, wg_size);
 
-            // Sync before MKL GEMM (MKL may use an internal queue)
-            stream->wait();
+            if (mkl_fa_drain) { stream->wait(); }
 
             // 3. KV chunk loop (OUTER): dequant each chunk once, then tile queries.
             for (int chunk_start = 0; chunk_start < n_kv; chunk_start += chunk_size) {
@@ -601,7 +625,6 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                         mkl_fa_dequant_chunk(stream, V_desc, KQV,
                             V_chunk_f16_ptr, ikvh, chunk_start, this_chunk);
                     }
-                    stream->wait();  // dequant must be ready before MKL GEMM
                     MKL_ACCUM(dequant_time_us, t0);
                 }
 
@@ -612,15 +635,16 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                     // GEMM: KQ = Q_tile × K_chunk^T
                     {
                         MKL_TAKE_TIME(t0);
-                        sycl::event ev = gemm(*stream,
-                            transpose::trans, transpose::nontrans,
-                            this_chunk, q_rows, DKQ,
-                            alpha,
-                            K_chunk_f16_ptr, DKQ,
-                            Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
-                            beta,
-                            KQ_f32_ptr, this_chunk);
-                        try { ev.wait_and_throw(); } catch (sycl::exception & e) {
+                        try {
+                            gemm(*stream,
+                                transpose::trans, transpose::nontrans,
+                                this_chunk, q_rows, DKQ,
+                                alpha,
+                                K_chunk_f16_ptr, DKQ,
+                                Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
+                                beta,
+                                KQ_f32_ptr, this_chunk);
+                        } catch (sycl::exception & e) {
                             GGML_LOG_INFO("[MKL-FA] GEMM KQ: %s\n", e.what());
                             GGML_ABORT("MKL GEMM KQ failed");
                         }
@@ -629,7 +653,10 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                     // Online softmax over this chunk for this query tile
                     {
                         MKL_TAKE_TIME(t0);
-                        mkl_fa_online_softmax_chunk(stream,
+                        auto softmax = sel_mode == 2 ? mkl_fa_online_softmax_chunk<2>
+                                     : sel_mode == 1 ? mkl_fa_online_softmax_chunk<1>
+                                                     : mkl_fa_online_softmax_chunk<0>;
+                        softmax(stream,
                             KQ_f32_ptr, S_f16_ptr,
                             KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
                             q0, q_rows, n_queries, DV,
@@ -637,23 +664,24 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                             kvh_base_head,
                             mask_batch, mask_head_stride,
                             mask_row_stride, mask_n_heads,
+                            sel_batch, sel_words,
                             logit_softcap, wg_size);
-                        stream->wait();  // S_f16 must be ready for GEMM
                         MKL_ACCUM(softmax_time_us, t0);
                     }
 
                     // GEMM: VKQ_chunk = S × V_chunk
                     {
                         MKL_TAKE_TIME(t0);
-                        sycl::event ev = gemm(*stream,
-                            transpose::nontrans, transpose::nontrans,
-                            DV, q_rows, this_chunk,
-                            alpha,
-                            V_chunk_f16_ptr, DV,
-                            S_f16_ptr, this_chunk,
-                            beta,
-                            VKQ_chunk_ptr, DV);
-                        try { ev.wait_and_throw(); } catch (sycl::exception & e) {
+                        try {
+                            gemm(*stream,
+                                transpose::nontrans, transpose::nontrans,
+                                DV, q_rows, this_chunk,
+                                alpha,
+                                V_chunk_f16_ptr, DV,
+                                S_f16_ptr, this_chunk,
+                                beta,
+                                VKQ_chunk_ptr, DV);
+                        } catch (sycl::exception & e) {
                             GGML_LOG_INFO("[MKL-FA] GEMM VKQ: %s\n", e.what());
                             GGML_ABORT("MKL GEMM VKQ failed");
                         }
@@ -690,6 +718,13 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
         }
     }
 
+    int64_t total_time_us = 0;
+    if (do_print) {
+        stream->wait();
+        total_time_us = (int64_t)std::chrono::duration_cast
+            <std::chrono::microseconds>(std::chrono::steady_clock::now() - t_all).count();
+    }
+
 #undef MKL_TAKE_TIME
 #undef MKL_ACCUM
 
@@ -707,13 +742,14 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
           + v_chunk_elems * (int64_t)sizeof(sycl::half)            // V_chunk_f16
         ) / (1024.0 * 1024.0);
         GGML_LOG_INFO("[MKL-FA] #%d n_kv=%d n_q=%d q_tile=%d time_us: "
-                "dequant=%lld GEMM_KQ=%lld softmax=%lld GEMM_VKQ=%lld "
+                "dequant=%lld GEMM_KQ=%lld softmax=%lld GEMM_VKQ=%lld total=%lld "
                 "buf_mb=%.1f\n",
                 mkl_call_count, n_kv, n_queries, q_tile_rows,
                 (long long)dequant_time_us,
                 (long long)gemm_kq_time_us,
                 (long long)softmax_time_us,
                 (long long)gemm_vkq_time_us,
+                (long long)total_time_us,
                 total_mb);
     }
 }
