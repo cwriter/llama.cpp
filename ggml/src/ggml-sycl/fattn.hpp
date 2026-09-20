@@ -44,6 +44,14 @@ size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
 // need, so the chunked oneMKL kernel takes the node instead and nothing has to be reserved.
 bool ggml_sycl_fattn_stage_capped(const ggml_tensor * dst);
 
-void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+// True when the dispatcher gives this node to the chunked oneMKL kernel. Only that kernel can
+// take a selection bitmap, so the QSA mask fusion asks here before it declines.
+bool ggml_sycl_fattn_picks_mkl(const ggml_tensor * dst);
+
+// sel_bits, when set, is one bit per (query row, kv cell): 1 keeps the cell. sel_mode 1 still
+// adds dst->src[3], sel_mode 2 says the bit already carries the causal mask, so it is not read.
+void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                  const uint32_t * sel_bits = nullptr, int64_t sel_words = 0,
+                                  int sel_mode = 0);
 
 #endif // GGML_SYCL_FATTN_HPP

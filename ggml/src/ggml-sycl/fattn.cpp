@@ -425,6 +425,19 @@ bool ggml_sycl_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_sycl_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
 
+// Mirrors the oneDNN-then-MKL order of ggml_sycl_get_best_fattn_kernel(). The device only
+// enters the VEC/TILE choice below MKL, so the answer does not depend on it.
+bool ggml_sycl_fattn_picks_mkl(const ggml_tensor * dst) {
+    if (!g_ggml_sycl_enable_flash_attention || dst->op != GGML_OP_FLASH_ATTN_EXT || !dst->src[0]) {
+        return false;
+    }
+    const bool stage_capped = ggml_sycl_fattn_stage_capped(dst);
+    if (dst->src[0]->ne[1] >= 32 && !stage_capped && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
+        return false;
+    }
+    return ggml_sycl_fattn_mkl_supported(dst);
+}
+
 bool ggml_sycl_flash_attn_ext_uses_library(int device, const ggml_tensor * dst) {
     const best_fattn_kernel kernel = ggml_sycl_get_best_fattn_kernel(device, dst);
     return kernel == BEST_FATTN_KERNEL_ONEDNN || kernel == BEST_FATTN_KERNEL_MKL;
