@@ -7019,9 +7019,9 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
     if (const int n = ggml_sycl_qsa_mask_absorbs(cgraph, node_idx)) {
         return n;
     }
-    // the transposed score copy and the gather output that the QSA kernel writes straight past
+    // the gather fusion runs at the first CONT and writes the last
     if (ggml_sycl_can_fuse_qsa_gather(cgraph, node_idx)) {
-        return 2;
+        return 3;
     }
     if (ggml_sycl_can_fuse_cast_add(cgraph, node_idx, NULL)) {
         return 1;
