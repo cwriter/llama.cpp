@@ -21,7 +21,6 @@
 // The chain is MUL_MAT -> RESHAPE -> RELU -> n_head x (VIEW, CONT or ADD).
 
 static constexpr int SYCL_QSA_SCORE_MAX_HEADS = 8;
-static constexpr int SYCL_QSA_SCORE_MAX_SPAN  = 2 * SYCL_QSA_SCORE_MAX_HEADS + 2;
 
 struct qsa_score_chain {
     int     i_mm;
@@ -173,36 +172,15 @@ bool ggml_sycl_can_fuse_qsa_score(const ggml_cgraph * cgraph, int i) {
     return g_ggml_sycl_enable_fusion && g_ggml_sycl_fuse_qsa_score && ggml_sycl_qsa_score_shape(cgraph, i, nullptr);
 }
 
-// The absorbed nodes are not adjacent: the reshape and the head views keep their normal
-// bookkeeping, which is what makes ggml-alloc release the chain's sources at the last ADD.
-static bool qsa_score_node_absorbed(const qsa_score_chain & c, int n) {
-    if (n == c.i_mm || n == c.i_mm + 2) {
-        return true;
-    }
-    return n >= c.i_mm + 4 && n < c.i_out && ((n - c.i_mm) % 2) == 0;
-}
-
 int ggml_sycl_qsa_score_absorbs(const ggml_cgraph * cgraph, int node_idx) {
     if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_qsa_score) {
         return 0;
     }
-
-    for (int back = 0; back <= SYCL_QSA_SCORE_MAX_SPAN && node_idx - back >= 0; ++back) {
-        qsa_score_chain c;
-        if (!ggml_sycl_qsa_score_shape(cgraph, node_idx - back, &c)) {
-            continue;
-        }
-        // report a run from its first node only, so the caller counts each node once
-        if (qsa_score_node_absorbed(c, node_idx - 1)) {
-            return 0;
-        }
-        int run = 0;
-        while (qsa_score_node_absorbed(c, node_idx + run)) {
-            run++;
-        }
-        return run;
+    qsa_score_chain c;
+    if (!ggml_sycl_qsa_score_shape(cgraph, node_idx, &c)) {
+        return 0;
     }
-    return 0;
+    return c.i_out - c.i_mm;
 }
 
 // dst[b, t0 + t, s] = sum over h of relu(tile[b, h, t, s])

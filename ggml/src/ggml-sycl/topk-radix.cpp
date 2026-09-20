@@ -420,9 +420,6 @@ void ggml_sycl_top_k_radix(
 // nothing for them. Every test below is structural, so the answer is the same before and after
 // allocation.
 
-// the ADD sits at most this far past the head, through the mask cast and its reshape
-static constexpr int SYCL_QSA_TOPK_MAX_SPAN = 6;
-
 struct qsa_topk_chain {
     int i_cont_in;
     int i_rows;
@@ -525,33 +522,15 @@ bool ggml_sycl_can_fuse_qsa_topk(const ggml_cgraph * cgraph, int i) {
     return g_ggml_sycl_enable_fusion && g_ggml_sycl_fuse_qsa_topk && ggml_sycl_qsa_topk_shape(cgraph, i, nullptr);
 }
 
-// The absorbed nodes are not consecutive: the two views inside the chain keep their normal
-// bookkeeping, which is what makes ggml-alloc release the chain's sources at the TOP_K.
-static bool qsa_topk_node_absorbed(const qsa_topk_chain & c, int n) {
-    return n == c.i_cont_in || n == c.i_rows || n == c.i_cont_out || n == c.i_cast || n == c.i_add;
-}
-
 int ggml_sycl_qsa_topk_absorbs(const ggml_cgraph * cgraph, int node_idx) {
     if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_qsa_topk) {
         return 0;
     }
-
-    for (int back = 0; back <= SYCL_QSA_TOPK_MAX_SPAN && node_idx - back >= 0; ++back) {
-        qsa_topk_chain c;
-        if (!ggml_sycl_qsa_topk_shape(cgraph, node_idx - back, &c)) {
-            continue;
-        }
-        // report a run from its first node only, so the caller counts each node once
-        if (qsa_topk_node_absorbed(c, node_idx - 1)) {
-            return 0;
-        }
-        int run = 0;
-        while (qsa_topk_node_absorbed(c, node_idx + run)) {
-            run++;
-        }
-        return run;
+    qsa_topk_chain c;
+    if (!ggml_sycl_qsa_topk_shape(cgraph, node_idx, &c)) {
+        return 0;
     }
-    return 0;
+    return c.i_topk - c.i_cont_in;
 }
 
 // Runs the chain matched by ggml_sycl_can_fuse_qsa_topk(); returns the extra nodes consumed.
