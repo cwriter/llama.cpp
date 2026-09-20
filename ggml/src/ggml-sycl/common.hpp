@@ -80,6 +80,7 @@ extern int g_ggml_sycl_fuse_qsa_gather;
 extern int g_ggml_sycl_fuse_qsa_topk;
 extern int g_ggml_sycl_fuse_qsa_score;
 extern int g_ggml_sycl_fuse_qsa_mask;
+extern int g_ggml_sycl_fuse_qsa_fa_mask;
 extern int g_ggml_sycl_small_gemm;
 extern int g_ggml_sycl_mv_fuse;
 extern int g_ggml_sycl_topk_moe_radix;
@@ -530,6 +531,52 @@ struct ggml_backend_sycl_context {
         return it->second.get();
     }
 #endif
+
+    // A QSA selection bitmap is built at the mask chain, where the top-k list is still live,
+    // and read by the flash attention node the chain feeds. The reader returns the pool block
+    // as soon as it has it; anything left over is returned when the next graph starts, so an
+    // abandoned graph cannot leak.
+    struct qsa_sel_block {
+        const ggml_tensor * key;
+        void *              ptr;
+        size_t              size;
+    };
+
+    std::vector<qsa_sel_block> qsa_sel;
+    size_t                     qsa_sel_high_water = 0;
+
+    void qsa_sel_put(const ggml_tensor * key, void * ptr, size_t size) {
+        qsa_sel.push_back({ key, ptr, size });
+        qsa_sel_high_water = std::max(qsa_sel_high_water, qsa_sel.size());
+    }
+
+    // null if the key is unknown. The block stays reserved until qsa_sel_drop(), because the
+    // reader allocates from the same pool and would otherwise be handed its own input back.
+    void * qsa_sel_find(const ggml_tensor * key) {
+        for (const qsa_sel_block & b : qsa_sel) {
+            if (b.key == key) {
+                return b.ptr;
+            }
+        }
+        return nullptr;
+    }
+
+    void qsa_sel_drop(const ggml_tensor * key) {
+        for (size_t i = 0; i < qsa_sel.size(); i++) {
+            if (qsa_sel[i].key == key) {
+                pool().free(qsa_sel[i].ptr, qsa_sel[i].size);
+                qsa_sel.erase(qsa_sel.begin() + i);
+                return;
+            }
+        }
+    }
+
+    void qsa_sel_reset() {
+        for (const qsa_sel_block & b : qsa_sel) {
+            pool().free(b.ptr, b.size);
+        }
+        qsa_sel.clear();
+    }
 
     ggml_sycl_pool & host_pool(int device) {
         if (host_pools[device] == nullptr) {
