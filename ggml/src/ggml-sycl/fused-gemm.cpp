@@ -21,6 +21,14 @@ static constexpr int FG_WG_SIZE = FG_KSPLIT * WARP_SIZE;
 static_assert(FG_SG_ROWS == WARP_SIZE, "the A stage maps one lane to one row");
 static_assert(2 * FG_BN == GGML_SYCL_FG_MAX_N, "header gate must match the tile width");
 
+static size_t grouped_gemm_packed_capacity(size_t size) {
+    size_t capacity = 1;
+    while (capacity < size) {
+        capacity *= 2;
+    }
+    return capacity;
+}
+
 static bool fused_gemm_f16_supported(dpct::queue_ptr stream) {
     try {
         const auto combinations = stream->get_device().get_info<
@@ -377,7 +385,7 @@ bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_b
     ggml_sycl_pool_alloc<ggml_sycl_gg_tile> tiles_dev(pool, n_tiles);
     SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tiles_dev.get(), tiles.data(), n_tiles * sizeof(ggml_sycl_gg_tile))));
 
-    ggml_sycl_pool_alloc<sycl::half> packed_b(pool, (size_t) K * Npad);
+    ggml_sycl_pool_alloc<sycl::half> packed_b(pool, grouped_gemm_packed_capacity((size_t) K * Npad));
     grouped_gemm_pack_b(src1, packed_b.get(), tiles_dev.get(), Npad, (int) K, stream);
 
     const sycl::half *       packed    = packed_b.get();
