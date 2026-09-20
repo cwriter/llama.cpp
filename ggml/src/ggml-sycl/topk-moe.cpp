@@ -239,9 +239,9 @@ static void launch_topk_moe(queue_ptr stream, const float * logits, float * weig
     fine because ids[i] and weights[i] stay paired.
 */
 // Two deliberate differences from topk_moe_kernel, neither reachable from a healthy graph:
-// NaN logits are ordered by their radix key (a positive NaN sorts above +inf) instead of being
-// sanitized to -FLT_MAX, so a NaN would be selected rather than excluded; and exact ties may pick
-// a different tied expert. Ties carry the same weight, so only the NaN case changes behaviour.
+// a NaN logit sorts above +inf by radix key instead of being sanitized to -FLT_MAX, so it is
+// selected rather than excluded; and exact ties pick an arbitrary tied expert rather than the
+// lowest index, which changes which expert MUL_MAT_ID runs even though the weight is the same.
 static void topk_moe_radix_kernel(const float * __restrict__ logits,
                                   float * __restrict__       weights,
                                   int32_t * __restrict__     ids,
