@@ -5660,6 +5660,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
+        // The reorder is applied lazily and only the mat-vec path triggers it, so a prefill
+        // that runs before any decode always saw unreordered weights. Trigger it here too,
+        // but only for a type the grouped kernel can consume reordered: for any other type a
+        // reordered tensor makes ggml_sycl_grouped_dequant_gemm_f16() decline the launch.
+        if (ggml_sycl_fused_dequant_gemm_f16_reorder_ok(src0->type)) {
+            opt_for_reorder_id(&ctx, src0);
+        }
+
         // one launch for all experts instead of one GEMM per expert
         // every expert slice is reordered on its own, so one flag decides the whole launch
         const auto * src0_extra_gg     = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
