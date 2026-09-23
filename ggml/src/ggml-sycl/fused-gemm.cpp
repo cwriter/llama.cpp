@@ -482,8 +482,9 @@ bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_b
     const int64_t n_tiles  = tiles.size();
     static std::atomic<int> gg_trace_left{getenv("GGML_SYCL_GG_TRACE") ? 6 : 0};
     if (gg_trace_left.fetch_sub(1) > 0) {
-        fprintf(stderr, "[GG] fired type=%s M=%ld K=%ld rows=%ld n_active=%ld tiles=%ld\n",
-                ggml_type_name(src0_type), (long) M, (long) K, (long) total_rows, (long) n_active, (long) n_tiles);
+        fprintf(stderr, "[GG] fired type=%s reordered=%d M=%ld K=%ld rows=%ld n_active=%ld tiles=%ld\n",
+                ggml_type_name(src0_type), (int) reordered, (long) M, (long) K, (long) total_rows,
+                (long) n_active, (long) n_tiles);
     }
     const int64_t groups_m = (M + FG_SG_ROWS - 1) / FG_SG_ROWS;
     const int     Npad     = (int) (n_tiles * FG_BN);
