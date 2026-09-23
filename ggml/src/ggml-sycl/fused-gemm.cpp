@@ -118,6 +118,30 @@ template <typename block_q_t> struct fg_reorder_a {
     static constexpr bool supported = false;
 };
 
+template <> struct fg_reorder_a<block_iq4_nl> {
+    static constexpr bool supported = true;
+
+    static_assert(QK4_NL / 2 + sizeof(ggml_half) == sizeof(block_iq4_nl),
+                  "the iq4_nl reorder layout must be a byte permutation of the canonical block");
+
+    // One k step is one whole block here (FG_BK == QK4_NL). The streams are [qs][d], each
+    // contiguous over the nblocks of the slice. Decode is the canonical overload verbatim.
+    static __dpct_inline__ void stage(const uint8_t * __restrict__ xb, const int ib_row, const int nblocks,
+                                      const int kb, sycl::half2 * a) {
+        const int       ib = ib_row + kb;
+        const uint8_t * qs = xb + (size_t) ib * (QK4_NL / 2);
+        const float     d  = (float) *(const ggml_half *) (xb + (size_t) nblocks * (QK4_NL / 2) +
+                                                           (size_t) ib * sizeof(ggml_half));
+#pragma unroll
+        for (int j = 0; j < QK4_NL / 2; j += 2) {
+            const uint8_t q0 = qs[j];
+            const uint8_t q1 = qs[j + 1];
+            a[j / 2]     = sycl::half2((sycl::half) (d * kvalues_iq4nl[q0 & 0xf]), (sycl::half) (d * kvalues_iq4nl[q1 & 0xf]));
+            a[j / 2 + 8] = sycl::half2((sycl::half) (d * kvalues_iq4nl[q0 >> 4]),  (sycl::half) (d * kvalues_iq4nl[q1 >> 4]));
+        }
+    }
+};
+
 template <> struct fg_reorder_a<block_iq3_s> {
     static constexpr bool supported = true;
 
@@ -402,8 +426,13 @@ bool ggml_sycl_fused_dequant_gemm_f16(ggml_type src0_type, const void * src0, co
     const sycl::half * packed = packed_b.get();
     switch (src0_type) {
         case GGML_TYPE_IQ4_NL:
-            fused_dequant_gemm_launch<block_iq4_nl, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K,
-                                                           (int) ldd, groups_n, groups_m, stream);
+            if (reordered) {
+                fused_dequant_gemm_launch<block_iq4_nl, true>(src0, packed, dst, (int) M, (int) N, Npad, (int) K,
+                                                              (int) ldd, groups_n, groups_m, stream);
+            } else {
+                fused_dequant_gemm_launch<block_iq4_nl, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K,
+                                                               (int) ldd, groups_n, groups_m, stream);
+            }
             break;
         case GGML_TYPE_IQ3_S:
             if (reordered) {
@@ -470,8 +499,13 @@ bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_b
     const char *             src0_dd   = (const char *) src0_base;
     switch (src0_type) {
         case GGML_TYPE_IQ4_NL:
-            grouped_dequant_gemm_launch<block_iq4_nl, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M,
-                                                             Npad, (int) K, n_tiles, groups_m, stream);
+            if (reordered) {
+                grouped_dequant_gemm_launch<block_iq4_nl, true>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M,
+                                                                Npad, (int) K, n_tiles, groups_m, stream);
+            } else {
+                grouped_dequant_gemm_launch<block_iq4_nl, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M,
+                                                                 Npad, (int) K, n_tiles, groups_m, stream);
+            }
             break;
         case GGML_TYPE_IQ3_S:
             if (reordered) {

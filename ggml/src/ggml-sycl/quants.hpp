@@ -58,6 +58,27 @@ template <> struct block_q_t<GGML_TYPE_Q4_0> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+// IQ4_NL has the same block layout as Q4_0 (ggml_half d; uint8_t qs[16]), so the SoA split
+// and its offsets are identical. Only the dequant differs: a lookup instead of q - 8.
+template <> struct block_q_t<GGML_TYPE_IQ4_NL> {
+    struct traits {
+        static constexpr uint32_t qk       = QK4_NL;
+        static constexpr uint32_t qi       = QI4_NL;
+        static constexpr uint32_t qr       = QR4_NL;
+        static constexpr uint32_t vdr_mmvq = 2;
+    };
+
+    static constexpr std::pair<int, int> get_block_offset(const int block_index, const int /* nblocks */) {
+        return { block_index * (QK4_NL / QR4_NL), 0 };
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, const int block_index) {
+        return { (ncols / QR4_NL * nrows) + block_index * sizeof(ggml_half), 0 };
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
+};
+
 template <> struct block_q_t<GGML_TYPE_Q2_K> {
     struct traits {
         static constexpr uint32_t qk       = QK_K;

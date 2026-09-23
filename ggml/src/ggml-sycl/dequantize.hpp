@@ -1686,6 +1686,34 @@ dequantize_block_iq1_m(const void *__restrict__ vx, dst_t *__restrict__ yy,
 
 // qs bytes each work item dequantizes: 1, 2, 4 or 8. drives the store width and, through
 // iq4_nl_wg_size() below, the work group size. tune here.
+// SoA counterpart of dequantize_block_iq4_nl: one flat stream of qs over the whole tensor,
+// then one of d. Same value order as the canonical block (low nibbles first, high at +16).
+template <typename dst_t>
+static void dequantize_block_iq4_nl_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
+                                            const sycl::nd_item<3> & item_ct1) {
+    const int64_t i       = item_ct1.get_group(2);
+    const int64_t tid     = item_ct1.get_local_id(2);
+    const int     lane_ib = i * WARP_SIZE + tid;
+
+    if (lane_ib >= k / QK4_NL) {
+        return;
+    }
+
+    dst_t * y_ptr = yy + lane_ib * QK4_NL;
+
+    auto qs    = (const uint8_t *) vx + lane_ib * QK4_NL / 2;
+    auto s_ptr = (const sycl::half *) ((const uint8_t *) vx + k / 2) + lane_ib;
+
+    const float d = float(*s_ptr);
+
+#pragma unroll
+    for (int l = 0; l < QK4_NL / 2; ++l) {
+        const int vq  = qs[l];
+        y_ptr[l + 0]  = d * kvalues_iq4nl[vq & 0xF];
+        y_ptr[l + 16] = d * kvalues_iq4nl[vq >> 4];
+    }
+}
+
 static constexpr int IQ4_NL_QS_BYTES_PER_THREAD = 4;
 
 // 8 blocks of QK4_NL per QK_K region, each split into 16/bpt chunks

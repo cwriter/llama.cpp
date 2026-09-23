@@ -18,7 +18,7 @@ constexpr bool ggml_sycl_fused_dequant_gemm_f16_type_ok(ggml_type src0_type, int
 // weight formats whose A stage also reads the reorder (SoA) layout. A reordered weight of any
 // other type must not reach the fused kernels: the decode would be silently wrong.
 constexpr bool ggml_sycl_fused_dequant_gemm_f16_reorder_ok(ggml_type src0_type) {
-    return src0_type == GGML_TYPE_IQ3_S;
+    return src0_type == GGML_TYPE_IQ3_S || src0_type == GGML_TYPE_IQ4_NL;
 }
 
 constexpr bool ggml_sycl_fused_dequant_gemm_f16_shape_ok(ggml_type src0_type, int64_t M, int64_t N, int64_t K,

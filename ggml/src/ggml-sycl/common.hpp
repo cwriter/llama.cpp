@@ -85,6 +85,7 @@ extern int g_ggml_sycl_small_gemm;
 extern int g_ggml_sycl_mv_fuse;
 extern int g_ggml_sycl_topk_moe_radix;
 extern int g_ggml_sycl_iq3_reorder;
+extern int g_ggml_sycl_iq4_nl_reorder;
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
