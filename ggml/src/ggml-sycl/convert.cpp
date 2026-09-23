@@ -721,7 +721,7 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             if (dst->src[0]->extra &&
-                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
+                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q4_0_sycl_reorder;
             } else {
                 return dequantize_block_sycl<QK4_0, QR4_0, dequantize_q4_0>;
@@ -734,37 +734,37 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             if (dst->src[0]->extra &&
-                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q8_0_sycl_reorder;
             } else {
                 return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
             }
         case GGML_TYPE_Q2_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q2_K_sycl_reorder;
             } else {
                 return dequantize_row_q2_K_sycl;
             }
         case GGML_TYPE_Q3_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q3_K_sycl_reorder;
             } else {
                 return dequantize_row_q3_K_sycl;
             }
         case GGML_TYPE_Q4_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q4_K_sycl_reorder;
             } else {
                 return dequantize_row_q4_K_sycl;
             }
         case GGML_TYPE_Q5_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q5_K_sycl_reorder;
             } else {
                 return dequantize_row_q5_K_sycl;
             }
         case GGML_TYPE_Q6_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q6_K_sycl_reorder;
             } else {
                 return dequantize_row_q6_K_sycl;
@@ -780,13 +780,13 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
         case GGML_TYPE_IQ2_S:
             return dequantize_row_iq2_s_sycl;
         case GGML_TYPE_IQ3_XXS:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_iq3_xxs_sycl_reorder;
             } else {
                 return dequantize_row_iq3_xxs_sycl;
             }
         case GGML_TYPE_IQ3_S:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_iq3_s_sycl_reorder;
             } else {
                 return dequantize_row_iq3_s_sycl;
@@ -794,7 +794,7 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_sycl;
         case GGML_TYPE_IQ4_NL:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_iq4_nl_sycl_reorder;
             } else {
                 return dequantize_row_iq4_nl_sycl;
@@ -823,7 +823,7 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
             return dequantize_block_sycl<QK2_0, QR2_0, dequantize_q2_0>;
         case GGML_TYPE_Q4_0:
             if (dst->src[0]->extra &&
-                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
+                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q4_0_sycl_reorder;
             } else {
                 return dequantize_row_q4_0_sycl;
@@ -836,38 +836,38 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             if (dst->src[0]->extra &&
-                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
+                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q8_0_sycl_reorder;
             } else {
                 return dequantize_block_sycl<QK8_0, QR8_0, dequantize_q8_0>;
             }
         case GGML_TYPE_Q2_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q2_K_sycl_reorder;
             } else {
                 return dequantize_row_q2_K_sycl;
             }
         case GGML_TYPE_Q3_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q3_K_sycl_reorder;
             } else {
                 return dequantize_row_q3_K_sycl;
             }
         case GGML_TYPE_Q4_K:
             if (dst->src[0]->extra &&
-                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
+                ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q4_K_sycl_reorder;
             } else {
                 return dequantize_row_q4_K_sycl;
             }
         case GGML_TYPE_Q5_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q5_K_sycl_reorder;
             } else {
                 return dequantize_row_q5_K_sycl;
             }
         case GGML_TYPE_Q6_K:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_q6_K_sycl_reorder;
             } else {
                 return dequantize_row_q6_K_sycl;
@@ -883,13 +883,13 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
         case GGML_TYPE_IQ2_S:
             return dequantize_row_iq2_s_sycl;
         case GGML_TYPE_IQ3_XXS:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_iq3_xxs_sycl_reorder;
             } else {
                 return dequantize_row_iq3_xxs_sycl;
             }
         case GGML_TYPE_IQ3_S:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_iq3_s_sycl_reorder;
             } else {
                 return dequantize_row_iq3_s_sycl;
@@ -897,7 +897,7 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
         case GGML_TYPE_IQ4_XS:
             return dequantize_row_iq4_xs_sycl;
         case GGML_TYPE_IQ4_NL:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_iq4_nl_sycl_reorder;
             } else {
                 return dequantize_row_iq4_nl_sycl;
