@@ -103,13 +103,21 @@ extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_device_event_wait;
 // Copy into a SYCL backend by enqueuing, instead of draining both devices on the host.
 extern int g_ggml_sycl_async_copy;
-// The elementwise fusions that cut dispatch count on the hyper-connection path:
-// scale+sigmoid+scale into dsv4_hc_post, scale+unary, and cont+cpy.
-extern int g_ggml_sycl_fuse_elementwise;
+// Which of the graph-level fusions may fire. One bit per fusion so a new one is a bit rather
+// than another environment variable, and so a bisect over them is a single value.
+enum ggml_sycl_fuse_type {
+    GGML_SYCL_FUSE_ELEMENTWISE = 1 << 0,  // hyper-connection gate chain, scale+unary
+    GGML_SYCL_FUSE_MUL_ADD     = 1 << 1,  // multiply-accumulate pair
+    GGML_SYCL_FUSE_MOE_REDUCE  = 1 << 2,  // MoE weighted sum: mul + per-expert views + add chain
+    GGML_SYCL_FUSE_MOE_GLU_ID  = 1 << 3,  // gate + up MoE mat-vec folded with their GLU
+};
+
+// Everything on. A fusion added later is on unless it is measured otherwise.
+static constexpr int GGML_SYCL_FUSE_DEFAULT = ~0;
+
+extern int g_ggml_sycl_fuse_types;
 // Allow a fusion to rely on a+b == b+a, which is exact in IEEE754. Not associativity.
 extern int g_ggml_sycl_float_commutative;
-// Collapse the MoE weighted sum (mul + per-expert views + add chain) into one kernel.
-extern int g_ggml_sycl_fuse_moe_reduce;
 // ggml_can_fuse_subgraph() takes at most 31 nodes, and the span is 2*n_expert_used.
 static constexpr int GGML_SYCL_MOE_REDUCE_MAX_EXPERTS = 15;
 extern int g_ggml_sycl_fa_onednn;
