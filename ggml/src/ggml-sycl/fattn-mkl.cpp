@@ -11,8 +11,8 @@
 #include "fattn-buffers.hpp"
 #include "convert.hpp"
 #include "fattn.hpp"
-
 #include <oneapi/mkl.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <cstdio>
 #include <chrono>
 
@@ -30,6 +30,7 @@
 
 using oneapi::mkl::transpose;
 using oneapi::mkl::blas::column_major::gemm;
+namespace mx = sycl::ext::oneapi::experimental::matrix;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -75,6 +76,36 @@ static void mkl_fa_pack_q_fp16(
                 });
         });
     }
+}
+
+// Pack Q as VNNI f16 for the online Q8_0 KQ kernel.
+static void mkl_fa_pack_q_xmx(
+    dpct::queue_ptr stream,
+    sycl::half * __restrict dst,
+    const float * __restrict q_src,
+    int n_queries, int DKQ, int n_query_rows, int n_query_rows_padded,
+    int kvh_base_head,
+    float q_scale, int64_t q_row_stride, int64_t q_head_stride) {
+
+    const int kpairs = DKQ / 2;
+    stream->parallel_for(sycl::range<1>((size_t)n_query_rows_padded * kpairs), [=](sycl::id<1> id) {
+        const int64_t idx = id[0];
+        const int     kp  = idx / n_query_rows_padded;
+        const int     row = idx - (int64_t)kp * n_query_rows_padded;
+        sycl::half v0 = 0.0f;
+        sycl::half v1 = 0.0f;
+        if (row < n_query_rows) {
+            const int iqg = row / n_queries;
+            const int q   = row - iqg * n_queries;
+            const int iqh = kvh_base_head + iqg;
+            const float * src = q_src + (int64_t)q * q_row_stride + (int64_t)iqh * q_head_stride + 2 * kp;
+            v0 = sycl::half(src[0] * q_scale);
+            v1 = sycl::half(src[1] * q_scale);
+        }
+        sycl::half * out = dst + ((size_t)kp * n_query_rows_padded + row) * 2;
+        out[0] = v0;
+        out[1] = v1;
+    });
 }
 
 // Zero-initialize the online softmax state arrays.
@@ -281,9 +312,10 @@ struct mkl_fa_kv_desc {
     int64_t              ts   = 0;      // type size (mode 3 base offset)
     int64_t              s01  = 0;      // nc row stride in blocks (mode 3)
     int64_t              s02  = 0;      // nc head stride in blocks (mode 3)
+    bool                 soa  = false;  // quants/scales permuted per span; see kv-soa.hpp
 };
 
-static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved, int n_kv_heads) {
+static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved) {
     mkl_fa_kv_desc d;
     d.data = (const char *)T->data;
     d.type = T->type;
@@ -299,22 +331,283 @@ static mkl_fa_kv_desc mkl_fa_make_desc(const ggml_tensor * T, bool interleaved, 
         d.mode = MKL_FA_KV_MODE_QUANT_CONTIG;
     } else {
         d.mode = MKL_FA_KV_MODE_QUANT_NC;
-        const int64_t bs          = (int64_t)ggml_blck_size(T->type);
-        const int64_t blk_per_row = T->ne[0] / bs;
-        // True Gemma interleave packs heads within a row (nb[2] < ne[1]*nb[1])
-        // → reconstruct physical strides. Padded seq-views (nb[2] > ne[1]*nb[1])
-        // already have correct physical strides.
-        const bool gemma = interleaved &&
-            ((int64_t)T->nb[2] < (int64_t)T->ne[1] * (int64_t)T->nb[1]);
-        if (gemma) {
-            d.s01 = (int64_t)n_kv_heads * blk_per_row;
-            d.s02 = blk_per_row;
-        } else {
-            d.s01 = d.nb1 / d.ts;
-            d.s02 = d.nb2 / d.ts;
+        d.s01 = d.nb1 / d.ts;
+        d.s02 = d.nb2 / d.ts;
+    }
+    d.soa = ggml_sycl_kv_is_soa(T);
+    return d;
+}
+
+static __dpct_inline__ const char * mkl_fa_q8_row(const mkl_fa_kv_desc & d, int head, int row) {
+    if (d.mode == MKL_FA_KV_MODE_QUANT_CONTIG) {
+        return d.data + (int64_t)head * d.nb2 + (int64_t)row * d.nb1;
+    }
+    const int64_t block = (int64_t)head * d.s02 + (int64_t)row * d.s01;
+    return d.data + block * d.ts;
+}
+
+// Read block kb of a row under either packing. d.soa is uniform across the work-group, so the
+// branch is free; both arms are the templated accessors, so each compiles to its own indexing.
+static __dpct_inline__ void mkl_fa_q8_block(const mkl_fa_kv_desc & d, const char * row_base, int kb,
+                                            const int8_t * & qs, float & scale) {
+    if (d.soa) {
+        using A = ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>;
+        size_t off;
+        int    ib;
+        ggml_sycl_q8_0_locate<GGML_SYCL_LAYOUT_SOA_SPAN>((int64_t) kb * QK8_0, off, ib);
+        qs    = A::qs(row_base + off, ib);
+        scale = A::d(row_base + off, ib);
+    } else {
+        using A = ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_CANONICAL>;
+        qs    = A::qs(row_base, kb);
+        scale = A::d(row_base, kb);
+    }
+}
+
+static constexpr int MKL_FA_XMX_TM      = 8;
+static constexpr int MKL_FA_XMX_TN      = 16;
+static constexpr int MKL_FA_XMX_TK      = 16;
+static constexpr int MKL_FA_XMX_ROWS    = 2 * MKL_FA_XMX_TM;
+static constexpr int MKL_FA_XMX_COLS    = 2 * MKL_FA_XMX_TN;
+static constexpr int MKL_FA_XMX_KSTEP   = QK8_0;
+static constexpr int MKL_FA_XMX_KSPLIT  = 4;
+static constexpr int MKL_FA_XMX_WG_SIZE = MKL_FA_XMX_KSPLIT * WARP_SIZE;
+static_assert(MKL_FA_XMX_ROWS == WARP_SIZE, "the K stage maps one lane to one row");
+
+[[sycl::reqd_sub_group_size(WARP_SIZE)]]
+static void mkl_fa_q8_kq_tile(
+    const mkl_fa_kv_desc K_desc,
+    const sycl::half * __restrict__ packed_q,
+    float * __restrict__ dst,
+    int ikvh, int chunk_start, int M, int N, int K, int q0, int q_padded, int ldd,
+    sycl::local_accessor<sycl::half, 1> tile_a,
+    sycl::local_accessor<float, 1> tile_c,
+    const sycl::nd_item<2> & item) {
+
+    const auto sg      = item.get_sub_group();
+    const int  sg_id   = sg.get_group_id()[0];
+    const int  lane    = sg.get_local_id()[0];
+    const int  m0      = item.get_group(1) * MKL_FA_XMX_ROWS;
+    const int  n0      = item.get_group(0) * MKL_FA_XMX_COLS;
+    const int  nstep   = K / MKL_FA_XMX_KSTEP;
+    const int  a_base  = sg_id * MKL_FA_XMX_ROWS * MKL_FA_XMX_KSTEP;
+    const int  c_base  = sg_id * MKL_FA_XMX_ROWS * MKL_FA_XMX_COLS;
+
+    mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, MKL_FA_XMX_TM, MKL_FA_XMX_TN> acc[2][2];
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            mx::joint_matrix_fill(sg, acc[mt][nt], 0.0f);
         }
     }
-    return d;
+
+    const int row = m0 + lane;
+    sycl::half2 * a = (sycl::half2 *)&tile_a[a_base + lane * MKL_FA_XMX_KSTEP];
+    const auto q_ptr = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                 sycl::access::decorated::no>(packed_q);
+    const int q_stride = q_padded * 2;
+    const int kb_begin = (sg_id * nstep) / MKL_FA_XMX_KSPLIT;
+    const int kb_end   = ((sg_id + 1) * nstep) / MKL_FA_XMX_KSPLIT;
+
+    for (int kb = kb_begin; kb < kb_end; ++kb) {
+        if (row < M) {
+            const char *   xrow = mkl_fa_q8_row(K_desc, ikvh, chunk_start + row);
+            const int8_t * bq;
+            float          bd;
+            mkl_fa_q8_block(K_desc, xrow, kb, bq, bd);
+            const sycl::half2  d    = sycl::half2((sycl::half)bd);
+#pragma unroll
+            for (int j = 0; j < MKL_FA_XMX_KSTEP / 2; ++j) {
+                a[j] = d * sycl::half2((sycl::half)bq[2 * j], (sycl::half)bq[2 * j + 1]);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < MKL_FA_XMX_KSTEP / 2; ++j) {
+                a[j] = sycl::half2(0.0f, 0.0f);
+            }
+        }
+        sycl::group_barrier(sg);
+
+#pragma unroll
+        for (int kt = 0; kt < MKL_FA_XMX_KSTEP / MKL_FA_XMX_TK; ++kt) {
+            const int kp0 = (kb * MKL_FA_XMX_KSTEP + kt * MKL_FA_XMX_TK) / 2;
+            mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::b,
+                             MKL_FA_XMX_TK, MKL_FA_XMX_TN, mx::layout::ext_intel_packed> sub_b[2];
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+                mx::joint_matrix_load(sg, sub_b[nt],
+                    q_ptr + (size_t)kp0 * q_stride + (q0 + n0 + nt * MKL_FA_XMX_TN) * 2, q_stride);
+            }
+#pragma unroll
+            for (int mt = 0; mt < 2; ++mt) {
+                mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::a,
+                                 MKL_FA_XMX_TM, MKL_FA_XMX_TK, mx::layout::row_major> sub_a;
+                mx::joint_matrix_load(sg, sub_a,
+                    tile_a.get_multi_ptr<sycl::access::decorated::no>() + a_base +
+                        mt * MKL_FA_XMX_TM * MKL_FA_XMX_KSTEP + kt * MKL_FA_XMX_TK,
+                    MKL_FA_XMX_KSTEP);
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    mx::joint_matrix_mad(sg, acc[mt][nt], sub_a, sub_b[nt], acc[mt][nt]);
+                }
+            }
+        }
+        sycl::group_barrier(sg);
+    }
+
+#pragma unroll
+    for (int mt = 0; mt < 2; ++mt) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            mx::joint_matrix_store(sg, acc[mt][nt],
+                tile_c.get_multi_ptr<sycl::access::decorated::no>() + c_base +
+                    mt * MKL_FA_XMX_TM * MKL_FA_XMX_COLS + nt * MKL_FA_XMX_TN,
+                MKL_FA_XMX_COLS, mx::layout::row_major);
+        }
+    }
+    sycl::group_barrier(item.get_group());
+
+    for (int idx = item.get_local_linear_id(); idx < MKL_FA_XMX_ROWS * MKL_FA_XMX_COLS;
+         idx += MKL_FA_XMX_WG_SIZE) {
+        const int r = idx / MKL_FA_XMX_COLS;
+        const int c = idx - r * MKL_FA_XMX_COLS;
+        if (m0 + r < M && n0 + c < N) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int s = 0; s < MKL_FA_XMX_KSPLIT; ++s) {
+                sum += tile_c[s * MKL_FA_XMX_ROWS * MKL_FA_XMX_COLS + r * MKL_FA_XMX_COLS + c];
+            }
+            dst[(size_t)(n0 + c) * ldd + m0 + r] = sum;
+        }
+    }
+}
+
+static void mkl_fa_q8_kq(
+    dpct::queue_ptr stream, const mkl_fa_kv_desc & K_desc, const sycl::half * packed_q, float * dst,
+    int ikvh, int chunk_start, int M, int N, int K, int q0, int q_padded, int ldd) {
+
+    const int64_t groups_n = (N + MKL_FA_XMX_COLS - 1) / MKL_FA_XMX_COLS;
+    const int64_t groups_m = (M + MKL_FA_XMX_ROWS - 1) / MKL_FA_XMX_ROWS;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<sycl::half, 1> tile_a(
+            MKL_FA_XMX_KSPLIT * MKL_FA_XMX_ROWS * MKL_FA_XMX_KSTEP, cgh);
+        sycl::local_accessor<float, 1> tile_c(
+            MKL_FA_XMX_KSPLIT * MKL_FA_XMX_ROWS * MKL_FA_XMX_COLS, cgh);
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(groups_n, groups_m * MKL_FA_XMX_WG_SIZE),
+                              sycl::range<2>(1, MKL_FA_XMX_WG_SIZE)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mkl_fa_q8_kq_tile(K_desc, packed_q, dst, ikvh, chunk_start, M, N, K, q0, q_padded, ldd,
+                                  tile_a, tile_c, item);
+            });
+    });
+}
+
+static constexpr int MKL_FA_VKQ_QM      = 8;
+static constexpr int MKL_FA_VKQ_QGROUP  = 16;
+static constexpr int MKL_FA_VKQ_QROWS   = MKL_FA_VKQ_QM * MKL_FA_VKQ_QGROUP;
+static constexpr int MKL_FA_VKQ_DN      = 16;
+static constexpr int MKL_FA_VKQ_TK      = 16;
+static constexpr int MKL_FA_VKQ_WG_SIZE = MKL_FA_VKQ_QGROUP * WARP_SIZE;
+
+[[sycl::reqd_sub_group_size(WARP_SIZE)]]
+static void mkl_fa_q8_vkq_tile(
+    const mkl_fa_kv_desc V_desc,
+    const sycl::half * __restrict__ S,
+    float * __restrict__ dst,
+    int ikvh, int chunk_start, int chunk_size, int q_rows, int DV, int s_stride,
+    sycl::local_accessor<sycl::half, 1> tile_s,
+    sycl::local_accessor<sycl::half, 1> tile_v,
+    sycl::local_accessor<float, 1> tile_c,
+    const sycl::nd_item<2> & item) {
+
+    const auto sg    = item.get_sub_group();
+    const int  sg_id = sg.get_group_id()[0];
+    const int  lid   = item.get_local_linear_id();
+    const int  q0    = item.get_group(1) * MKL_FA_VKQ_QROWS;
+    const int  d0    = item.get_group(0) * MKL_FA_VKQ_DN;
+
+    mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, MKL_FA_VKQ_QM, MKL_FA_VKQ_DN> acc;
+    mx::joint_matrix_fill(sg, acc, 0.0f);
+
+    for (int t0 = 0; t0 < chunk_size; t0 += MKL_FA_VKQ_TK) {
+        if (lid < MKL_FA_VKQ_TK) {
+            const int t = lid;
+            if (t0 + t < chunk_size && d0 < DV) {
+                const char *   row = mkl_fa_q8_row(V_desc, ikvh, chunk_start + t0 + t);
+                const int8_t * bq;
+                float          bd;
+                mkl_fa_q8_block(V_desc, row, d0 / QK8_0, bq, bd);
+                const sycl::half scale = (sycl::half)bd;
+#pragma unroll
+                for (int d = 0; d < MKL_FA_VKQ_DN; ++d) {
+                    const sycl::half value = d0 + d < DV
+                        ? scale * (sycl::half)bq[d0 % QK8_0 + d] : (sycl::half)0.0f;
+                    tile_v[((t / 2) * MKL_FA_VKQ_DN + d) * 2 + t % 2] = value;
+                }
+            } else {
+#pragma unroll
+                for (int d = 0; d < MKL_FA_VKQ_DN; ++d) {
+                    tile_v[((t / 2) * MKL_FA_VKQ_DN + d) * 2 + t % 2] = (sycl::half)0.0f;
+                }
+            }
+        }
+
+        for (int idx = lid; idx < MKL_FA_VKQ_QROWS * MKL_FA_VKQ_TK; idx += MKL_FA_VKQ_WG_SIZE) {
+            const int q  = idx / MKL_FA_VKQ_TK;
+            const int t  = idx - q * MKL_FA_VKQ_TK;
+            const int qr = q0 + q;
+            tile_s[idx] = qr < q_rows && t0 + t < chunk_size ? S[(size_t)qr * s_stride + t0 + t] : (sycl::half)0.0f;
+        }
+        sycl::group_barrier(item.get_group());
+
+        mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::a,
+                         MKL_FA_VKQ_QM, MKL_FA_VKQ_TK, mx::layout::row_major> sub_s;
+        mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::b,
+                         MKL_FA_VKQ_TK, MKL_FA_VKQ_DN, mx::layout::ext_intel_packed> sub_v;
+        mx::joint_matrix_load(sg, sub_s,
+            tile_s.get_multi_ptr<sycl::access::decorated::no>() +
+                sg_id * MKL_FA_VKQ_QM * MKL_FA_VKQ_TK,
+            MKL_FA_VKQ_TK);
+        mx::joint_matrix_load(sg, sub_v, tile_v.get_multi_ptr<sycl::access::decorated::no>(), MKL_FA_VKQ_DN * 2);
+        mx::joint_matrix_mad(sg, acc, sub_s, sub_v, acc);
+        sycl::group_barrier(item.get_group());
+    }
+
+    mx::joint_matrix_store(sg, acc,
+        tile_c.get_multi_ptr<sycl::access::decorated::no>() + sg_id * MKL_FA_VKQ_QM * MKL_FA_VKQ_DN,
+        MKL_FA_VKQ_DN, mx::layout::row_major);
+    sycl::group_barrier(item.get_group());
+
+    for (int idx = lid; idx < MKL_FA_VKQ_QROWS * MKL_FA_VKQ_DN; idx += MKL_FA_VKQ_WG_SIZE) {
+        const int q = idx / MKL_FA_VKQ_DN;
+        const int d = idx - q * MKL_FA_VKQ_DN;
+        if (q0 + q < q_rows && d0 + d < DV) {
+            dst[(size_t)(q0 + q) * DV + d0 + d] = tile_c[idx];
+        }
+    }
+}
+
+static void mkl_fa_q8_vkq(
+    dpct::queue_ptr stream, const mkl_fa_kv_desc & V_desc, const sycl::half * S, float * dst,
+    int ikvh, int chunk_start, int chunk_size, int q_rows, int DV, int s_stride) {
+
+    const int64_t groups_d = (DV + MKL_FA_VKQ_DN - 1) / MKL_FA_VKQ_DN;
+    const int64_t groups_q = (q_rows + MKL_FA_VKQ_QROWS - 1) / MKL_FA_VKQ_QROWS;
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<sycl::half, 1> tile_s(
+            MKL_FA_VKQ_QROWS * MKL_FA_VKQ_TK, cgh);
+        sycl::local_accessor<sycl::half, 1> tile_v(MKL_FA_VKQ_TK * MKL_FA_VKQ_DN, cgh);
+        sycl::local_accessor<float, 1> tile_c(MKL_FA_VKQ_QROWS * MKL_FA_VKQ_DN, cgh);
+        cgh.parallel_for(
+            sycl::nd_range<2>(sycl::range<2>(groups_d, groups_q * MKL_FA_VKQ_WG_SIZE),
+                              sycl::range<2>(1, MKL_FA_VKQ_WG_SIZE)),
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mkl_fa_q8_vkq_tile(V_desc, S, dst, ikvh, chunk_start, chunk_size, q_rows, DV, s_stride,
+                                   tile_s, tile_v, tile_c, item);
+            });
+    });
 }
 
 // Dequant one KV-head chunk into a dense [this_chunk x D] fp16 buffer.
@@ -408,6 +701,9 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const bool V_is_K_view = V->view_src
         && (V->view_src == K || (V->view_src == K->view_src
             && V->view_offs == K->view_offs));
+    // Standalone online VKQ is slower than staged oneMKL for the tested prefill shapes.
+    const bool online_q8 = false;
+    const int n_query_rows_padded = ((n_query_rows + MKL_FA_XMX_COLS - 1) / MKL_FA_XMX_COLS) * MKL_FA_XMX_COLS;
 
     static int chunk_env = ggml_sycl_get_env("GGML_SYCL_MKL_FA_CHUNK_KV", MKL_FA_CHUNK_SIZE_KV);
     int chunk_size = std::min(std::max(1, chunk_env), n_kv);
@@ -428,7 +724,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     if (g_ggml_sycl_fa_max_mem_mib > 0) {
         const int64_t budget   = ((int64_t) g_ggml_sycl_fa_max_mem_mib << 20) / 4;
         const int64_t fixed    = (int64_t) n_query_rows * (DV * 4 + DKQ * 2 + 8);
-        const int64_t kv_bytes = (int64_t) (DKQ + (V_is_K_view ? 0 : DV)) * 2;
+        const int64_t kv_bytes = online_q8 ? 0 : (int64_t) (DKQ + (V_is_K_view ? 0 : DV)) * 2;
         // The softmax gets its parallelism from the work group, not from the tile width, so prefer
         // the widest chunk the ceiling allows: fewer dequant calls and a longer GEMM K. Narrow the
         // chunk only when the tile would otherwise be too thin for a sane GEMM.
@@ -443,6 +739,10 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
             }
             chunk_size = std::max(256, chunk_size / 2);
         }
+    }
+    if (online_q8) {
+        q_tile_rows = std::max(MKL_FA_XMX_COLS, (q_tile_rows / MKL_FA_XMX_COLS) * MKL_FA_XMX_COLS);
+        q_tile_rows = std::min(q_tile_rows, n_query_rows);
     }
 
     const int64_t wg_size = MKL_FA_WG_SIZE;
@@ -477,6 +777,9 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                     / (1024.0 * 1024.0),
                 k_early_interleaved ? " K_ILV" : "",
                 v_early_interleaved ? " V_ILV" : "");
+        if (online_q8) {
+            GGML_LOG_INFO("[MKL-FA] #%d online Q8_0 XMX KQ/VKQ\n", mkl_call_count);
+        }
         GGML_LOG_INFO("[MKL-FA] #%d Q-nb1=%lld Q-nb2=%lld "
                 "q_rs=%lld q_hs=%lld dst_rs=%lld dst_hs=%lld\n",
                 mkl_call_count,
@@ -515,9 +818,9 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const bool v_interleaved =
         ((int64_t)V->ne[1] * V->nb[1] != V->nb[2]) && V->ne[2] > 1;
 
-    const mkl_fa_kv_desc K_desc = mkl_fa_make_desc(K, k_interleaved, n_kv_heads);
+    const mkl_fa_kv_desc K_desc = mkl_fa_make_desc(K, k_interleaved);
     const mkl_fa_kv_desc V_desc = V_is_K_view
-        ? K_desc : mkl_fa_make_desc(V, v_interleaved, n_kv_heads);
+        ? K_desc : mkl_fa_make_desc(V, v_interleaved);
 
     MKL_ACCUM(dequant_time_us, t_deq);
 
@@ -543,7 +846,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     ggml_sycl_pool_alloc<float>      VKQ_accum(pool);   // [n_query_rows x DV] (full)
     ggml_sycl_pool_alloc<float>      KQ_max(pool);      // [n_query_rows] (full)
     ggml_sycl_pool_alloc<float>      KQ_sum(pool);      // [n_query_rows] (full)
-    ggml_sycl_pool_alloc<sycl::half> Q_head_f16(pool);  // [n_query_rows x DKQ] (full)
+    ggml_sycl_pool_alloc<sycl::half> Q_head_f16(pool);  // row-major fallback or VNNI-packed online Q8_0
     ggml_sycl_pool_alloc<sycl::half> K_chunk_f16(pool); // [chunk x DKQ] (per-chunk dequant)
     ggml_sycl_pool_alloc<sycl::half> V_chunk_f16(pool); // [chunk x DV] (per-chunk dequant)
 
@@ -553,15 +856,17 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     VKQ_accum.alloc((size_t)n_query_rows * DV);
     KQ_max.alloc(n_query_rows);
     KQ_sum.alloc(n_query_rows);
-    Q_head_f16.alloc((size_t)n_query_rows * DKQ);
-    K_chunk_f16.alloc((size_t)chunk_size * DKQ);
+    Q_head_f16.alloc((size_t)(online_q8 ? n_query_rows_padded : n_query_rows) * DKQ);
 
-    sycl::half * V_chunk_f16_ptr;
-    if (V_is_K_view) {
-        V_chunk_f16_ptr = K_chunk_f16.ptr;   // V aliases K (DV == DKQ)
-    } else {
-        V_chunk_f16.alloc((size_t)chunk_size * DV);
-        V_chunk_f16_ptr = V_chunk_f16.ptr;
+    sycl::half * V_chunk_f16_ptr = nullptr;
+    if (!online_q8) {
+        K_chunk_f16.alloc((size_t)chunk_size * DKQ);
+        if (V_is_K_view) {
+            V_chunk_f16_ptr = K_chunk_f16.ptr;   // V aliases K (DV == DKQ)
+        } else {
+            V_chunk_f16.alloc((size_t)chunk_size * DV);
+            V_chunk_f16_ptr = V_chunk_f16.ptr;
+        }
     }
 
     sycl::half * Q_head_f16_ptr  = Q_head_f16.ptr;
@@ -599,11 +904,19 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
             int kvh_base_head = ikvh * gqa_ratio;
 
             // 1. Pack all GQA Q heads into fp16 (full n_query_rows)
-            mkl_fa_pack_q_fp16(stream,
-                Q_head_f16_ptr, Q_batch,
-                n_queries, DKQ,
-                gqa_ratio, kvh_base_head,
-                q_scale, q_row_stride, q_head_stride, wg_size);
+            if (online_q8) {
+                mkl_fa_pack_q_xmx(stream,
+                    Q_head_f16_ptr, Q_batch,
+                    n_queries, DKQ, n_query_rows, n_query_rows_padded,
+                    kvh_base_head,
+                    q_scale, q_row_stride, q_head_stride);
+            } else {
+                mkl_fa_pack_q_fp16(stream,
+                    Q_head_f16_ptr, Q_batch,
+                    n_queries, DKQ,
+                    gqa_ratio, kvh_base_head,
+                    q_scale, q_row_stride, q_head_stride, wg_size);
+            }
 
             // 2. Initialize softmax state (full n_query_rows)
             mkl_fa_init_softmax_state(stream,
@@ -617,7 +930,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                 int this_chunk = std::min(chunk_size, n_kv - chunk_start);
 
                 // 3a. Dequant this KV chunk to dense fp16 (once per chunk)
-                {
+                if (!online_q8) {
                     MKL_TAKE_TIME(t0);
                     mkl_fa_dequant_chunk(stream, K_desc, KQV,
                         K_chunk_f16_ptr, ikvh, chunk_start, this_chunk);
@@ -635,18 +948,24 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                     // GEMM: KQ = Q_tile × K_chunk^T
                     {
                         MKL_TAKE_TIME(t0);
-                        try {
-                            gemm(*stream,
-                                transpose::trans, transpose::nontrans,
-                                this_chunk, q_rows, DKQ,
-                                alpha,
-                                K_chunk_f16_ptr, DKQ,
-                                Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
-                                beta,
-                                KQ_f32_ptr, this_chunk);
-                        } catch (sycl::exception & e) {
-                            GGML_LOG_INFO("[MKL-FA] GEMM KQ: %s\n", e.what());
-                            GGML_ABORT("MKL GEMM KQ failed");
+                        if (online_q8) {
+                            mkl_fa_q8_kq(stream, K_desc, Q_head_f16_ptr, KQ_f32_ptr,
+                                         ikvh, chunk_start, this_chunk, q_rows, DKQ,
+                                         q0, n_query_rows_padded, chunk_size);
+                        } else {
+                            try {
+                                gemm(*stream,
+                                    transpose::trans, transpose::nontrans,
+                                    this_chunk, q_rows, DKQ,
+                                    alpha,
+                                    K_chunk_f16_ptr, DKQ,
+                                    Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
+                                    beta,
+                                    KQ_f32_ptr, this_chunk);
+                            } catch (sycl::exception & e) {
+                                GGML_LOG_INFO("[MKL-FA] GEMM KQ: %s\n", e.what());
+                                GGML_ABORT("MKL GEMM KQ failed");
+                            }
                         }
                         MKL_ACCUM(gemm_kq_time_us, t0);
                     }
@@ -672,18 +991,23 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                     // GEMM: VKQ_chunk = S × V_chunk
                     {
                         MKL_TAKE_TIME(t0);
-                        try {
-                            gemm(*stream,
-                                transpose::nontrans, transpose::nontrans,
-                                DV, q_rows, this_chunk,
-                                alpha,
-                                V_chunk_f16_ptr, DV,
-                                S_f16_ptr, this_chunk,
-                                beta,
-                                VKQ_chunk_ptr, DV);
-                        } catch (sycl::exception & e) {
-                            GGML_LOG_INFO("[MKL-FA] GEMM VKQ: %s\n", e.what());
-                            GGML_ABORT("MKL GEMM VKQ failed");
+                        if (online_q8) {
+                            mkl_fa_q8_vkq(stream, V_desc, S_f16_ptr, VKQ_chunk_ptr,
+                                          ikvh, chunk_start, this_chunk, q_rows, DV, chunk_size);
+                        } else {
+                            try {
+                                gemm(*stream,
+                                    transpose::nontrans, transpose::nontrans,
+                                    DV, q_rows, this_chunk,
+                                    alpha,
+                                    V_chunk_f16_ptr, DV,
+                                    S_f16_ptr, this_chunk,
+                                    beta,
+                                    VKQ_chunk_ptr, DV);
+                            } catch (sycl::exception & e) {
+                                GGML_LOG_INFO("[MKL-FA] GEMM VKQ: %s\n", e.what());
+                                GGML_ABORT("MKL GEMM VKQ failed");
+                            }
                         }
                         MKL_ACCUM(gemm_vkq_time_us, t0);
                     }
@@ -729,7 +1053,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
 #undef MKL_ACCUM
 
     if (do_print) {
-        const int64_t v_chunk_elems = V_is_K_view ? 0 : (int64_t)chunk_size * DV;
+        const int64_t k_chunk_elems = online_q8 ? 0 : (int64_t)chunk_size * DKQ;
+        const int64_t v_chunk_elems = online_q8 || V_is_K_view ? 0 : (int64_t)chunk_size * DV;
         double total_mb = (double)(
             (int64_t)q_tile_rows * chunk_size * sizeof(float)      // KQ_f32
           + (int64_t)q_tile_rows * chunk_size * sizeof(sycl::half) // S_f16
@@ -737,8 +1062,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
           + (int64_t)n_query_rows * DV * sizeof(float)             // VKQ_accum
           + (int64_t)n_query_rows * sizeof(float)                  // KQ_max
           + (int64_t)n_query_rows * sizeof(float)                  // KQ_sum
-          + (int64_t)n_query_rows * DKQ * sizeof(sycl::half)       // Q_head_f16
-          + (int64_t)chunk_size * DKQ * sizeof(sycl::half)         // K_chunk_f16
+          + (int64_t)(online_q8 ? n_query_rows_padded : n_query_rows) * DKQ * sizeof(sycl::half)
+          + k_chunk_elems * (int64_t)sizeof(sycl::half)            // K_chunk_f16
           + v_chunk_elems * (int64_t)sizeof(sycl::half)            // V_chunk_f16
         ) / (1024.0 * 1024.0);
         GGML_LOG_INFO("[MKL-FA] #%d n_kv=%d n_q=%d q_tile=%d time_us: "
