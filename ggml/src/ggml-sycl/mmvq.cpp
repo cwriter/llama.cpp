@@ -3630,6 +3630,7 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type) 
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q8_0:
             return true;
         default:
             return false;
@@ -4039,6 +4040,12 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
             return true;
         case GGML_TYPE_IQ3_S:
             launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_S>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                dst_token_stride, src1_token_stride, route_order, stream);
+            return true;
+        case GGML_TYPE_Q8_0:
+            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0>>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
                 expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
                 dst_token_stride, src1_token_stride, route_order, stream);

@@ -84,8 +84,19 @@ extern int g_ggml_sycl_fuse_qsa_fa_mask;
 extern int g_ggml_sycl_small_gemm;
 extern int g_ggml_sycl_mv_fuse;
 extern int g_ggml_sycl_topk_moe_radix;
-extern int g_ggml_sycl_iq3_reorder;
-extern int g_ggml_sycl_iq4_nl_reorder;
+// Which quant types may have their MoE expert weights reordered into the per-expert SoA
+// layout. One bit per type so a new type is one bit, not another environment variable.
+enum ggml_sycl_reorder_type {
+    GGML_SYCL_REORDER_IQ3_S  = 1 << 0,
+    GGML_SYCL_REORDER_IQ4_NL = 1 << 1,
+    GGML_SYCL_REORDER_Q8_0   = 1 << 2,
+};
+
+// Everything except Q8_0: its MoE mat-vec is about 4% of decode and its quants are already
+// contiguous within a block, so the reorder measured flat. A new bit is on by default.
+static constexpr int GGML_SYCL_REORDER_DEFAULT = ~GGML_SYCL_REORDER_Q8_0;
+
+extern int g_ggml_sycl_reorder_types;
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;

@@ -127,10 +127,8 @@ int g_ggml_sycl_fuse_qsa_fa_mask = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
 int g_ggml_sycl_topk_moe_radix = 1;
-// measured +12.8% decode on qwen4exp; it pays on the mat-vec paths, prefill is flat
-int g_ggml_sycl_iq3_reorder = 1;
-// measured +3.7% prefill / +5.8% decode on qwen4exp; same SoA layout as the IQ3_S reorder
-int g_ggml_sycl_iq4_nl_reorder = 1;
+// bitmask of ggml_sycl_reorder_type; see GGML_SYCL_REORDER_DEFAULT in common.hpp
+int g_ggml_sycl_reorder_types = GGML_SYCL_REORDER_DEFAULT;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -418,8 +416,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
         g_ggml_sycl_topk_moe_radix = ggml_sycl_get_env("GGML_SYCL_TOPK_MOE_RADIX", 1);
-        g_ggml_sycl_iq3_reorder = ggml_sycl_get_env("GGML_SYCL_IQ3_REORDER", 1);
-        g_ggml_sycl_iq4_nl_reorder = ggml_sycl_get_env("GGML_SYCL_IQ4_NL_REORDER", 1);
+        g_ggml_sycl_reorder_types = ggml_sycl_get_env("GGML_SYCL_REORDER_TYPES", GGML_SYCL_REORDER_DEFAULT);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -542,8 +539,11 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
         GGML_LOG_INFO("  GGML_SYCL_TOPK_MOE_RADIX: %d\n", g_ggml_sycl_topk_moe_radix);
-        GGML_LOG_INFO("  GGML_SYCL_IQ3_REORDER: %d\n", g_ggml_sycl_iq3_reorder);
-        GGML_LOG_INFO("  GGML_SYCL_IQ4_NL_REORDER: %d\n", g_ggml_sycl_iq4_nl_reorder);
+        GGML_LOG_INFO("  GGML_SYCL_REORDER_TYPES: 0x%x (iq3_s=%d iq4_nl=%d q8_0=%d)\n",
+                      g_ggml_sycl_reorder_types,
+                      (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S)  != 0,
+                      (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_NL) != 0,
+                      (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0)   != 0);
         GGML_LOG_INFO("  GGML_SYCL_FA_MAX_MEM_MIB: %d\n", g_ggml_sycl_fa_max_mem_mib);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
@@ -768,12 +768,12 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
         switch (tensor->type) {
             case GGML_TYPE_IQ3_XXS:
             case GGML_TYPE_IQ3_S:
-                if (!g_ggml_sycl_iq3_reorder) {
+                if (!(g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S)) {
                     break;
                 }
                 [[fallthrough]];
             case GGML_TYPE_IQ4_NL:
-                if (tensor->type == GGML_TYPE_IQ4_NL && !g_ggml_sycl_iq4_nl_reorder) {
+                if (tensor->type == GGML_TYPE_IQ4_NL && !(g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_NL)) {
                     break;
                 }
                 [[fallthrough]];
@@ -4240,7 +4240,7 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
             return true;
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
-            return g_ggml_sycl_iq3_reorder != 0;
+            return (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S) != 0;
         default:
             return false;
     }
@@ -4626,10 +4626,17 @@ static bool reorder_qw_q6_k_moe(uint8_t * data_device, size_t expert_bytes, int6
     return true;
 }
 
-// IQ4_NL shares block_q4_0's layout, so this is q4_0's SoA split applied per expert slice.
-static bool reorder_qw_iq4_nl_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert, dpct::queue_ptr stream) {
-    GGML_ASSERT(expert_bytes % sizeof(block_iq4_nl) == 0);
-    const int    blocks_per_expert = (int) (expert_bytes / sizeof(block_iq4_nl));
+// One SoA producer for every block that is just a scale plus flat quants: q4_0, q8_0 and
+// iq4_nl all have {ggml_half d; <qs bytes>}, so the reorder is the same byte permutation.
+// Per expert slice the layout becomes [qs of every block][d of every block], which is what
+// block_q_t<>::get_block_offset()/get_d_offset() address.
+template <typename block_t, int qs_bytes>
+static bool reorder_qw_soa2_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert,
+                                dpct::queue_ptr stream) {
+    static_assert(qs_bytes + sizeof(ggml_half) == sizeof(block_t),
+                  "this reorder only fits a block of one half scale followed by flat quants");
+    GGML_ASSERT(expert_bytes % sizeof(block_t) == 0);
+    const int    blocks_per_expert = (int) (expert_bytes / sizeof(block_t));
     const size_t total_bytes       = expert_bytes * (size_t) n_expert;
 
     sycl_reorder_temp_buffer tmp(stream, total_bytes);
@@ -4647,17 +4654,17 @@ static bool reorder_qw_iq4_nl_moe(uint8_t * data_device, size_t expert_bytes, in
 
     const int total_blocks = blocks_per_expert * (int) n_expert;
     auto reorder_event = stream->parallel_for(total_blocks, [=](auto gb_) {
-        const int             gb   = gb_;
-        const int             e    = gb / blocks_per_expert;
-        const int             ib   = gb % blocks_per_expert;
-        const block_iq4_nl *  x    = (const block_iq4_nl *) (tmp_buf + (size_t) e * expert_bytes);
-        uint8_t *             base = data_device + (size_t) e * expert_bytes;
+        const int       gb   = gb_;
+        const int       e    = gb / blocks_per_expert;
+        const int       ib   = gb % blocks_per_expert;
+        const block_t * x    = (const block_t *) (tmp_buf + (size_t) e * expert_bytes);
+        uint8_t *       base = data_device + (size_t) e * expert_bytes;
 
-        uint8_t *     qs_ptr = base;
-        sycl::half *  d_ptr  = (sycl::half *) (qs_ptr + (size_t) blocks_per_expert * (QK4_NL / 2));
+        uint8_t *    qs_ptr = base;
+        sycl::half * d_ptr  = (sycl::half *) (qs_ptr + (size_t) blocks_per_expert * qs_bytes);
 
-        for (int j = 0; j < QK4_NL / 2; ++j) {
-            qs_ptr[ib * (QK4_NL / 2) + j] = x[ib].qs[j];
+        for (int j = 0; j < qs_bytes; ++j) {
+            qs_ptr[ib * qs_bytes + j] = (uint8_t) x[ib].qs[j];
         }
         d_ptr[ib] = x[ib].d;
     });
@@ -5017,7 +5024,9 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
             case GGML_TYPE_IQ3_S:
                 return reorder_qw_iq3_s_moe(data_device, src0->nb[2], src0->ne[2], stream);
             case GGML_TYPE_IQ4_NL:
-                return reorder_qw_iq4_nl_moe(data_device, src0->nb[2], src0->ne[2], stream);
+                return reorder_qw_soa2_moe<block_iq4_nl, QK4_NL / 2>(data_device, src0->nb[2], src0->ne[2], stream);
+            case GGML_TYPE_Q8_0:
+                return reorder_qw_soa2_moe<block_q8_0, QK8_0>(data_device, src0->nb[2], src0->ne[2], stream);
             default:
                 return false;
         }
@@ -5095,8 +5104,9 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 // the two cannot drift: MUL_MAT_ID has its own, narrower list than MUL_MAT.
 static inline bool ggml_sycl_mul_mat_id_reorders_type(enum ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
-           (type == GGML_TYPE_IQ3_S && g_ggml_sycl_iq3_reorder) ||
-           (type == GGML_TYPE_IQ4_NL && g_ggml_sycl_iq4_nl_reorder);
+           (type == GGML_TYPE_IQ3_S  && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S)) ||
+           (type == GGML_TYPE_IQ4_NL && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_NL)) ||
+           (type == GGML_TYPE_Q8_0   && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0));
 }
 
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
