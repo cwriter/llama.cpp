@@ -5494,6 +5494,10 @@ struct ggml_tensor * ggml_arange(
 
 // ggml_flash_attn_ext
 
+bool ggml_mask_is_bitset(const struct ggml_tensor * mask) {
+    return mask != NULL && mask->type == GGML_TYPE_I32;
+}
+
 struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -5510,8 +5514,12 @@ struct ggml_tensor * ggml_flash_attn_ext(
     GGML_ASSERT(q->ne[3] == v->ne[3]);
 
     if (mask) {
-        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(mask->type == GGML_TYPE_F16 || ggml_mask_is_bitset(mask));
         GGML_ASSERT(ggml_is_contiguous(mask));
+        if (ggml_mask_is_bitset(mask)) {
+            GGML_ASSERT(mask->ne[0] == (k->ne[1] + 31)/32);
+            GGML_ASSERT(max_bias == 0.0f);  // one bit cannot carry an ALiBi slope
+        }
         //GGML_ASSERT(ggml_can_repeat_rows(mask, qk));
 
         GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
