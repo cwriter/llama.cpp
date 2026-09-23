@@ -99,6 +99,10 @@ static constexpr int GGML_SYCL_REORDER_DEFAULT = ~GGML_SYCL_REORDER_Q8_0;
 extern int g_ggml_sycl_reorder_types;
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
+// Wait for a cross-split event by enqueuing a barrier instead of blocking the host on it.
+extern int g_ggml_sycl_device_event_wait;
+// Copy into a SYCL backend by enqueuing, instead of draining both devices on the host.
+extern int g_ggml_sycl_async_copy;
 extern int g_ggml_sycl_fa_onednn;
 extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;
