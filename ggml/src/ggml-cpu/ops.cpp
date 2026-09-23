@@ -8718,10 +8718,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memset(VKQ32, 0, DV*sizeof(float));
         }
 
-        const char * mrow = mask ? (const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3] : NULL;
-        const bool          mbits = mask && ggml_mask_is_bitset(mask);
-        const ggml_fp16_t * mp    = (mask && !mbits) ? (const ggml_fp16_t *) mrow : NULL;
-        const uint32_t    * mb    = mbits ? (const uint32_t *) mrow : NULL;
+        const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
 
         // k indices
         const int ik3 = iq3 / rk3;
@@ -8739,9 +8736,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            // a bit carries no magnitude, so it is exactly "attend" or "do not"
-            const float mv = mb ? (((mb[ic >> 5] >> (ic & 31)) & 1u) ? 0.0f : -INFINITY)
-                                : (mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f);
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
@@ -9004,17 +8999,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             if (mask) {
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    const char * mrow = (const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3];
-                    const bool          mbits  = ggml_mask_is_bitset(mask);
-                    const ggml_fp16_t * mp_row = mbits ? NULL : (const ggml_fp16_t *) mrow;
-                    const uint32_t    * mb_row = mbits ? (const uint32_t *) mrow : NULL;
+                    const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
                     for (int tk = 0; tk < kv_tile; tk++) {
-                        // this kernel expands a tile either way, for the vector add below;
-                        // a bit simply decodes to 0 or -inf instead of scaling an f16
-                        const int64_t c = ic + tk;
-                        mask32[tq * KV_TILE_SZ + tk] = mbits
-                            ? (((mb_row[c >> 5] >> (c & 31)) & 1u) ? 0.0f : -INFINITY)
-                            : slope * GGML_CPU_FP16_TO_FP32(mp_row[c]);
+                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
                         }
