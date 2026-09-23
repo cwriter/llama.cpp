@@ -141,9 +141,8 @@ int g_ggml_sycl_enable_flash_attention = 1;
 int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
 int g_ggml_sycl_device_event_wait = 1;
 int g_ggml_sycl_async_copy = 1;
-int g_ggml_sycl_fuse_elementwise = 1;
+int g_ggml_sycl_fuse_types = GGML_SYCL_FUSE_DEFAULT;
 int g_ggml_sycl_float_commutative = 1;
-int g_ggml_sycl_fuse_moe_reduce = 1;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
@@ -436,9 +435,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_dev2dev_memcpy = ggml_sycl_get_env("GGML_SYCL_DEV2DEV_MEMCPY", DEV2DEV_MEMCPY_SYCL);
         g_ggml_sycl_device_event_wait = ggml_sycl_get_env("GGML_SYCL_DEVICE_EVENT_WAIT", 1);
         g_ggml_sycl_async_copy = ggml_sycl_get_env("GGML_SYCL_ASYNC_COPY", 1);
-        g_ggml_sycl_fuse_elementwise = ggml_sycl_get_env("GGML_SYCL_FUSE_ELEMENTWISE", 1);
+        g_ggml_sycl_fuse_types = ggml_sycl_get_env("GGML_SYCL_FUSE_TYPES", GGML_SYCL_FUSE_DEFAULT);
         g_ggml_sycl_float_commutative = ggml_sycl_get_env("GGML_SYCL_FLOAT_COMMUTATIVE", 1);
-        g_ggml_sycl_fuse_moe_reduce = ggml_sycl_get_env("GGML_SYCL_FUSE_MOE_REDUCE", 1);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
@@ -508,9 +506,13 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s)\n", g_ggml_sycl_dev2dev_memcpy, dev2dev_int2str(g_ggml_sycl_dev2dev_memcpy));
         GGML_LOG_INFO("  GGML_SYCL_DEVICE_EVENT_WAIT: %d\n", g_ggml_sycl_device_event_wait);
         GGML_LOG_INFO("  GGML_SYCL_ASYNC_COPY: %d\n", g_ggml_sycl_async_copy);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_ELEMENTWISE: %d\n", g_ggml_sycl_fuse_elementwise);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_TYPES: 0x%x (elementwise=%d mul_add=%d moe_reduce=%d moe_glu_id=%d)\n",
+                      g_ggml_sycl_fuse_types,
+                      (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_ELEMENTWISE) != 0,
+                      (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MUL_ADD)     != 0,
+                      (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_REDUCE)  != 0,
+                      (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_GLU_ID)  != 0);
         GGML_LOG_INFO("  GGML_SYCL_FLOAT_COMMUTATIVE: %d\n", g_ggml_sycl_float_commutative);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_MOE_REDUCE: %d\n", g_ggml_sycl_fuse_moe_reduce);
         GGML_LOG_INFO("  GGML_SYCL_GET_MEM_API: %d (%s)\n", g_ggml_sycl_get_mem_api, mem_api_int2str(g_ggml_sycl_get_mem_api));
 #else
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s), enable to SYCL API since missing GGML_SYCL_SUPPORT_LEVEL_ZERO_API\n",
@@ -6824,6 +6826,90 @@ static int ggml_sycl_mul_mat_multi_mmvq_fused(ggml_backend_sycl_context & ctx, g
 }
 
 // MUL_MAT_ID counterpart: adjacent expert mat-vecs that share the activation and the id table.
+// gate and up MoE mat-vecs over one activation, folded with the GLU that consumes them. The
+// sibling batcher cannot help here: ggml_sycl_mul_mat_id_mmvq_fused() declines any group of more
+// than one node once the weights are reordered, because only the plain grid stacks weights. This
+// runs one sub-group per output column doing both dot products instead, so the gate and up
+// intermediates are never written and the GLU never gets a launch of its own.
+static bool ggml_sycl_glu_id_why(const char * reason) {
+    static const char * env = getenv("GGML_SYCL_GLU_ID_WHY");
+    static std::atomic<int> left{ env ? atoi(env) : 0 };
+    if (left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[GLUID] declined: %s\n", reason);
+    }
+    return false;
+}
+
+static bool ggml_sycl_mul_mat_id_glu_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_tensor * gate,
+                                                ggml_tensor * up, ggml_tensor * glu) {
+    if (!(g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_GLU_ID)) {
+        return false;
+    }
+
+    const ggml_tensor * wg   = gate->src[0];
+    const ggml_tensor * wu   = up->src[0];
+    const ggml_tensor * src1 = gate->src[1];
+    const ggml_tensor * ids  = gate->src[2];
+
+    const ggml_glu_op glu_op = ggml_get_glu_op(glu);
+    if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
+        return ggml_sycl_glu_id_why("glu op");
+    }
+    // the kernel activates src[0] and multiplies by src[1]; a swapped GLU reverses that
+    if (ggml_get_op_params_i32(glu, 1)) {
+        return ggml_sycl_glu_id_why("swapped");
+    }
+    if (!ggml_sycl_mul_mat_id_mmvq_shape_ok(wg, src1, ids, gate)) {
+        return ggml_sycl_glu_id_why("shape_ok");
+    }
+    if (!ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(wg->type)) {
+        return ggml_sycl_glu_id_why("type");
+    }
+    // one set of block offsets and one grid serve both weights
+    if (wu->type != wg->type || !ggml_are_same_shape(wu, wg) || !ggml_are_same_stride(wu, wg)) {
+        return ggml_sycl_glu_id_why("weight pair");
+    }
+    if (glu->type != GGML_TYPE_F32 || !ggml_are_same_shape(glu, gate) || glu->ne[0] != wg->ne[1]) {
+        return ggml_sycl_glu_id_why("glu shape");
+    }
+
+    // both slices must already carry the SoA layout the reorder GEMV indexes
+    opt_for_reorder_id(&ctx, wg);
+    opt_for_reorder_id(&ctx, wu);
+    const auto * eg = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
+    const auto * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
+    if (!eg || !eg->optimized_feature.reorder || !eu || !eu->optimized_feature.reorder) {
+        return ggml_sycl_glu_id_why("not reordered");
+    }
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int     n_experts_used = (int) ids->ne[0];
+    const int     nrows          = (int) wg->ne[1];
+
+    const queue_ptr stream           = ctx.stream();
+    const int       src1_padded_cols = GGML_PAD((int) ne10, MATRIX_ROW_PADDING);
+
+    ggml_sycl_pool_alloc<char> src1_q8_alloc(
+        ctx.pool(), (size_t) ne11 * ne12 * src1_padded_cols * sizeof(block_q8_1) / QK8_1);
+    char * src1_ddq = src1_q8_alloc.get();
+    quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+        (const float *) src1->data, src1_ddq, (int) ne10, (int) (ne11 * ne12), src1_padded_cols, stream);
+
+    const size_t bytes_per_qrow    = (size_t) src1_padded_cols * sizeof(block_q8_1) / QK8_1;
+    const size_t src1_row_stride   = (ne11 == 1) ? 0 : bytes_per_qrow;
+    const size_t src1_token_stride = (size_t) ne11 * bytes_per_qrow;
+
+    scope_op_debug_print scope_dbg_print(__func__, glu, /*num_src=*/0);
+    return ggml_sycl_mul_mat_vec_q_id_reorder_glu(
+        wg->type, wg->data, wu->data, src1_ddq, (const int32_t *) ids->data,
+        (float *) glu->data, (int) ne10, nrows, n_experts_used, (int) ne12,
+        /*expert_weight_stride=*/ wg->nb[2],
+        /*dst_row_stride=*/ glu->nb[1],
+        src1_row_stride, ids->nb[1], glu->nb[2], src1_token_stride, glu_op, stream);
+}
+
 static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph,
                                                  int node_idx) {
     if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_mv_fuse) {
@@ -7031,6 +7117,28 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
             i += 2;
             continue;
+        }
+
+        // gate + up + GLU for the MoE experts: the views between them are metadata, so match the
+        // span rather than requiring consecutive indices
+        // gate and up are siblings, not a chain, so ggml_can_fuse() cannot express this: the
+        // subgraph form with the GLU as the only materialised output is the matcher for it
+        if (node->op == GGML_OP_MUL_MAT_ID && i + 2 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[i + 2]->op == GGML_OP_GLU &&
+            ggml_can_fuse_subgraph(cgraph, i,
+                                   { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU },
+                                   { i + 2 })) {
+            ggml_tensor * glu  = cgraph->nodes[i + 2];
+            ggml_tensor * gate = cgraph->nodes[i];
+            ggml_tensor * up   = cgraph->nodes[i + 1];
+            if (glu->src[0] == up && glu->src[1] == gate) {
+                std::swap(gate, up);
+            }
+            if (glu->src[0] == gate && glu->src[1] == up &&
+                ggml_sycl_mul_mat_id_glu_mmvq_fused(*sycl_ctx, gate, up, glu)) {
+                i += 2;
+                continue;
+            }
         }
 
         // after the GLU fusion above: that one also absorbs the GLU, so it wins when both match

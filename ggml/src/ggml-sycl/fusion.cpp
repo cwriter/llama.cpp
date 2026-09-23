@@ -107,7 +107,7 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
     // than the chain - so use the subgraph form with hc_post as the only materialised output.
     if (ops.size() == 4 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
         ops.begin()[2] == GGML_OP_SCALE && ops.begin()[3] == GGML_OP_DSV4_HC_POST) {
-        if (!g_ggml_sycl_fuse_elementwise) {
+        if (!(g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_ELEMENTWISE)) {
             return false;
         }
         if (unary_ops.size() != 1 || unary_ops.begin()[0] != GGML_UNARY_OP_SIGMOID) {
@@ -150,7 +150,7 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
     // A SCALE that exists only to feed the next unary.
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
         unary_ops.size() == 1) {
-        if (!g_ggml_sycl_fuse_elementwise) {
+        if (!(g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_ELEMENTWISE)) {
             return false;
         }
         if (!ggml_can_fuse(cgraph, node_idx, ops)) {
@@ -268,7 +268,7 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 
     // MUL feeding an ADD: the multiply-accumulate that survives every other fusion.
     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_ADD) {
-        if (!g_ggml_sycl_fuse_elementwise) {
+        if (!(g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MUL_ADD)) {
             return false;
         }
         if (!ggml_can_fuse(cgraph, node_idx, ops)) {

@@ -88,6 +88,14 @@ bool ggml_sycl_mul_mat_vec_q_id(
 bool ggml_sycl_mul_mat_vec_q_id_supports_type(enum ggml_type src0_type);
 bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type);
 
+// MoE mat-vec that folds a GLU over a gate/up weight pair, so neither intermediate is written
+bool ggml_sycl_mul_mat_vec_q_id_reorder_glu(
+    enum ggml_type src0_type, const void * vx_gate_base, const void * vx_up_base, const void * vy,
+    const int32_t * ids_dev, float * dst_base, int ncols, int nrows, int n_experts_used, int n_tokens,
+    size_t expert_weight_stride, size_t dst_row_stride, size_t src1_row_stride,
+    size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
+    ggml_glu_op glu_op, dpct::queue_ptr stream);
+
 // Reorder (SoA) variant of the fused MoE expert GEMV.
 // vx_base: each expert slice (stride expert_weight_stride == src0->nb[2]) is a self-contained reorder/SoA layout.
 // vy: src1 quantized with quantize_and_reorder_q8_1_soa (per-row SoA). Returns false if src0_type isn't handled.
