@@ -11,8 +11,37 @@ static constexpr int64_t  GGML_SYCL_SK_MAX_MNK = 256 * 256 * 256;
 
 // weight formats the fused A stage decodes; K must cover whole stored blocks
 constexpr bool ggml_sycl_fused_dequant_gemm_f16_type_ok(ggml_type src0_type, int64_t K) {
-    return (src0_type == GGML_TYPE_IQ4_NL && K % QK4_NL == 0) ||
-           (src0_type == GGML_TYPE_IQ3_S && QK_K == 256 && K % QK_K == 0);
+    // iq4_nl stores 32 values per block; every other format here is a 256-value superblock the
+    // A stage walks in steps of 32, so K must cover whole superblocks.
+    if (src0_type == GGML_TYPE_IQ4_NL) {
+        return K % QK4_NL == 0;
+    }
+    const bool superblock =
+           src0_type == GGML_TYPE_IQ3_S ||
+           src0_type == GGML_TYPE_IQ4_XS ||
+           src0_type == GGML_TYPE_IQ3_XXS ||
+           src0_type == GGML_TYPE_IQ2_XXS ||
+           src0_type == GGML_TYPE_IQ2_XS ||
+           src0_type == GGML_TYPE_IQ2_S ||
+           src0_type == GGML_TYPE_IQ1_S ||
+           src0_type == GGML_TYPE_IQ1_M;
+    return superblock && QK_K == 256 && K % QK_K == 0;
+}
+
+// Runtime type gate, kept out of the constexpr predicate above so it stays pure.
+inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
+    switch (src0_type) {
+        case GGML_TYPE_IQ4_NL:  return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ4_NL  ) != 0;
+        case GGML_TYPE_IQ3_S:   return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ3_S   ) != 0;
+        case GGML_TYPE_IQ4_XS:  return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ4_XS  ) != 0;
+        case GGML_TYPE_IQ3_XXS: return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ3_XXS ) != 0;
+        case GGML_TYPE_IQ2_XXS: return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ2_XXS ) != 0;
+        case GGML_TYPE_IQ2_XS:  return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ2_XS  ) != 0;
+        case GGML_TYPE_IQ2_S:   return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ2_S   ) != 0;
+        case GGML_TYPE_IQ1_S:   return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ1_S   ) != 0;
+        case GGML_TYPE_IQ1_M:   return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ1_M   ) != 0;
+        default:          return false;
+    }
 }
 
 // weight formats whose A stage also reads the reorder (SoA) layout. A reordered weight of any

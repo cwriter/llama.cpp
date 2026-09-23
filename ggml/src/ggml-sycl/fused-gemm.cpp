@@ -4,6 +4,9 @@
 
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 
+#include <mutex>
+#include <unordered_map>
+
 namespace mx = sycl::ext::oneapi::experimental::matrix;
 
 // XMX f16 tile: 8x16 (A) times 16x16 (B) into an 8x16 f32 accumulator
@@ -114,6 +117,158 @@ static __dpct_inline__ void fg_stage_a(const block_iq3_s * __restrict__ xrow, co
 // Reorder (SoA) A stage. The reorder is a pure permutation of a slice: the same block fields in
 // the same intra-field order, but each field is one stream over the nblocks of the slice. Only
 // the addresses change, so the decode below is identical to the canonical overload.
+// Every superblock format below steps its 256 values in 32-wide k steps.
+static_assert(QK_K == 256, "the superblock A stages assume 8 sub-blocks per superblock");
+
+static __dpct_inline__ void fg_pack_quarter(const float * __restrict__ t, sycl::half2 * a, int il) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        a[4 * il + j] = sycl::half2((sycl::half) t[2 * j], (sycl::half) t[2 * j + 1]);
+    }
+}
+
+static __dpct_inline__ void fg_stage_a(const block_iq4_xs * __restrict__ xrow, const int kb, sycl::half2 * a) {
+    const block_iq4_xs * blk = xrow + kb / (QK_K / 32);
+    const int ib = kb % (QK_K / 32);
+    // low nibbles fill the first half of the step, high nibbles the second, so the two halves
+    // land at a[0..7] and a[8..15] and no quarter loop is needed
+    const float d = (float) blk->d *
+        ((((blk->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((blk->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+    const uint8_t * q4 = blk->qs + 16 * ib;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        a[j]     = sycl::half2((sycl::half) (d * kvalues_iq4nl[q4[2 * j] & 0xf]),
+                               (sycl::half) (d * kvalues_iq4nl[q4[2 * j + 1] & 0xf]));
+        a[8 + j] = sycl::half2((sycl::half) (d * kvalues_iq4nl[q4[2 * j] >> 4]),
+                               (sycl::half) (d * kvalues_iq4nl[q4[2 * j + 1] >> 4]));
+    }
+}
+
+static __dpct_inline__ void fg_stage_a(const block_iq3_xxs * __restrict__ xrow, const int kb, sycl::half2 * a) {
+    const block_iq3_xxs * blk = xrow + kb / (QK_K / 32);
+    const int ib = kb % (QK_K / 32);
+    const uint8_t *  q3    = blk->qs + 8 * ib;
+    const uint16_t * gas   = (const uint16_t *) (blk->qs + QK_K / 4) + 2 * ib;
+    const uint32_t   aux32 = gas[0] | (gas[1] << 16);
+    const float      d     = (float) blk->d * (0.5f + (aux32 >> 28)) * 0.5f;
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+        const uint8_t * grid1 = (const uint8_t *) (iq3xxs_grid + q3[2 * il + 0]);
+        const uint8_t * grid2 = (const uint8_t *) (iq3xxs_grid + q3[2 * il + 1]);
+        const uint8_t   signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+        float t[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            t[j + 0] = d * grid1[j] * (signs & kmask_iq2xs[j + 0] ? -1.f : 1.f);
+            t[j + 4] = d * grid2[j] * (signs & kmask_iq2xs[j + 4] ? -1.f : 1.f);
+        }
+        fg_pack_quarter(t, a, il);
+    }
+}
+
+static __dpct_inline__ void fg_stage_a(const block_iq2_xxs * __restrict__ xrow, const int kb, sycl::half2 * a) {
+    const block_iq2_xxs * blk = xrow + kb / (QK_K / 32);
+    const int ib = kb % (QK_K / 32);
+    const uint16_t * q2    = blk->qs + 4 * ib;
+    const uint8_t *  aux8  = (const uint8_t *) q2;
+    const uint32_t   aux32 = q2[2] | (q2[3] << 16);
+    const float      d     = (float) blk->d * (0.5f + (aux32 >> 28)) * 0.25f;
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+        const uint8_t * grid  = (const uint8_t *) (iq2xxs_grid + aux8[il]);
+        const uint8_t   signs = ksigns_iq2xs[(aux32 >> (7 * il)) & 127];
+        float t[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            t[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+        }
+        fg_pack_quarter(t, a, il);
+    }
+}
+
+static __dpct_inline__ void fg_stage_a(const block_iq2_xs * __restrict__ xrow, const int kb, sycl::half2 * a) {
+    const block_iq2_xs * blk = xrow + kb / (QK_K / 32);
+    const int ib = kb % (QK_K / 32);
+    const uint16_t * q2 = blk->qs + 4 * ib;
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+        const uint8_t * grid  = (const uint8_t *) (iq2xs_grid + (q2[il] & 511));
+        const float     d     = (float) blk->d * (0.5f + ((blk->scales[ib] >> (4 * (il / 2))) & 0xf)) * 0.25f;
+        const uint8_t   signs = ksigns_iq2xs[q2[il] >> 9];
+        float t[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            t[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+        }
+        fg_pack_quarter(t, a, il);
+    }
+}
+
+static __dpct_inline__ void fg_stage_a(const block_iq2_s * __restrict__ xrow, const int kb, sycl::half2 * a) {
+    const block_iq2_s * blk = xrow + kb / (QK_K / 32);
+    const int ib = kb % (QK_K / 32);
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+        const uint8_t * grid =
+            (const uint8_t *) (iq2s_grid + (blk->qs[4 * ib + il] | ((blk->qh[ib] << (8 - 2 * il)) & 0x300)));
+        const float   d     = (float) blk->d * (0.5f + ((blk->scales[ib] >> (4 * (il / 2))) & 0xf)) * 0.25f;
+        const uint8_t signs = blk->qs[QK_K / 8 + 4 * ib + il];
+        float t[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            t[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+        }
+        fg_pack_quarter(t, a, il);
+    }
+}
+
+static __dpct_inline__ void fg_stage_a(const block_iq1_s * __restrict__ xrow, const int kb, sycl::half2 * a) {
+    const block_iq1_s * blk = xrow + kb / (QK_K / 32);
+    const int ib = kb % (QK_K / 32);
+    const float delta = blk->qh[ib] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d     = (float) blk->d * (2 * ((blk->qh[ib] >> 12) & 7) + 1);
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+        uint32_t       grid32[2];
+        const int8_t * q = (const int8_t *) grid32;
+        grid32[0] = iq1s_grid_gpu[blk->qs[4 * ib + il] | (((blk->qh[ib] >> (3 * il)) & 7) << 8)];
+        grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+        grid32[0] &= 0x0f0f0f0f;
+        float t[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            t[j] = d * (q[j] + delta);
+        }
+        fg_pack_quarter(t, a, il);
+    }
+}
+
+static __dpct_inline__ void fg_stage_a(const block_iq1_m * __restrict__ xrow, const int kb, sycl::half2 * a) {
+    const block_iq1_m * blk = xrow + kb / (QK_K / 32);
+    const int ib = kb % (QK_K / 32);
+    const uint16_t * sc = (const uint16_t *) blk->scales;
+    iq1m_scale_t     scale;
+    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+#pragma unroll
+    for (int il = 0; il < 4; ++il) {
+        const int   ib16  = 2 * ib + il / 2;
+        const float d     = (float) scale.f16 * (2 * ((sc[ib16 / 4] >> (3 * (ib16 % 4))) & 0x7) + 1);
+        const float delta = blk->qh[2 * ib + il / 2] & (0x08 << (4 * (il % 2))) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
+        uint32_t       grid32[2];
+        const int8_t * q = (const int8_t *) grid32;
+        grid32[0] = iq1s_grid_gpu[blk->qs[4 * ib + il] |
+                                  (((blk->qh[2 * ib + il / 2] >> (4 * (il % 2))) & 7) << 8)];
+        grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+        grid32[0] &= 0x0f0f0f0f;
+        float t[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            t[j] = d * (q[j] + delta);
+        }
+        fg_pack_quarter(t, a, il);
+    }
+}
+
 template <typename block_q_t> struct fg_reorder_a {
     static constexpr bool supported = false;
 };
@@ -191,6 +346,13 @@ template <> struct fg_reorder_a<block_iq3_s> {
 template <typename block_q_t> struct fg_block_traits;
 template <> struct fg_block_traits<block_iq4_nl> { static constexpr int qk = QK4_NL; };
 template <> struct fg_block_traits<block_iq3_s>  { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_iq4_xs>   { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_iq3_xxs>  { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_iq2_xxs>  { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_iq2_xs>   { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_iq2_s>    { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_iq1_s>    { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_iq1_m>    { static constexpr int qk = QK_K; };
 
 // one FG_SG_ROWS x FG_BN output tile: B columns [b0, b0 + FG_BN) of packed_b go to dst columns
 // [n0, n1), n1 - n0 <= FG_BN
@@ -398,7 +560,17 @@ static void grouped_gemm_pack_b(const float * y, sycl::half * packed, const ggml
 }
 
 bool ggml_sycl_fused_dequant_gemm_f16_device_ok(dpct::queue_ptr stream) {
-    static const bool ok = fused_gemm_f16_supported(stream);
+    // Cached per device, not once: on a mixed box the first caller's verdict is not the others'.
+    static std::mutex                            mtx;
+    static std::unordered_map<sycl::device, bool> known;
+    const sycl::device                           dev = stream->get_device();
+    std::lock_guard<std::mutex>                  lock(mtx);
+    const auto                                   it = known.find(dev);
+    if (it != known.end()) {
+        return it->second;
+    }
+    const bool ok = fused_gemm_f16_supported(stream);
+    known.emplace(dev, ok);
     return ok;
 }
 
@@ -406,6 +578,9 @@ bool ggml_sycl_fused_dequant_gemm_f16(ggml_type src0_type, const void * src0, co
                                       int64_t M, int64_t N, int64_t K, int64_t ldd, bool reordered,
                                       ggml_sycl_pool & pool, dpct::queue_ptr stream) {
     // every FG_BN columns dequantize A again, so wide N is left to the library GEMM
+    if (!ggml_sycl_xmx_gather_type_enabled(src0_type)) {
+        return false;
+    }
     if (!ggml_sycl_fused_dequant_gemm_f16_shape_ok(src0_type, M, N, K, ldd)) {
         return false;
     }
@@ -443,6 +618,48 @@ bool ggml_sycl_fused_dequant_gemm_f16(ggml_type src0_type, const void * src0, co
                                                               (int) ldd, groups_n, groups_m, stream);
             }
             break;
+        case GGML_TYPE_IQ4_XS:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            fused_dequant_gemm_launch<block_iq4_xs, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K, (int) ldd, groups_n, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            fused_dequant_gemm_launch<block_iq3_xxs, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K, (int) ldd, groups_n, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            fused_dequant_gemm_launch<block_iq2_xxs, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K, (int) ldd, groups_n, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            fused_dequant_gemm_launch<block_iq2_xs, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K, (int) ldd, groups_n, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ2_S:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            fused_dequant_gemm_launch<block_iq2_s, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K, (int) ldd, groups_n, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ1_S:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            fused_dequant_gemm_launch<block_iq1_s, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K, (int) ldd, groups_n, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ1_M:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            fused_dequant_gemm_launch<block_iq1_m, false>(src0, packed, dst, (int) M, (int) N, Npad, (int) K, (int) ldd, groups_n, groups_m, stream);
+            break;
         default:
             return false;
     }
@@ -457,6 +674,9 @@ bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_b
     int64_t n_active = 0;
     for (int64_t e = 0; e < n_as; ++e) {
         n_active += expert_row_offsets[e + 1] > expert_row_offsets[e];
+    }
+    if (!ggml_sycl_xmx_gather_type_enabled(src0_type)) {
+        return false;
     }
     if (!ggml_sycl_grouped_dequant_gemm_f16_shape_ok(src0_type, M, K, total_rows, n_active)) {
         return false;
@@ -516,6 +736,48 @@ bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_b
                 grouped_dequant_gemm_launch<block_iq3_s, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M,
                                                                 Npad, (int) K, n_tiles, groups_m, stream);
             }
+            break;
+        case GGML_TYPE_IQ4_XS:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            grouped_dequant_gemm_launch<block_iq4_xs, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M, Npad, (int) K, n_tiles, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            grouped_dequant_gemm_launch<block_iq3_xxs, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M, Npad, (int) K, n_tiles, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            grouped_dequant_gemm_launch<block_iq2_xxs, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M, Npad, (int) K, n_tiles, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            grouped_dequant_gemm_launch<block_iq2_xs, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M, Npad, (int) K, n_tiles, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ2_S:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            grouped_dequant_gemm_launch<block_iq2_s, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M, Npad, (int) K, n_tiles, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ1_S:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            grouped_dequant_gemm_launch<block_iq1_s, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M, Npad, (int) K, n_tiles, groups_m, stream);
+            break;
+        case GGML_TYPE_IQ1_M:
+            if (reordered) {
+                return false;  // no SoA A stage for this format; nothing reorders it either
+            }
+            grouped_dequant_gemm_launch<block_iq1_m, false>(src0_dd, expert_stride, tiles_ptr, packed, dst, (int) M, Npad, (int) K, n_tiles, groups_m, stream);
             break;
         default:
             return false;

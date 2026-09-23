@@ -135,6 +135,7 @@ int g_ggml_sycl_mv_fuse = 1;
 int g_ggml_sycl_topk_moe_radix = 1;
 // bitmask of ggml_sycl_reorder_type; see GGML_SYCL_REORDER_DEFAULT in common.hpp
 int g_ggml_sycl_reorder_types = GGML_SYCL_REORDER_DEFAULT;
+int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -430,6 +431,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
         g_ggml_sycl_topk_moe_radix = ggml_sycl_get_env("GGML_SYCL_TOPK_MOE_RADIX", 1);
         g_ggml_sycl_reorder_types = ggml_sycl_get_env("GGML_SYCL_REORDER_TYPES", GGML_SYCL_REORDER_DEFAULT);
+        g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -575,6 +577,7 @@ static void ggml_check_sycl() try {
                       (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_NL) != 0,
                       (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0)   != 0);
         GGML_LOG_INFO("  GGML_SYCL_FA_MAX_MEM_MIB: %d\n", g_ggml_sycl_fa_max_mem_mib);
+        GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -5710,7 +5713,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     SYCL_CHECK(CHECK_TRY_ERROR(
         stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
 
-    // also ensures ctx.mmid_row_mapping_host is drained before we use it again
+    // also ensures ctx.mmid_row_mapping_host and ctx.mmid_tile_schedule_host are drained before we
+    // refill them: the grouped GEMM enqueues an async copy out of the tile schedule, so removing
+    // this wait would let the next node overwrite a buffer the device is still reading
     SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
 
     ggml_tensor src0_row = *src0;

@@ -97,6 +97,22 @@ enum ggml_sycl_reorder_type {
 static constexpr int GGML_SYCL_REORDER_DEFAULT = ~GGML_SYCL_REORDER_Q8_0;
 
 extern int g_ggml_sycl_reorder_types;
+
+// Which quantized weight formats may take the XMX dequant-GEMM paths. A bitmask rather than one
+// flag per path, so a format can be enabled or measured on its own and adding a format is one bit.
+enum ggml_sycl_xmx_gather_type {
+    GGML_SYCL_XMX_GATHER_IQ4_NL   = 1 << 0,
+    GGML_SYCL_XMX_GATHER_IQ3_S    = 1 << 1,
+    GGML_SYCL_XMX_GATHER_IQ4_XS   = 1 << 2,
+    GGML_SYCL_XMX_GATHER_IQ3_XXS  = 1 << 3,
+    GGML_SYCL_XMX_GATHER_IQ2_XXS  = 1 << 4,
+    GGML_SYCL_XMX_GATHER_IQ2_XS   = 1 << 5,
+    GGML_SYCL_XMX_GATHER_IQ2_S    = 1 << 6,
+    GGML_SYCL_XMX_GATHER_IQ1_S    = 1 << 7,
+    GGML_SYCL_XMX_GATHER_IQ1_M    = 1 << 8,
+};
+static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
+extern int g_ggml_sycl_xmx_gather_types;
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 // Wait for a cross-split event by enqueuing a barrier instead of blocking the host on it.
@@ -416,6 +432,7 @@ struct mmid_row_mapping {
 };
 
 // one work-group of the grouped GEMM: rows [n0, n1) of the expert-major buffers belong to expert
+
 struct ggml_sycl_gg_tile {
     int32_t expert;
     int32_t n0;
@@ -529,6 +546,7 @@ struct ggml_backend_sycl_context {
 
     std::vector<mmid_row_mapping> mmid_row_mapping_host;
     std::vector<ggml_sycl_gg_tile> mmid_tile_schedule_host;
+
 
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
