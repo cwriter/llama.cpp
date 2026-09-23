@@ -35,6 +35,7 @@ void ggml_sycl_div(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 void ggml_sycl_repeat(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 
 void ggml_sycl_op_add_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add0, ggml_tensor * add1);
+void ggml_sycl_op_mul_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * mul, ggml_tensor * add);
 
 void ggml_sycl_op_add_n_fused(ggml_backend_sycl_context & ctx, ggml_tensor * const * nodes, int n_nodes,
                               ggml_tensor * scale = nullptr);

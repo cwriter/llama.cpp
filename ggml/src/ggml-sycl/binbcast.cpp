@@ -610,9 +610,11 @@ void ggml_sycl_repeat(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_op_repeat(ctx, dst);
 }
 
-// fused ADD+ADD: dst = (src0 + src1) + src2. Same indexing as k_bin_bcast, so mixed
+// fused pair: dst = bin_op2(bin_op(src0, src1), src2). Same indexing as k_bin_bcast, so mixed
 // types, broadcast, and non-contiguous layouts that add() already handles also fuse.
-template<float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename src2_t, typename dst_t>
+// bin_op2 defaults to bin_op, which is the ADD+ADD case; MUL+ADD passes op_add for it.
+template<float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename src2_t,
+         typename dst_t, float (*bin_op2)(const float, const float) = bin_op>
 static void k_bin_bcast3(const src0_t * src0, const src1_t * src1, const src2_t * src2, dst_t * dst,
         int ne0, int ne1, int ne2, int ne3,
         int ne10, int ne11, int ne12, int ne13,
@@ -659,11 +661,12 @@ static void k_bin_bcast3(const src0_t * src0, const src1_t * src1, const src2_t 
         const int   i10 = i0 % ne10;
         const int   i20 = i0 % ne20;
         const float acc = bin_op((float) src0_row[i0 * s00], (float) src1_row[i10 * s10]);
-        dst_row[i0]     = (dst_t) bin_op(acc, (float) src2_row[i20 * s20]);
+        dst_row[i0]     = (dst_t) bin_op2(acc, (float) src2_row[i20 * s20]);
     }
 }
 
-template<float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename src2_t, typename dst_t>
+template<float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename src2_t,
+         typename dst_t, float (*bin_op2)(const float, const float) = bin_op>
 static void k_bin_bcast3_unravel(const src0_t * src0, const src1_t * src1, const src2_t * src2, dst_t * dst,
         int ne0, int ne1, int ne2, int ne3,
         int ne10, int ne11, int ne12, int ne13,
@@ -700,10 +703,11 @@ static void k_bin_bcast3_unravel(const src0_t * src0, const src1_t * src1, const
     const int   i10 = i0 % ne10;
     const int   i20 = i0 % ne20;
     const float acc = bin_op((float) src0[i_src0 + i0 * s00], (float) src1[i_src1 + i10 * s10]);
-    dst[i_dst + i0] = (dst_t) bin_op(acc, (float) src2[i_src2 + i20 * s20]);
+    dst[i_dst + i0] = (dst_t) bin_op2(acc, (float) src2[i_src2 + i20 * s20]);
 }
 
-template<float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename src2_t, typename dst_t>
+template<float (*bin_op)(const float, const float), typename src0_t, typename src1_t, typename src2_t,
+         typename dst_t, float (*bin_op2)(const float, const float) = bin_op>
 static void launch_bin_bcast3(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                               const ggml_tensor * src2, ggml_tensor * dst) {
     dpct::queue_ptr stream = ctx.stream();
@@ -828,14 +832,14 @@ static void launch_bin_bcast3(ggml_backend_sycl_context & ctx, const ggml_tensor
                 sycl::nd_range<3>(sycl::range<3>(1, 1, block_num) * sycl::range<3>(1, 1, block_size),
                                   sycl::range<3>(1, 1, block_size)),
                 [=](sycl::nd_item<3> item_ct1) {
-                    k_bin_bcast3_unravel<bin_op>(src0_dd, src1_dd, src2_dd, dst_dd, ne0, ne1, ne2, ne3, ne10, ne11,
+                    k_bin_bcast3_unravel<bin_op, src0_t, src1_t, src2_t, dst_t, bin_op2>(src0_dd, src1_dd, src2_dd, dst_dd, ne0, ne1, ne2, ne3, ne10, ne11,
                                                  ne12, ne13, ne20, ne21, ne22, ne23, s1, s2, s3, s00, s01, s02, s03,
                                                  s10, s11, s12, s13, s20, s21, s22, s23, item_ct1);
                 });
         } else {
             stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                                  [=](sycl::nd_item<3> item_ct1) {
-                                     k_bin_bcast3<bin_op>(src0_dd, src1_dd, src2_dd, dst_dd, ne0, ne1, ne2, ne3, ne10,
+                                     k_bin_bcast3<bin_op, src0_t, src1_t, src2_t, dst_t, bin_op2>(src0_dd, src1_dd, src2_dd, dst_dd, ne0, ne1, ne2, ne3, ne10,
                                                           ne11, ne12, ne13, ne20, ne21, ne22, ne23, s1, s2, s3, s00,
                                                           s01, s02, s03, s10, s11, s12, s13, s20, s21, s22, s23,
                                                           item_ct1);
@@ -844,14 +848,34 @@ static void launch_bin_bcast3(ggml_backend_sycl_context & ctx, const ggml_tensor
     }
 }
 
+// fused MUL+ADD: dst = (mul->src0 * mul->src1) + the other operand of add. The multiply is the
+// per-expert / per-gate scaling that feeds an accumulate, which is the commonest surviving pair
+// in a decode graph once the existing fusions have taken their share.
+void ggml_sycl_op_mul_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * mul, ggml_tensor * add) {
+    scope_op_debug_print scope_dbg_print(__func__, add, /*num_src=*/2);
+
+    const ggml_tensor * src0 = mul->src[0];
+    const ggml_tensor * src1 = mul->src[1];
+    const ggml_tensor * src2 = (add->src[0] == mul) ? add->src[1] : add->src[0];
+    ggml_tensor *       dst  = add;
+
+    GGML_ASSERT(add->src[0] == mul || add->src[1] == mul);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+                src2->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    launch_bin_bcast3<op_mul, float, float, float, float, op_add>(ctx, src0, src1, src2, dst);
+}
+
 void ggml_sycl_op_add_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add0, ggml_tensor * add1) {
     scope_op_debug_print scope_dbg_print(__func__, add1, /*num_src=*/0);
     const ggml_tensor * src0 = add0->src[0];
     const ggml_tensor * src1 = add0->src[1];
-    const ggml_tensor * src2 = add1->src[1];
+    // add0 is normally src[0] of add1; with GGML_SYCL_FLOAT_COMMUTATIVE it may be src[1], which
+    // ggml_sycl_can_fuse() only allows because a+b and b+a are the same IEEE754 value
+    const ggml_tensor * src2 = (add1->src[0] == add0) ? add1->src[1] : add1->src[0];
     ggml_tensor *       dst  = add1;
 
-    GGML_ASSERT(add1->src[0] == add0);
+    GGML_ASSERT(add1->src[0] == add0 || add1->src[1] == add0);
     GGML_ASSERT(ggml_sycl_add_kernel_supports(src0->type, src1->type, add0->type));
     GGML_ASSERT(ggml_sycl_add_kernel_supports(add0->type, src2->type, dst->type));
 
