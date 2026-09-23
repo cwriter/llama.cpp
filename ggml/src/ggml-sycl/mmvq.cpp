@@ -2432,7 +2432,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
         switch (src0->type) {
             case GGML_TYPE_Q4_0:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2499,7 +2499,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_Q8_0:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2555,7 +2555,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_Q2_K:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2583,7 +2583,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_Q3_K:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2611,7 +2611,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_Q4_K:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2639,7 +2639,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_Q5_K:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2667,7 +2667,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_Q6_K:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2710,7 +2710,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_IQ3_XXS:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2730,7 +2730,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_IQ3_S:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                         const int stride_col_y_bytes = src1_padded_col_size * q8_1_ts / q8_1_bs;
                         const int stride_col_dst     = dst->ne[0];
@@ -2750,7 +2750,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 break;
             case GGML_TYPE_IQ4_NL:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
-                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                     reorder_mul_mat_vec_iq4_nl_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 } else {
                     mul_mat_vec_iq4_nl_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
