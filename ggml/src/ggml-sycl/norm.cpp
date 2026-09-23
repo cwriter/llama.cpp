@@ -683,6 +683,7 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
+    scope_op_debug_print scope_dbg_print(__func__, mul_tensor, /*num_src=*/0);
     const ggml_tensor * rms_norm_src = dst->src[0];
     float eps = 0.0f;
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -744,6 +745,7 @@ void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
 void ggml_sycl_op_rms_norm_fused_add(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                      ggml_tensor * mul_tensor, ggml_tensor * add_tensor) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/0);
     const ggml_tensor * rms_norm_src = dst->src[0];
     float eps = 0.0f;
     memcpy(&eps, dst->op_params, sizeof(float));
@@ -1021,6 +1023,7 @@ void ggml_sycl_op_l2_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst) {
 // nodes[0..count) are independent, same-shape, same-eps, same-nb L2_NORM ops validated
 // by the caller; requires ncols < 1024 (the warp reduction path).
 void ggml_sycl_l2_norm_batch(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, int count) {
+    scope_op_debug_print scope_dbg_print(__func__, nodes[0], /*num_src=*/0);
     const ggml_tensor * s0 = nodes[0]->src[0];
     const int ncols       = (int) s0->ne[0];
     const int nrows_total = (int) ggml_nrows(s0);
