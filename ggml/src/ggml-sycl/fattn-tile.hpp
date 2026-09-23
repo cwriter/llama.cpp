@@ -1,3 +1,4 @@
+#include "kv-soa.hpp"
 #include <sycl/sycl.hpp>
 #include <sycl/ext/oneapi/work_group_static.hpp>
 #include "dpct/helper.hpp"
@@ -344,12 +345,18 @@ static __dpct_inline__ void flash_attn_tile_load_tile_q8_0(const char * const __
         __dpct_align__(16) sycl::half2 tmp[qpt/2] = { { 0.0f, 0.0f } };
 
         if (!oob_check || i < i_sup) {
-            const block_q8_0 * block = (const block_q8_0 *) (KV + int64_t(i)*stride_KV) + (j0 + j)/QK8_0;
+            // SoA span: the quants of these qpt features are contiguous and 16-byte aligned, so
+            // one int4 load replaces the eight 2-byte loads the interleaved block forced.
+            using A = ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>;
+            size_t span_off;
+            int    iblk;
+            ggml_sycl_q8_0_locate<GGML_SYCL_LAYOUT_SOA_SPAN>(j0 + j, span_off, iblk);
+            const char * span = KV + int64_t(i)*stride_KV + span_off;
 
-            int8_t qs[qpt];
-            ggml_sycl_memcpy_1<qpt, 2>(qs, block->qs + (j0 + j) % QK8_0);
+            __dpct_align__(16) int8_t qs[qpt];
+            ggml_sycl_memcpy_1<qpt, 16>(qs, A::qs(span, iblk) + ((j0 + j) % QK8_0));
 
-            const sycl::half2 d = sycl::half2(block->d);
+            const sycl::half2 d = sycl::half2((sycl::half) A::d(span, iblk));
 #pragma unroll
             for (int l = 0; l < qpt/2; ++l) {
                 tmp[l] = d * make_half2(qs[2*l + 0], qs[2*l + 1]);
@@ -391,12 +398,16 @@ static __dpct_inline__ void flash_attn_tile_load_tile_q8_0(const char * const __
         __dpct_align__(16) float tmp[qpt] = { 0.0f };
 
         if (!oob_check || i < i_sup) {
-            const block_q8_0 * block = (const block_q8_0 *) (KV + int64_t(i)*stride_KV) + (j0 + j)/QK8_0;
+            using A = ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>;
+            size_t span_off;
+            int    iblk;
+            ggml_sycl_q8_0_locate<GGML_SYCL_LAYOUT_SOA_SPAN>(j0 + j, span_off, iblk);
+            const char * span = KV + int64_t(i)*stride_KV + span_off;
 
-            int8_t qs[qpt];
-            ggml_sycl_memcpy_1<qpt, 2>(qs, block->qs + (j0 + j) % QK8_0);
+            __dpct_align__(16) int8_t qs[qpt];
+            ggml_sycl_memcpy_1<qpt, 16>(qs, A::qs(span, iblk) + ((j0 + j) % QK8_0));
 
-            const float d = block->d;
+            const float d = A::d(span, iblk);
 #pragma unroll
             for (int l = 0; l < qpt; ++l) {
                 tmp[l] = d * qs[l];
@@ -1187,7 +1198,12 @@ static bool ggml_sycl_fattn_tile_use_q8_0(const ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
 
-    return g_ggml_sycl_fattn_tile_q8_0 && K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0;
+    // The online loader reads the SoA span layout: its whole point is the aligned 16-byte quant
+    // load that the interleaved block cannot give. Reading canonical q8_0 online was measured
+    // slower than f16 staging five different ways, so require the layout rather than fall back.
+    const bool ok = g_ggml_sycl_fattn_tile_q8_0 && K->type == GGML_TYPE_Q8_0 &&
+                    V->type == GGML_TYPE_Q8_0 && ggml_sycl_kv_is_soa(K) && ggml_sycl_kv_is_soa(V);
+    return ok;
 }
 
 template <int DKQ, int DV, int ncols2, int cols_per_block, bool use_logit_softcap, int warp_size>

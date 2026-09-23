@@ -858,10 +858,17 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
-    // a session file must hold canonical bytes; de/re-permuting here is the fix, asserting is the
-    // interim so a save cannot silently write a layout no other build understands
-    GGML_ASSERT(!ggml_sycl_kv_is_soa(tensor) &&
-                "raw access to a SoA KV tensor; see kv-soa.hpp");
+    // A caller always hands over canonical bytes (a session file has to be readable by any build),
+    // so permute into span order here rather than making every writer aware of the layout. The
+    // staging loop below memcpy()s out of this buffer on the host, so the local outlives the copy.
+    std::vector<char> soa_buf;
+    if (ggml_sycl_kv_is_soa(tensor)) {
+        GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
+                    "a SoA KV write must cover whole spans; see kv-soa.hpp");
+        soa_buf.resize(size);
+        ggml_sycl_kv_soa_canonical_to_span(soa_buf.data(), data, size);
+        data = soa_buf.data();
+    }
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
     queue_ptr stream = ctx->stream;
@@ -916,10 +923,10 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
-    // a session file must hold canonical bytes; de/re-permuting here is the fix, asserting is the
-    // interim so a save cannot silently write a layout no other build understands
-    GGML_ASSERT(!ggml_sycl_kv_is_soa(tensor) &&
-                "raw access to a SoA KV tensor; see kv-soa.hpp");
+    // Hand back canonical bytes whatever the device holds, so a session file stays portable.
+    const bool soa = ggml_sycl_kv_is_soa(tensor);
+    GGML_ASSERT((!soa || ggml_sycl_kv_soa_range_ok(offset, size)) &&
+                "a SoA KV read must cover whole spans; see kv-soa.hpp");
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
 
     ggml_sycl_set_device(ctx->device);
@@ -928,6 +935,11 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     SYCL_CHECK(CHECK_TRY_ERROR(
         stream.memcpy(data, (const char *)tensor->data + offset, size)
             .wait()));
+
+    if (soa) {
+        // spans keep their byte range, so this unpermutes in place
+        ggml_sycl_kv_soa_span_to_canonical(data, data, size);
+    }
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -1017,6 +1029,9 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(" src", src).c_str());
     GGML_SYCL_DEBUG(" is_cpy_supported=%d\n", is_cpy_supported);
     if (is_cpy_supported) {
+        // a raw byte copy carries the layout with it, so it is only correct when both sides agree
+        GGML_ASSERT(ggml_sycl_kv_is_soa(src) == ggml_sycl_kv_is_soa(dst) &&
+                    "cpy_tensor across different KV layouts; see kv-soa.hpp");
         ggml_backend_sycl_buffer_context * src_ctx = (ggml_backend_sycl_buffer_context *)src->buffer->context;
         ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
 
@@ -6402,6 +6417,16 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (ggml_sycl_kv_is_soa(tensor)) {
+        // the permuted copy is a local, so this one copy has to be synchronous
+        GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
+                    "a SoA KV write must cover whole spans; see kv-soa.hpp");
+        std::vector<char> soa_buf(size);
+        ggml_sycl_kv_soa_canonical_to_span(soa_buf.data(), data, size);
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            (stream)->memcpy((char *)tensor->data + offset, soa_buf.data(), size).wait()));
+        return;
+    }
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
 }
@@ -6423,6 +6448,15 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (ggml_sycl_kv_is_soa(tensor)) {
+        // unpermuting needs the bytes in hand, so this one copy has to be synchronous
+        GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
+                    "a SoA KV read must cover whole spans; see kv-soa.hpp");
+        SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
+            data, (const char *)tensor->data + offset, size).wait()));
+        ggml_sycl_kv_soa_span_to_canonical(data, data, size);
+        return;
+    }
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
         data, (const char *)tensor->data + offset, size)));
 }

@@ -97,6 +97,20 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // n_kv has to stay a multiple of 256 for two independent reasons: the SYCL SoA q8_0 cache
+    // spans 256 elements, and flash attention's use_gqa_opt silently drops to a far slower path
+    // without it. get_n_kv() pads to that granularity but clamps to the cell count, so the
+    // guarantee actually comes from llama-context.cpp rounding n_ctx up to 256 before we are
+    // constructed. Assert it rather than re-pad, so the dependency is visible if that changes.
+    // Guarded: a shared source cache can override kv_size above, and only the SoA path needs
+    // this. Padding here would be dead code - llama-context.cpp already rounds n_ctx to 256 -
+    // so assert instead, and only where it matters.
+    if (getenv("GGML_SYCL_KV_SOA") && atoi(getenv("GGML_SYCL_KV_SOA")) != 0) {
+        GGML_ASSERT(kv_size % 256 == 0 &&
+                    "GGML_SYCL_KV_SOA needs kv_size a multiple of 256; llama-context pads n_ctx "
+                    "for this, so reaching here means something overrode it");
+    }
+
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer = hparams.n_layer_all;

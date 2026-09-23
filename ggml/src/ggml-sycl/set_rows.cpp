@@ -149,7 +149,6 @@ static void set_rows_sycl_q8_0_soa(const char * __restrict__ src0_d, const TIdx 
         const int64_t dst_row     = src1_d[src1_offset / sizeof(TIdx)];
 
         char *        row_base = dst_d + calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 });
-        const int64_t iblk     = i00 / QK8_0;
 
         float src_f32[QK8_0];
         if constexpr (std::is_same_v<TIn, float>) {

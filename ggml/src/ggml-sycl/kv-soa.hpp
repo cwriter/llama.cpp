@@ -77,4 +77,12 @@ void ggml_sycl_kv_soa_mark(ggml_tensor * t);
 void ggml_sycl_kv_soa_to_fp16(const void * vx, sycl::half * y, int64_t ne0, int64_t ne1,
                               int64_t ne2, size_t nb1, size_t nb2, queue_ptr stream);
 
+// Canonical and SoA spans occupy the same bytes (8 * sizeof(block_q8_0) == 256 + 8 * sizeof(half)),
+// so converting permutes inside each span and never moves one. That is why the host can hand out
+// canonical bytes for a session file without a device round trip, and why the range check is a
+// plain span-alignment test. dst may alias src.
+bool ggml_sycl_kv_soa_range_ok(size_t offset, size_t nbytes);
+void ggml_sycl_kv_soa_span_to_canonical(void * dst, const void * src, size_t nbytes);
+void ggml_sycl_kv_soa_canonical_to_span(void * dst, const void * src, size_t nbytes);
+
 #endif  // GGML_SYCL_KV_SOA_HPP
