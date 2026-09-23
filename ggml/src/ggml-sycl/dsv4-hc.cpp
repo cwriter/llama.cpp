@@ -1,5 +1,6 @@
 #include "ggml-impl.h"
 #include "dsv4-hc.hpp"
+#include "element_wise.hpp"  // op_exp, for sigmoid parity with the unfused chain
 
 #include <cmath>
 #include <type_traits>
@@ -157,7 +158,9 @@ static constexpr int dsv4_hc_post_block_size = 256;
 
 // comb == nullptr is identity mixing: each destination stream keeps its own residual
 // instead of summing across the streams.
-template <bool has_comb>
+// fused_gate: post points at the input of a scale -> sigmoid -> scale chain rather than its
+// result, and the three ops are applied here. g0/g1 carry (scale, bias) for the two scales.
+template <bool has_comb, bool fused_gate>
 static void dsv4_hc_post_f32_sycl(
         const float * x, const float * residual, const float * post, const float * comb, float * dst,
         int64_t n_embd, int64_t hc, int64_t n_tokens,
@@ -166,6 +169,7 @@ static void dsv4_hc_post_f32_sycl(
         int64_t sp0, int64_t sp1,
         int64_t sc0, int64_t sc1, int64_t sc2,
         int64_t sd0, int64_t sd1, int64_t sd2,
+        sycl::float2 g0, sycl::float2 g1,
         queue_ptr stream) {
     const int64_t nr = n_embd * hc * n_tokens;
     const int64_t block_size = dsv4_hc_post_block_size;
@@ -183,7 +187,14 @@ static void dsv4_hc_post_f32_sycl(
             const int64_t idst = (ir / n_embd) % hc;
             const int64_t it   = ir / (n_embd * hc);
 
-            float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+            float gate = post[idst*sp0 + it*sp1];
+            if constexpr (fused_gate) {
+                gate = g0[0] * gate + g0[1];
+                gate = 1.0f / (1.0f + op_exp(-gate));  // exactly op_sigmoid()
+                gate = g1[0] * gate + g1[1];
+            }
+
+            float sum = x[i0*sx0 + it*sx1] * gate;
             if constexpr (has_comb) {
                 for (int64_t isrc = 0; isrc < hc; ++isrc) {
                     sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -284,11 +295,13 @@ void ggml_sycl_op_dsv4_hc_comb(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             eps, n_iter, stream);
 }
 
-void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
-    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
+// gate == nullptr keeps dst->src[2] as the gate; otherwise the scale -> sigmoid -> scale chain
+// that produced it is folded into this launch and its three nodes are skipped by the caller.
+static void dsv4_hc_post_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                              const ggml_sycl_dsv4_hc_post_gate * gate) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
+    const ggml_tensor * post     = gate ? gate->src : dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
@@ -315,10 +328,20 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
 
+    // the folded chain is elementwise, so its input indexes exactly like the gate it replaces.
+    // Only assert on the fused path: the plain path never carried this check and must keep
+    // accepting whatever shapes it already did.
+    if (gate) {
+        GGML_ASSERT(post->ne[0] == hc && post->ne[1] == n_tokens);
+    }
+
+    const sycl::float2 g0(gate ? gate->s0 : 1.0f, gate ? gate->b0 : 0.0f);
+    const sycl::float2 g1(gate ? gate->s1 : 1.0f, gate ? gate->b1 : 0.0f);
+
     queue_ptr stream = ctx.stream();
 
-    const auto launch = [&](auto has_comb) {
-        dsv4_hc_post_f32_sycl<decltype(has_comb)::value>(
+    const auto launch = [&](auto has_comb, auto fused_gate) {
+        dsv4_hc_post_f32_sycl<decltype(has_comb)::value, decltype(fused_gate)::value>(
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
             n_embd, hc, n_tokens,
@@ -327,12 +350,23 @@ void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * ds
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
-            stream);
+            g0, g1, stream);
     };
 
-    if (comb) {
-        launch(std::true_type{});
-    } else {
-        launch(std::false_type{});
-    }
+    if (comb && gate)   { launch(std::true_type{},  std::true_type{});  }
+    else if (comb)      { launch(std::true_type{},  std::false_type{}); }
+    else if (gate)      { launch(std::false_type{}, std::true_type{});  }
+    else                { launch(std::false_type{}, std::false_type{}); }
+}
+
+void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
+    dsv4_hc_post_impl(ctx, dst, /*gate=*/nullptr);
+}
+
+void ggml_sycl_op_dsv4_hc_post_fused_gate(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                          const ggml_sycl_dsv4_hc_post_gate & gate) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
+    GGML_ASSERT(gate.src != nullptr);
+    dsv4_hc_post_impl(ctx, dst, &gate);
 }
