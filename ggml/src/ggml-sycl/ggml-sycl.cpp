@@ -31,6 +31,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#include <mutex>
+#include <set>
+#include <map>
+#include <utility>
 
 #include <sycl/sycl.hpp>
 #include <sycl/backend.hpp>
@@ -134,6 +138,8 @@ int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
 int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
+int g_ggml_sycl_device_event_wait = 1;
+int g_ggml_sycl_async_copy = 1;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
@@ -424,6 +430,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_use_level_zero_api = 0;
 #endif
         g_ggml_sycl_dev2dev_memcpy = ggml_sycl_get_env("GGML_SYCL_DEV2DEV_MEMCPY", DEV2DEV_MEMCPY_SYCL);
+        g_ggml_sycl_device_event_wait = ggml_sycl_get_env("GGML_SYCL_DEVICE_EVENT_WAIT", 1);
+        g_ggml_sycl_async_copy = ggml_sycl_get_env("GGML_SYCL_ASYNC_COPY", 1);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
@@ -491,6 +499,8 @@ static void ggml_check_sycl() try {
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s)\n", g_ggml_sycl_dev2dev_memcpy, dev2dev_int2str(g_ggml_sycl_dev2dev_memcpy));
+        GGML_LOG_INFO("  GGML_SYCL_DEVICE_EVENT_WAIT: %d\n", g_ggml_sycl_device_event_wait);
+        GGML_LOG_INFO("  GGML_SYCL_ASYNC_COPY: %d\n", g_ggml_sycl_async_copy);
         GGML_LOG_INFO("  GGML_SYCL_GET_MEM_API: %d (%s)\n", g_ggml_sycl_get_mem_api, mem_api_int2str(g_ggml_sycl_get_mem_api));
 #else
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s), enable to SYCL API since missing GGML_SYCL_SUPPORT_LEVEL_ZERO_API\n",
@@ -895,6 +905,8 @@ static bool ggml_sycl_is_l0_discrete_gpu(int device) {
 }
 #endif
 
+static bool sycl_queue_wait_for_queue(const queue_ptr & q_dst, const queue_ptr & q_src);
+
 static void dev2dev_memcpy(int device_dst, sycl::queue &q_dst, int device_src, sycl::queue &q_src, void *ptr_dst,
                     const void *ptr_src, size_t size) {
 
@@ -906,14 +918,29 @@ static void dev2dev_memcpy(int device_dst, sycl::queue &q_dst, int device_src, s
         if (g_ggml_sycl_use_level_zero_api && l0_copy_supported) {
             auto ze_ctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_dst.get_context());
             auto ze_dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q_dst.get_device());
-            ze_command_queue_desc_t cq_desc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0,
-                                            0, ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
-            ze_command_list_handle_t cl;
-            ze_result_t r = zeCommandListCreateImmediate(ze_ctx, ze_dev, &cq_desc, &cl);
-            if (r == ZE_RESULT_SUCCESS) {
+            // One immediate command list per destination device, kept for the process. Building
+            // and tearing one down around every copy costs more than the copy on short tensors.
+            static std::mutex                                     cl_mtx;
+            static std::map<ze_device_handle_t, ze_command_list_handle_t> cl_cache;
+            ze_command_list_handle_t cl = nullptr;
+            ze_result_t              r  = ZE_RESULT_SUCCESS;
+            {
+                std::lock_guard<std::mutex> lock(cl_mtx);
+                auto it = cl_cache.find(ze_dev);
+                if (it != cl_cache.end()) {
+                    cl = it->second;
+                } else {
+                    ze_command_queue_desc_t cq_desc = {ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC, nullptr, 0, 0,
+                                                    0, ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS, ZE_COMMAND_QUEUE_PRIORITY_NORMAL};
+                    r = zeCommandListCreateImmediate(ze_ctx, ze_dev, &cq_desc, &cl);
+                    if (r == ZE_RESULT_SUCCESS) {
+                        cl_cache.emplace(ze_dev, cl);
+                    }
+                }
+            }
+            if (r == ZE_RESULT_SUCCESS && cl != nullptr) {
                 GGML_SYCL_DEBUG("[SYCL] dev2dev memcpy by L0\n");
                 r = zeCommandListAppendMemoryCopy(cl, ptr_dst, ptr_src, size, nullptr, 0, nullptr);
-                zeCommandListDestroy(cl);
                 if (r == ZE_RESULT_SUCCESS) {
                     return;
                 }
@@ -957,31 +984,31 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         ggml_backend_sycl_buffer_context * src_ctx = (ggml_backend_sycl_buffer_context *)src->buffer->context;
         ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
 
-        ggml_sycl_set_device(src_ctx->device);
-        /*
-        DPCT1009:198: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            dpct::dev_mgr::instance().get_device(src_ctx->device).queues_wait_and_throw()));
-        ggml_sycl_set_device(dst_ctx->device);
-        /*
-        DPCT1009:199: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            dpct::dev_mgr::instance().get_device(dst_ctx->device).queues_wait_and_throw()));
-        /*
-        DPCT1009:200: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-
         queue_ptr stream_dst = dst_ctx->stream;
         queue_ptr stream_src = src_ctx->stream;
         size_t size = ggml_nbytes(src);
+
+        // This entry point is synchronous by contract, so the copy is still waited out below.
+        // Reaching it does not need both devices drained on the host: a barrier on the source
+        // queue is what the read actually depends on, and the destination queue is in-order, so
+        // its own pending work already precedes the write. That substitution is only sound when
+        // the copy will be enqueued on stream_dst - the Level Zero and host-staged routes inside
+        // dev2dev_memcpy do not run on it, and a barrier would not order them - so the drains
+        // stay for every case peer_dst_enqueue() does not claim.
+        const bool dst_enqueued =
+            g_ggml_sycl_async_copy && g_ggml_sycl_dev2dev_memcpy == DEV2DEV_MEMCPY_SYCL &&
+            stream_dst->get_device().ext_oneapi_can_access_peer(
+                stream_src->get_device(), sycl::ext::oneapi::peer_access::access_supported) &&
+            sycl_queue_wait_for_queue(stream_dst, stream_src);
+        ggml_sycl_set_device(src_ctx->device);
+        if (!dst_enqueued) {
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                dpct::dev_mgr::instance().get_device(src_ctx->device).queues_wait_and_throw()));
+            ggml_sycl_set_device(dst_ctx->device);
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                dpct::dev_mgr::instance().get_device(dst_ctx->device).queues_wait_and_throw()));
+        }
+        ggml_sycl_set_device(dst_ctx->device);
 
         //todo. it's dirty solutino to walkaroud known issue:device2device cross GPUs.
         dev2dev_memcpy(dst_ctx->device, *stream_dst, src_ctx->device, *stream_src, dst->data, src->data, size);
@@ -6369,29 +6396,89 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
-                                               const ggml_tensor *src,
-                                               ggml_tensor *dst) try {
-    ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
-    bool is_cpy_supported                = dst->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) &&
-                            ggml_backend_buffer_is_sycl(src->buffer);
-    GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
-    GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
-    GGML_SYCL_DEBUG("%s", debug_get_tensor_str(" src", src).c_str());
-    GGML_SYCL_DEBUG(" is_cpy_supported=%d\n", is_cpy_supported);
-    if (is_cpy_supported) {
-        /*
-        DPCT1009:215: SYCL uses exceptions to report errors and does not use the
-        error codes. The original code was commented out and a warning string
-        was inserted. You need to rewrite this code.
-        */
-        const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-        SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
-            dst->data, src->data, ggml_nbytes(dst))));
+// Enable peer access once per ordered device pair. Asking twice is an error, and this runs
+// on the copy path, so the set is kept rather than the question re-asked.
+static bool sycl_enable_peer_access_once(int device_dst, int device_src, sycl::queue & q_dst,
+                                         sycl::queue & q_src) {
+    static std::mutex                    mtx;
+    static std::set<std::pair<int, int>> enabled;
+    sycl::device                         dev_dst = q_dst.get_device();
+    sycl::device                         dev_src = q_src.get_device();
+    if (!dev_dst.ext_oneapi_can_access_peer(dev_src, sycl::ext::oneapi::peer_access::access_supported)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    if (enabled.insert({ device_dst, device_src }).second) {
+        dev_dst.ext_oneapi_enable_peer_access(dev_src);
+    }
+    return true;
+}
+
+// Order q_dst behind everything currently queued on q_src, device-side. Both queues must share
+// a context, which a SYCL wait list requires. Returns false when they do not.
+static bool sycl_queue_wait_for_queue(const queue_ptr & q_dst, const queue_ptr & q_src) {
+    if (q_dst == q_src) {
+        return true;  // in-order queue already orders the copy behind its own prior work
+    }
+    if (q_src->get_context() != q_dst->get_context()) {
+        return false;
+    }
+    sycl::event src_done;
+    SYCL_CHECK(CHECK_TRY_ERROR(src_done = q_src->ext_oneapi_submit_barrier()));
+    SYCL_CHECK(CHECK_TRY_ERROR(q_dst->ext_oneapi_submit_barrier({ src_done })));
+    return true;
+}
+
+// Copy into this backend without draining anything on the host. Returning true tells the
+// scheduler it no longer has to synchronize the destination backend around the copy, so every
+// ordering this replaces has to be re-established on the device:
+//   - the destination queue is in-order, which covers the write-after-read on dst;
+//   - a cross-device read is placed behind a barrier on the source queue, which covers the
+//     read-after-write on src;
+//   - a host source is staged through pinned memory by set_tensor, which copies it out
+//     synchronously, so the caller may reuse the source buffer as soon as this returns.
+static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
+                                               const ggml_tensor * src, ggml_tensor * dst) try {
+    GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
+    if (!g_ggml_sycl_async_copy || !ggml_backend_is_sycl(backend_dst)) {
+        return false;
+    }
+    ggml_backend_sycl_context * dst_ctx = (ggml_backend_sycl_context *) backend_dst->context;
+    if (dst->buffer->buft != ggml_backend_sycl_buffer_type(dst_ctx->device)) {
+        return false;
+    }
+    // the copy is a flat byte move, so only identically laid out tensors qualify
+    const size_t nbytes = ggml_nbytes(dst);
+    if (ggml_nbytes(src) != nbytes || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    if (!ggml_backend_buffer_is_sycl(src->buffer)) {
+        // host source, including the CPU splits an -ot override creates
+        if (!ggml_backend_buffer_is_host(src->buffer)) {
+            return false;
+        }
+        ggml_backend_sycl_buffer_set_tensor(dst->buffer, dst, src->data, 0, nbytes);
         return true;
     }
 
-    return false;
+    const ggml_backend_sycl_buffer_context * src_bctx =
+        (const ggml_backend_sycl_buffer_context *) src->buffer->context;
+    const queue_ptr & q_dst = dst_ctx->stream(dst_ctx->device, 0);
+    const queue_ptr & q_src = dst_ctx->stream(src_bctx->device, 0);
+
+    if (src_bctx->device != dst_ctx->device) {
+        if (!sycl_enable_peer_access_once(dst_ctx->device, src_bctx->device, *q_dst, *q_src)) {
+            return false;
+        }
+    }
+    if (!sycl_queue_wait_for_queue(q_dst, q_src)) {
+        return false;
+    }
+    SYCL_CHECK(CHECK_TRY_ERROR(q_dst->memcpy(dst->data, src->data, nbytes)));
+    return true;
+
+    GGML_UNUSED(backend_src);
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -7246,10 +7333,29 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     sycl::event* sycl_event = static_cast<sycl::event*>(event->context);
 
-    if (ggml_backend_is_sycl(backend)) {
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
-    } else
+    if (!ggml_backend_is_sycl(backend)) {
         GGML_ABORT("fatal error");
+    }
+
+    // Order the queues on the device rather than stalling the host, the SYCL equivalent of
+    // cudaStreamWaitEvent. event_record leaves a barrier on the producing queue, so a barrier
+    // that takes it as a wait list carries the same dependency without a round trip. The
+    // scheduler calls this to keep a split from overwriting an input the backend is still
+    // reading, and every such overwrite is enqueued on this same in-order queue, so the
+    // dependency holds. A wait list may only name events from the queue's own context, so a
+    // producer elsewhere still has to be waited out on the host.
+    if (g_ggml_sycl_device_event_wait) {
+        ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *) backend->context;
+        const queue_ptr &           stream   = sycl_ctx->stream(sycl_ctx->device, 0);
+        const ggml_backend_sycl_device_context * ev_dev =
+            (const ggml_backend_sycl_device_context *) event->device->context;
+        if (sycl_ctx->stream(ev_dev->device, 0)->get_context() == stream->get_context()) {
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->ext_oneapi_submit_barrier({ *sycl_event })));
+            return;
+        }
+    }
+
+    SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
 } catch (sycl::exception const& exc) {
     std::cerr << exc.what() << "Exception caught at file:" << __FILE__
               << ", line:" << __LINE__ << std::endl;
@@ -7292,7 +7398,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_tensor_async        = */ ggml_backend_sycl_get_tensor_async,
     /* .set_tensor_2d_async     = */ NULL,
     /* .get_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ NULL, // ggml_backend_sycl_cpy_tensor_async,
+    /* .cpy_tensor_async        = */ ggml_backend_sycl_cpy_tensor_async,
                                            // // TODO: update for the new
                                            // interface
     /* .synchronize             = */ ggml_backend_sycl_synchronize,
