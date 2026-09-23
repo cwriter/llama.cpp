@@ -295,6 +295,7 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 enum ggml_sycl_layout_kind : uint8_t {
     GGML_SYCL_LAYOUT_CANONICAL = 0,  // exactly as ggml packs the type
     GGML_SYCL_LAYOUT_SOA_SPAN  = 1,  // quants then scales, repeating every `span` elements
+    GGML_SYCL_LAYOUT_SOA_WHOLE = 2,  // quants then scales, once over the whole tensor
 };
 
 struct ggml_sycl_layout {
@@ -305,10 +306,23 @@ struct ggml_sycl_layout {
     bool is_canonical() const { return kind == GGML_SYCL_LAYOUT_CANONICAL; }
 };
 
+// What layout a tensor's bytes are actually in. The weight reorder and the SoA KV cache are the
+// same idea at different spans, so they share one descriptor rather than a bool beside it.
 struct optimize_feature {
-    bool reorder=false;
-    // richer description for layouts a bool cannot express; see kv-soa.hpp
     ggml_sycl_layout layout;
+
+    // the whole-tensor SoA that reorder_qw() produces
+    bool is_reordered() const { return layout.kind == GGML_SYCL_LAYOUT_SOA_WHOLE; }
+
+    void set_reordered(ggml_type t) {
+        layout.kind = GGML_SYCL_LAYOUT_SOA_WHOLE;
+        layout.type = t;
+    }
+};
+
+// Per-device policy, not a layout: whether this device should use reordered weights at all.
+struct device_opt_feature {
+    bool reorder = false;
 };
 
 struct sycl_device_info {
@@ -326,7 +340,7 @@ struct sycl_device_info {
     size_t  vmm_granularity;    // granularity of virtual memory
     size_t  total_vram;
     sycl_hw_info hw_info;
-    optimize_feature opt_feature;
+    device_opt_feature opt_feature;
     bool    usm_system_support; // support for USM system allocations
 #ifdef GGML_SYCL_GRAPH
     bool    graph_support;        // command graphs can be recorded and replayed
@@ -470,7 +484,7 @@ static_assert(std::is_trivial<ggml_sycl_graph::node_properties>::value, "node_pr
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
-    optimize_feature opt_feature;
+    device_opt_feature opt_feature;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 

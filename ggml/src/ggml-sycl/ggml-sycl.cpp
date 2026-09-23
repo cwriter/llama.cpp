@@ -718,7 +718,7 @@ struct ggml_backend_sycl_buffer_context {
     void * dev_ptr = nullptr;
     queue_ptr stream;
     std::string name;
-    optimize_feature opt_feature;
+    device_opt_feature opt_feature;
     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
     host_staging staging;
     bool is_usm_system;
@@ -3221,7 +3221,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
         // the reorder (SoA) offsets are relative to the start of the reordered region, so the
         // fused GEMM only runs on a reordered weight when it gets that base pointer
         const auto * src0_extra_fg  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-        const bool   src0_reordered = src0_extra_fg && src0_extra_fg->optimized_feature.reorder;
+        const bool   src0_reordered = src0_extra_fg && src0_extra_fg->optimized_feature.is_reordered();
         const bool   fused_gemm_ok  = !src0_reordered || src0_dd_i == (const char *) src0->data;
 
         // dequantize inside the GEMM instead of writing the f16 weights out and reading them back
@@ -5153,7 +5153,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     }
 
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-    if (!extra || extra->optimized_feature.reorder) {
+    if (!extra || extra->optimized_feature.is_reordered()) {
         return;  // Skip permutations and already reordered tensors
     }
 
@@ -5176,7 +5176,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     }
 
     if (reorder_qw(src0, ctx->stream())) {
-        extra->optimized_feature.reorder = true;  // Used to decode/dequan in next steps and avoid re-reordering
+        extra->optimized_feature.set_reordered(src0->type);  // and so it is not reordered twice
     }
 }
 
@@ -5198,11 +5198,11 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
         return;
     }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-    if (!extra || extra->optimized_feature.reorder) {
+    if (!extra || extra->optimized_feature.is_reordered()) {
         return;
     }
     if (reorder_qw(src0, ctx->stream())) {
-        extra->optimized_feature.reorder = true;
+        extra->optimized_feature.set_reordered(src0->type);
     }
 }
 
@@ -5318,7 +5318,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (use_mul_mat_vec_q) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
         ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-        if (extra && extra->optimized_feature.reorder) {
+        if (extra && extra->optimized_feature.is_reordered()) {
             ggml_sycl_op_mul_mat<quantize_and_reorder_q8_1_soa>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
         } else {
             ggml_sycl_op_mul_mat<quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_mul_mat_vec_q);
@@ -5362,7 +5362,7 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
 
     const auto * extra_u = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
     const auto * extra_g = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
-    if (!extra_u || !extra_g || !extra_u->optimized_feature.reorder || !extra_g->optimized_feature.reorder) {
+    if (!extra_u || !extra_g || !extra_u->optimized_feature.is_reordered() || !extra_g->optimized_feature.is_reordered()) {
         return false;
     }
 
@@ -5558,7 +5558,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     opt_for_reorder_id(&ctx, src0);
     const ggml_tensor_extra_gpu * src0_extra =
         static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-    const bool use_reorder = src0_extra && src0_extra->optimized_feature.reorder;
+    const bool use_reorder = src0_extra && src0_extra->optimized_feature.is_reordered();
 
     // building the route order costs a few dispatches, and the serial prefix sum over every
     // expert is the bulk of it, so only take the ordered path once enough routes share a bucket
@@ -5571,7 +5571,7 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
     }
     for (int k = 1; k < n_nodes; ++k) {
         const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(nodes[k]->src[0]->extra);
-        if (extra && extra->optimized_feature.reorder) {
+        if (extra && extra->optimized_feature.is_reordered()) {
             return false;  // one block layout serves the whole group
         }
     }
@@ -5817,7 +5817,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         // one launch for all experts instead of one GEMM per expert
         // every expert slice is reordered on its own, so one flag decides the whole launch
         const auto * src0_extra_gg     = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-        const bool   src0_reordered_gg = src0_extra_gg && src0_extra_gg->optimized_feature.reorder;
+        const bool   src0_reordered_gg = src0_extra_gg && src0_extra_gg->optimized_feature.is_reordered();
 
         bool grouped = false;
         if (g_ggml_sycl_grouped_gemm && ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
@@ -6847,7 +6847,7 @@ static int ggml_sycl_mul_mat_multi_mmvq_fused(ggml_backend_sycl_context & ctx, g
     for (int k = 0; k < count; ++k) {
         opt_for_reorder(&ctx, group[k]->src[0], act, group[k], mul_mat_algo::MMVQ);
         const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(group[k]->src[0]->extra);
-        if (!extra || !extra->optimized_feature.reorder) {
+        if (!extra || !extra->optimized_feature.is_reordered()) {
             return 0;
         }
     }
@@ -6941,7 +6941,7 @@ static bool ggml_sycl_mul_mat_id_glu_mmvq_fused(ggml_backend_sycl_context & ctx,
     opt_for_reorder_id(&ctx, wu);
     const auto * eg = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
     const auto * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
-    if (!eg || !eg->optimized_feature.reorder || !eu || !eu->optimized_feature.reorder) {
+    if (!eg || !eg->optimized_feature.is_reordered() || !eu || !eu->optimized_feature.is_reordered()) {
         return ggml_sycl_glu_id_why("not reordered");
     }
 
@@ -7241,7 +7241,7 @@ static bool graph_needs_reorder(ggml_backend_sycl_context * ctx, const ggml_cgra
         const ggml_tensor_extra_gpu * extra = src0 != nullptr
             ? static_cast<const ggml_tensor_extra_gpu *>(src0->extra)
             : nullptr;
-        if (extra != nullptr && !extra->optimized_feature.reorder) {
+        if (extra != nullptr && !extra->optimized_feature.is_reordered()) {
             GGML_LOG_DEBUG("%s: disabling SYCL graphs due to needing reorder\n", __func__);
             return true;
         }
