@@ -79,3 +79,47 @@ void ggml_sycl_kv_soa_to_fp16(const void * vx, sycl::half * y, int64_t ne0, int6
         kv_soa_dequant_f16((const char *) vx, y, nblk_row, ne1, total, nb1, nb2, ne0, item);
     });
 }
+
+// ---- host-side layout conversion -------------------------------------------------------------
+// A span is the same number of bytes in both layouts, so these only reshuffle its interior. Both
+// go through a span-sized temporary, which keeps them correct when dst aliases src - the in-place
+// case get_tensor uses, where writing block i would otherwise clobber the quants of block i+1.
+
+using kv_soa_acc = ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>;
+static_assert(kv_soa_acc::span_size == kv_soa_acc::nblk * sizeof(block_q8_0),
+              "a SoA span must occupy exactly as many bytes as the canonical blocks it replaces");
+
+bool ggml_sycl_kv_soa_range_ok(size_t offset, size_t nbytes) {
+    return offset % kv_soa_acc::span_size == 0 && nbytes % kv_soa_acc::span_size == 0;
+}
+
+void ggml_sycl_kv_soa_span_to_canonical(void * vdst, const void * vsrc, size_t nbytes) {
+    GGML_ASSERT(ggml_sycl_kv_soa_range_ok(0, nbytes));
+    char *       dst = (char *) vdst;
+    const char * src = (const char *) vsrc;
+    for (size_t off = 0; off < nbytes; off += kv_soa_acc::span_size, dst += kv_soa_acc::span_size,
+                src += kv_soa_acc::span_size) {
+        block_q8_0 tmp[kv_soa_acc::nblk];
+        for (int i = 0; i < kv_soa_acc::nblk; ++i) {
+            memcpy(&tmp[i].d, src + GGML_SYCL_KV_SOA_SPAN + i * sizeof(sycl::half), sizeof(sycl::half));
+            memcpy(tmp[i].qs, src + i * QK8_0, QK8_0);
+        }
+        memcpy(dst, tmp, sizeof(tmp));
+    }
+}
+
+void ggml_sycl_kv_soa_canonical_to_span(void * vdst, const void * vsrc, size_t nbytes) {
+    GGML_ASSERT(ggml_sycl_kv_soa_range_ok(0, nbytes));
+    char *       dst = (char *) vdst;
+    const char * src = (const char *) vsrc;
+    for (size_t off = 0; off < nbytes; off += kv_soa_acc::span_size, dst += kv_soa_acc::span_size,
+                src += kv_soa_acc::span_size) {
+        char tmp[kv_soa_acc::span_size];
+        for (int i = 0; i < kv_soa_acc::nblk; ++i) {
+            const block_q8_0 * b = (const block_q8_0 *) src + i;
+            memcpy(tmp + i * QK8_0, b->qs, QK8_0);
+            memcpy(tmp + GGML_SYCL_KV_SOA_SPAN + i * sizeof(sycl::half), &b->d, sizeof(sycl::half));
+        }
+        memcpy(dst, tmp, sizeof(tmp));
+    }
+}
