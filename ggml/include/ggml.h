@@ -2484,12 +2484,6 @@ extern "C" {
     //   n_head % ne32      == 0
     //   ne3    % ne33      == 0
     //
-    // A flash-attention mask may be supplied as one bit per KV cell instead of one f16 value:
-    //   type I32, ne[0] == (n_kv + 31)/32, bit (c & 31) of word (c >> 5) set means "attend to c".
-    // It carries no magnitude, so it requires max_bias == 0. Backends that do not implement it
-    // must not be handed one; ggml_flash_attn_ext() is the only op that accepts it.
-    GGML_API bool ggml_mask_is_bitset(const struct ggml_tensor * mask);
-
     GGML_API struct ggml_tensor * ggml_flash_attn_ext(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
