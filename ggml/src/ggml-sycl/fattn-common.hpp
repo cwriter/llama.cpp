@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kv-soa.hpp"
 #include <sycl/sycl.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
@@ -948,7 +949,14 @@ void launch_fattn(
 
         sycl::half * K_f16_ptr = extra.K_buffer_ptr ? (sycl::half *) extra.K_buffer_ptr
                                                     : K_f16.alloc(ggml_nelements(K));
-        if (ggml_is_contiguously_allocated(K)) {
+        if (ggml_sycl_kv_is_soa(K)) {
+            // permuted bytes: only the SoA dequantizer may read them
+            ggml_sycl_kv_soa_to_fp16(K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2],
+                                     K->nb[1], K->nb[2], main_stream);
+            nb11 = K->ne[0] * sizeof(sycl::half);
+            nb12 = K->ne[1] * nb11;
+            nb13 = K->ne[2] * nb12;
+        } else if (ggml_is_contiguously_allocated(K)) {
             to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
             to_fp16(K_data, K_f16_ptr, ggml_nelements(K), main_stream);
 
@@ -982,7 +990,14 @@ void launch_fattn(
 
             sycl::half * V_f16_ptr = extra.V_buffer_ptr ? (sycl::half *) extra.V_buffer_ptr
                                                         : V_f16.alloc(ggml_nelements(V));
-            if (ggml_is_contiguously_allocated(V)) {
+            if (ggml_sycl_kv_is_soa(V)) {
+                ggml_sycl_kv_soa_to_fp16(V_data, V_f16_ptr, V->ne[0], V->ne[1], V->ne[2],
+                                         V->nb[1], V->nb[2], main_stream);
+                V_data = (char *) V_f16_ptr;
+                nb21 = V->ne[0] * sizeof(sycl::half);
+                nb22 = V->ne[1] * nb21;
+                nb23 = V->ne[2] * nb22;
+            } else if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(V->type, dst);
                 to_fp16(V_data, V_f16_ptr, ggml_nelements(V), main_stream);
                 V_data = (char *) V_f16_ptr;

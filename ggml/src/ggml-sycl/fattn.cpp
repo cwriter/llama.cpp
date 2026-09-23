@@ -21,6 +21,8 @@
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
 
+extern int g_ggml_sycl_fattn_prefer_vec;
+
 #define FATTN_VEC_CASE(D, type_K, type_V)                                                                        \
     {                                                                                                            \
         const bool type_K_okay = K->type == (type_K) || (K->type == GGML_TYPE_F32 && (type_K) == GGML_TYPE_F16); \
@@ -305,7 +307,8 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
             if (Q->ne[1] <= 2) {
                 // TILE is faster for quantized KV decode on Xe2 (BMG); keep VEC on untested archs
                 const gpu_arch arch = ggml_sycl_info().devices[device].hw_info.arch;
-                if (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31) {
+                if (!g_ggml_sycl_fattn_prefer_vec &&
+                    (arch == gpu_arch::intel_gpu_bmg_g21 || arch == gpu_arch::intel_gpu_bmg_g31)) {
                     return BEST_FATTN_KERNEL_TILE;
                 }
                 return BEST_FATTN_KERNEL_VEC;

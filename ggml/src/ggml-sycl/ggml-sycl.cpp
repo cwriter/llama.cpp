@@ -84,6 +84,7 @@
 #include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "kv-soa.hpp"
 #include "moe-reduce.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/fill.hpp"
@@ -143,11 +144,14 @@ int g_ggml_sycl_device_event_wait = 1;
 int g_ggml_sycl_async_copy = 1;
 int g_ggml_sycl_fuse_types = GGML_SYCL_FUSE_DEFAULT;
 int g_ggml_sycl_float_commutative = 1;
+int g_ggml_sycl_kv_soa = 0;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
 int g_ggml_sycl_get_mem_api = MEMORY_API_TYPE_LEVEL_ZERO;
 int g_ggml_sycl_enable_sparse_fa = 1;
+int g_ggml_sycl_fattn_tile_q8_0 = 0;
+int g_ggml_sycl_fattn_prefer_vec = 0;
 int g_ggml_sycl_debug_sparse_fa = 0;
 int g_ggml_sycl_sparse_fa_margin = 256;
 
@@ -437,6 +441,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_async_copy = ggml_sycl_get_env("GGML_SYCL_ASYNC_COPY", 1);
         g_ggml_sycl_fuse_types = ggml_sycl_get_env("GGML_SYCL_FUSE_TYPES", GGML_SYCL_FUSE_DEFAULT);
         g_ggml_sycl_float_commutative = ggml_sycl_get_env("GGML_SYCL_FLOAT_COMMUTATIVE", 1);
+        g_ggml_sycl_kv_soa = ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
@@ -457,6 +462,8 @@ static void ggml_check_sycl() try {
             ggml_sycl_get_env("GGML_SYCL_HOST_PINNED_MEM_2G", 0) & g_ggml_sycl_enable_host_pinned_mem;
 
         g_ggml_sycl_enable_sparse_fa  = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA", 1);
+        g_ggml_sycl_fattn_tile_q8_0   = ggml_sycl_get_env("GGML_SYCL_FATTN_TILE_Q8_0", 0);
+        g_ggml_sycl_fattn_prefer_vec  = ggml_sycl_get_env("GGML_SYCL_FATTN_PREFER_VEC", 0);
         g_ggml_sycl_debug_sparse_fa   = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_DEBUG", 0);
         g_ggml_sycl_sparse_fa_margin  = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_MARGIN", 256);
 
@@ -513,6 +520,7 @@ static void ggml_check_sycl() try {
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_REDUCE)  != 0,
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_GLU_ID)  != 0);
         GGML_LOG_INFO("  GGML_SYCL_FLOAT_COMMUTATIVE: %d\n", g_ggml_sycl_float_commutative);
+        GGML_LOG_INFO("  GGML_SYCL_KV_SOA: %d\n", g_ggml_sycl_kv_soa);
         GGML_LOG_INFO("  GGML_SYCL_GET_MEM_API: %d (%s)\n", g_ggml_sycl_get_mem_api, mem_api_int2str(g_ggml_sycl_get_mem_api));
 #else
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s), enable to SYCL API since missing GGML_SYCL_SUPPORT_LEVEL_ZERO_API\n",
@@ -600,6 +608,8 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_HOST_PINNED_MEM_2G: %d\n", g_ggml_sycl_host_pinned_mem_2g);
 
         GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA: %d\n", g_ggml_sycl_enable_sparse_fa);
+        GGML_LOG_INFO("  GGML_SYCL_FATTN_TILE_Q8_0: %d\n", g_ggml_sycl_fattn_tile_q8_0);
+        GGML_LOG_INFO("  GGML_SYCL_FATTN_PREFER_VEC: %d\n", g_ggml_sycl_fattn_prefer_vec);
         GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA_DEBUG: %d\n", g_ggml_sycl_debug_sparse_fa);
         GGML_LOG_INFO("  GGML_SYCL_SPARSE_FA_MARGIN: %d\n", g_ggml_sycl_sparse_fa_margin);
 
@@ -809,6 +819,12 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
                 tensor->extra                 = extra;
                 ctx->tensor_extras.push_back(extra);
+                // llama.cpp names the KV cache tensors cache_k_l* / cache_v_l*; nothing else in
+                // a non-weight buffer carries that prefix
+                if (strncmp(tensor->name, "cache_", 6) == 0 &&
+                    ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    ggml_sycl_kv_soa_mark(tensor);
+                }
                 break;
             }
             default:
@@ -842,6 +858,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+    // a session file must hold canonical bytes; de/re-permuting here is the fix, asserting is the
+    // interim so a save cannot silently write a layout no other build understands
+    GGML_ASSERT(!ggml_sycl_kv_is_soa(tensor) &&
+                "raw access to a SoA KV tensor; see kv-soa.hpp");
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
     queue_ptr stream = ctx->stream;
@@ -896,6 +916,10 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+    // a session file must hold canonical bytes; de/re-permuting here is the fix, asserting is the
+    // interim so a save cannot silently write a layout no other build understands
+    GGML_ASSERT(!ggml_sycl_kv_is_soa(tensor) &&
+                "raw access to a SoA KV tensor; see kv-soa.hpp");
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
 
     ggml_sycl_set_device(ctx->device);

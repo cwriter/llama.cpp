@@ -1,4 +1,5 @@
 #include "set_rows.hpp"
+#include "kv-soa.hpp"
 #include "cpy.hpp"
 
 #include "ggml-quants.h"
@@ -109,6 +110,73 @@ template<typename blockType>
 using quantize_row_qk_t = void (*)(const float *, blockType *, int64_t);
 
 using quantize_rows_f_t = size_t (*)(const float *, void *, int64_t, int64_t, const float *);
+
+// Per-row SoA q8_0 write, the layout kv-soa.hpp documents. Same block-per-work-item mapping as
+// set_rows_sycl_q(); only the destination offsets differ: quants pack from the row base, scales
+// follow them in the row's tail.
+template <typename TIn, typename TIdx>
+static void set_rows_sycl_q8_0_soa(const char * __restrict__ src0_d, const TIdx * __restrict__ src1_d,
+                                   char * __restrict__ dst_d,
+                                   const int64_t ne00, const int64_t ne01, const int64_t ne02,
+                                   const int64_t ne03, const int64_t ne11, const int64_t ne12,
+                                   const size_t nb01, const size_t nb02, const size_t nb03,
+                                   const size_t nb10, const size_t nb11, const size_t nb12,
+                                   const size_t nb1, const size_t nb2, const size_t nb3,
+                                   queue_ptr stream) {
+    const int64_t total_blocks = (ne00 / QK8_0) * ne01 * ne02 * ne03;
+    constexpr int block_size   = 256;
+    const int64_t grid_size    = ceil_div(total_blocks, block_size);
+
+    stream->parallel_for(sycl::nd_range<1>(grid_size * block_size, block_size), [=](sycl::nd_item<1> item) {
+        const int64_t i = item.get_global_linear_id();
+        if (i >= total_blocks) {
+            return;
+        }
+        const int64_t i_base = i * QK8_0;
+        const int64_t i03    = i_base / (ne00 * ne01 * ne02);
+        const int64_t rem1   = i_base - i03 * (ne00 * ne01 * ne02);
+        const int64_t i02    = rem1 / (ne00 * ne01);
+        const int64_t rem2   = rem1 - i02 * ne00 * ne01;
+        const int64_t i01    = rem2 / ne00;
+        const int64_t i00    = rem2 - i01 * ne00;
+        const int64_t i12    = i03 % ne12;
+        const int64_t i11    = i02 % ne11;
+        const int64_t i10    = i01;
+
+        const char *  src_block   = src0_d + calculate_offset<3>({ nb01, nb02, nb03 }, { i01, i02, i03 })
+                                           + i00 * sizeof(TIn);
+        const size_t  src1_offset = calculate_offset<3>({ nb10, nb11, nb12 }, { i10, i11, i12 });
+        const int64_t dst_row     = src1_d[src1_offset / sizeof(TIdx)];
+
+        char *        row_base = dst_d + calculate_offset<3>({ nb1, nb2, nb3 }, { dst_row, i02, i03 });
+        const int64_t iblk     = i00 / QK8_0;
+
+        float src_f32[QK8_0];
+        if constexpr (std::is_same_v<TIn, float>) {
+            for (int j = 0; j < QK8_0; ++j) { src_f32[j] = ((const float *) src_block)[j]; }
+        } else {
+            for (int j = 0; j < QK8_0; ++j) { src_f32[j] = (float) ((const TIn *) src_block)[j]; }
+        }
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; ++j) {
+            amax = sycl::fmax(amax, sycl::fabs(src_f32[j]));
+        }
+        const float d  = amax / ((1 << 7) - 1);
+        const float id = d ? 1.0f / d : 0.0f;
+
+        size_t span_off;
+        int    iblk_in_span;
+        ggml_sycl_q8_0_locate<GGML_SYCL_LAYOUT_SOA_SPAN>(i00, span_off, iblk_in_span);
+        char * span_base = row_base + span_off;
+
+        int8_t * qs = (int8_t *) span_base + iblk_in_span * QK8_0;
+        for (int j = 0; j < QK8_0; ++j) {
+            qs[j] = (int8_t) sycl::round(src_f32[j] * id);
+        }
+        ((sycl::half *) (span_base + GGML_SYCL_KV_SOA_SPAN))[iblk_in_span] = (sycl::half) d;
+    });
+}
 
 template <typename TIn, typename TIdx, typename blockType, int qk, quantize_row_qk_t<blockType> quantize_row>
 static void set_rows_sycl_qk_host(
@@ -356,10 +424,16 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
             break;
 #endif
         case GGML_TYPE_Q8_0:
-            set_rows_sycl_q<TIn, TIdx, block_q8_0, QK8_0, cpy_blck_f32_q8_0>(
-                src0_d, src1_d, (block_q8_0 *) dst->data, ne00, ne01, ne02, ne03,
-                ne10, ne11, ne12, ne13, nb00, nb01,
-                nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            if (ggml_sycl_kv_is_soa(dst)) {
+                set_rows_sycl_q8_0_soa<TIn, TIdx>(
+                    src0_d, src1_d, (char *) dst->data, ne00, ne01, ne02, ne03,
+                    ne11, ne12, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+            } else {
+                set_rows_sycl_q<TIn, TIdx, block_q8_0, QK8_0, cpy_blck_f32_q8_0>(
+                    src0_d, src1_d, (block_q8_0 *) dst->data, ne00, ne01, ne02, ne03,
+                    ne10, ne11, ne12, ne13, nb00, nb01,
+                    nb02, nb03, nb10, nb11, nb12, nb13, nb1, nb2, nb3, stream);
+            }
             break;
         case GGML_TYPE_Q1_0:
             set_rows_sycl_q<TIn, TIdx, block_q1_0, QK1_0, cpy_blck_f32_q1_0>(
