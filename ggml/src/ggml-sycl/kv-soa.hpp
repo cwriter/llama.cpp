@@ -62,6 +62,16 @@ static __dpct_inline__ void ggml_sycl_q8_0_locate(int64_t i0, size_t & span_off,
     iblk                = (int) ((i0 - ispan * A::span) / QK8_0);
 }
 
+// Writable counterparts of the accessors above, for the paths that produce a span rather than
+// consume one. The layout is stated once here so a writer and a reader cannot drift apart.
+static __dpct_inline__ int8_t * ggml_sycl_q8_0_soa_qs_mut(char * span, int iblk) {
+    return (int8_t *) span + iblk * QK8_0;
+}
+
+static __dpct_inline__ void ggml_sycl_q8_0_soa_set_d(char * span, int iblk, float d) {
+    ((sycl::half *) (span + GGML_SYCL_KV_SOA_SPAN))[iblk] = (sycl::half) d;
+}
+
 // True only when the bytes this tensor refers to are permuted. Keyed on the tensor that OWNS
 // the bytes, never on a view's shape: a false answer means "these bytes are canonical", so
 // deciding it from a view is how the first attempt produced garbage.
