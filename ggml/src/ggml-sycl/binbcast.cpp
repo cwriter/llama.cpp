@@ -845,6 +845,7 @@ static void launch_bin_bcast3(ggml_backend_sycl_context & ctx, const ggml_tensor
 }
 
 void ggml_sycl_op_add_add_fused(ggml_backend_sycl_context & ctx, ggml_tensor * add0, ggml_tensor * add1) {
+    scope_op_debug_print scope_dbg_print(__func__, add1, /*num_src=*/0);
     const ggml_tensor * src0 = add0->src[0];
     const ggml_tensor * src1 = add0->src[1];
     const ggml_tensor * src2 = add1->src[1];
@@ -1108,6 +1109,7 @@ static void launch_add_n_f32_contiguous(ggml_backend_sycl_context & ctx,
 
 void ggml_sycl_op_add_n_fused(ggml_backend_sycl_context & ctx, ggml_tensor * const * nodes, int n_nodes,
                               ggml_tensor * scale_node) {
+    scope_op_debug_print scope_dbg_print(__func__, scale_node ? scale_node : nodes[n_nodes - 1], /*num_src=*/0);
     GGML_ASSERT(n_nodes >= 1 && n_nodes <= 8);
     std::array<const ggml_tensor *, 9> tensors = {};
     tensors[0] = nodes[0]->src[0];
