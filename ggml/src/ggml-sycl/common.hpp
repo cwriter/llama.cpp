@@ -106,6 +106,12 @@ extern int g_ggml_sycl_async_copy;
 // The elementwise fusions that cut dispatch count on the hyper-connection path:
 // scale+sigmoid+scale into dsv4_hc_post, scale+unary, and cont+cpy.
 extern int g_ggml_sycl_fuse_elementwise;
+// Allow a fusion to rely on a+b == b+a, which is exact in IEEE754. Not associativity.
+extern int g_ggml_sycl_float_commutative;
+// Collapse the MoE weighted sum (mul + per-expert views + add chain) into one kernel.
+extern int g_ggml_sycl_fuse_moe_reduce;
+// ggml_can_fuse_subgraph() takes at most 31 nodes, and the span is 2*n_expert_used.
+static constexpr int GGML_SYCL_MOE_REDUCE_MAX_EXPERTS = 15;
 extern int g_ggml_sycl_fa_onednn;
 extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;

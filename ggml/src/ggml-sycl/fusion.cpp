@@ -247,15 +247,58 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         const ggml_tensor * add0 = cgraph->nodes[node_idx];
         const ggml_tensor * add1 = cgraph->nodes[node_idx + 1];
         // ggml_can_fuse already guarantees add1 consumes add0 and that add0 has a single use.
-        // Keep the CUDA association: the running sum is src0 of the next ADD so the fused
-        // float fold matches two sequential add() launches.
-        if (add1->src[0] != add0) {
+        // The running sum is normally src0 of the next ADD, which keeps the fused float fold
+        // matching two sequential add() launches. With add0 as src1 the unfused result is
+        // src2 + (src0 + src1) and the fused one is (src0 + src1) + src2: the inner sum is
+        // identical and a single IEEE754 addition commutes exactly, so the two agree bit for
+        // bit. Associativity is what would not hold, and neither form re-associates.
+        // GGML_SYCL_FLOAT_COMMUTATIVE=0 restores the stricter src0-only rule.
+        if (add1->src[0] != add0 && !(g_ggml_sycl_float_commutative && add1->src[1] == add0)) {
             return false;
         }
 
         const ggml_tensor * c = add1->src[1];
         if (!ggml_sycl_add_kernel_supports(add0->src[0]->type, add0->src[1]->type, add0->type) ||
             !ggml_sycl_add_kernel_supports(add0->type, c->type, add1->type)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // MUL feeding an ADD: the multiply-accumulate that survives every other fusion.
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_MUL && ops.begin()[1] == GGML_OP_ADD) {
+        if (!g_ggml_sycl_fuse_elementwise) {
+            return false;
+        }
+        if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+            return false;
+        }
+
+        const ggml_tensor * mul = cgraph->nodes[node_idx];
+        const ggml_tensor * add = cgraph->nodes[node_idx + 1];
+
+        // ggml_can_fuse() accepts the link through either source, and the fused kernel folds
+        // (a*b) then + c, so the multiply has to be the operand being added, not the addend.
+        const ggml_tensor * other = (add->src[0] == mul) ? add->src[1] : add->src[0];
+        if (other == mul) {
+            return false;
+        }
+        // adding a value to itself would read mul twice; the fold only produces it once
+        if (add->src[0] != mul && add->src[1] != mul) {
+            return false;
+        }
+
+        // the fused kernel is instantiated for f32 only, which is every pair this model emits
+        if (mul->src[0]->type != GGML_TYPE_F32 || mul->src[1]->type != GGML_TYPE_F32 ||
+            other->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || add->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // the broadcast indexing folds src1 and src2 against dst, so dst must be the wide shape
+        if (!ggml_are_same_shape(mul, add)) {
+            return false;
+        }
+        if (!ggml_sycl_add_kernel_supports(mul->type, other->type, add->type)) {
             return false;
         }
 

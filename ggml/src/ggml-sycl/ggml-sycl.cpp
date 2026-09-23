@@ -84,6 +84,7 @@
 #include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "moe-reduce.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
 #include "ggml-sycl/fill.hpp"
 #include "ggml-sycl/cumsum.hpp"
@@ -141,6 +142,8 @@ int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
 int g_ggml_sycl_device_event_wait = 1;
 int g_ggml_sycl_async_copy = 1;
 int g_ggml_sycl_fuse_elementwise = 1;
+int g_ggml_sycl_float_commutative = 1;
+int g_ggml_sycl_fuse_moe_reduce = 1;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
@@ -434,6 +437,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_device_event_wait = ggml_sycl_get_env("GGML_SYCL_DEVICE_EVENT_WAIT", 1);
         g_ggml_sycl_async_copy = ggml_sycl_get_env("GGML_SYCL_ASYNC_COPY", 1);
         g_ggml_sycl_fuse_elementwise = ggml_sycl_get_env("GGML_SYCL_FUSE_ELEMENTWISE", 1);
+        g_ggml_sycl_float_commutative = ggml_sycl_get_env("GGML_SYCL_FLOAT_COMMUTATIVE", 1);
+        g_ggml_sycl_fuse_moe_reduce = ggml_sycl_get_env("GGML_SYCL_FUSE_MOE_REDUCE", 1);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
@@ -504,6 +509,8 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DEVICE_EVENT_WAIT: %d\n", g_ggml_sycl_device_event_wait);
         GGML_LOG_INFO("  GGML_SYCL_ASYNC_COPY: %d\n", g_ggml_sycl_async_copy);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_ELEMENTWISE: %d\n", g_ggml_sycl_fuse_elementwise);
+        GGML_LOG_INFO("  GGML_SYCL_FLOAT_COMMUTATIVE: %d\n", g_ggml_sycl_float_commutative);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_MOE_REDUCE: %d\n", g_ggml_sycl_fuse_moe_reduce);
         GGML_LOG_INFO("  GGML_SYCL_GET_MEM_API: %d (%s)\n", g_ggml_sycl_get_mem_api, mem_api_int2str(g_ggml_sycl_get_mem_api));
 #else
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s), enable to SYCL API since missing GGML_SYCL_SUPPORT_LEVEL_ZERO_API\n",
@@ -6930,6 +6937,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             i++;
             continue;
         }
+        if (node->op == GGML_OP_MUL) {
+            ggml_sycl_moe_reduce_match moe_match;
+            if (ggml_sycl_match_moe_weighted_reduction(cgraph, i, moe_match)) {
+                ggml_sycl_op_moe_weighted_reduction(*sycl_ctx, moe_match);
+                i += moe_match.node_count - 1;
+                continue;
+            }
+        }
+
+        if (node->op == GGML_OP_MUL &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_MUL, GGML_OP_ADD }, {})) {
+            ggml_sycl_op_mul_add_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            i++;
+            continue;
+        }
+
         if (node->op == GGML_OP_ADD) {
             const int add_n_skip = ggml_sycl_try_add_n_fusion(*sycl_ctx, cgraph, i);
             if (add_n_skip > 0) {
@@ -7424,6 +7447,26 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
     return 0;
 }
 
+// The MoE reduction reads the mul's operands at the node where the add chain ends, so those
+// tensors have to outlive their last use as the graph sees it. Without this ggml-alloc is free
+// to hand their memory to something in between and the fusion would read its own output.
+static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
+                                             ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(backend);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op != GGML_OP_MUL) {
+            continue;
+        }
+        ggml_sycl_moe_reduce_match match;
+        if (!ggml_sycl_match_moe_weighted_reduction(cgraph, i, match)) {
+            continue;
+        }
+        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
+        params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
+        i += match.node_count - 1;
+    }
+}
+
 static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_name                = */ ggml_backend_sycl_get_name,
     /* .free                    = */ ggml_backend_sycl_free,
@@ -7442,7 +7485,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .graph_compute           = */ ggml_backend_sycl_graph_compute,
     /* .event_record            = */ ggml_backend_sycl_event_record,
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
-    /* .graph_optimize          = */ NULL,
+    /* .graph_optimize          = */ ggml_backend_sycl_graph_optimize,
     /* .fusion_absorbs          = */ ggml_backend_sycl_fusion_absorbs,
 };
 
