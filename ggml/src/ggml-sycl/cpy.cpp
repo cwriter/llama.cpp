@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "dequantize.hpp"
+#include "kv-soa.hpp"
 #include "ggml-sycl/common.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml.h"
@@ -1255,6 +1256,13 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     scope_op_debug_print scope_dbg_print(__func__, src1, /*num_src=*/0, debug_get_tensor_str("\tsrc0", src0));
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
+
+    // A permuted cache must be read and written through the layout accessors. ggml_cpy is the
+    // path llama-kv-cache uses for the RoPE shift (cast -> rope -> cpy); it packs canonical
+    // blocks, so let it abort rather than silently interleave scales into a SoA span.
+    GGML_ASSERT(!ggml_sycl_kv_is_soa(src0) && !ggml_sycl_kv_is_soa(src1) &&
+                "SoA KV cache reached ggml_sycl_cpy; teach this path the layout or disable "
+                "GGML_SYCL_KV_SOA (see kv-soa.hpp)");
 
     GGML_TENSOR_BINARY_OP_LOCALS01;
 

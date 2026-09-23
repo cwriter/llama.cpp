@@ -118,6 +118,8 @@ static constexpr int GGML_SYCL_FUSE_DEFAULT = ~0;
 extern int g_ggml_sycl_fuse_types;
 // Allow a fusion to rely on a+b == b+a, which is exact in IEEE754. Not associativity.
 extern int g_ggml_sycl_float_commutative;
+// Store the q8_0 KV cache per-row SoA so its quants load 16-byte aligned. See kv-soa.hpp.
+extern int g_ggml_sycl_kv_soa;
 // ggml_can_fuse_subgraph() takes at most 31 nodes, and the span is 2*n_expert_used.
 static constexpr int GGML_SYCL_MOE_REDUCE_MAX_EXPERTS = 15;
 extern int g_ggml_sycl_fa_onednn;
@@ -266,8 +268,31 @@ inline dpct::err0 ggml_sycl_set_device(const int device) try {
 }
 
 //////////////////////
+// How a tensor's bytes are actually packed, when that differs from the canonical ggml packing
+// for its ggml_type. This is backend-local on purpose: a new ggml_type would be a global enum
+// entry that every backend must implement or reject, would need a CPU reference for
+// test-backend-ops, and would leak into GGUF and session files. A descriptor on the tensor costs
+// nothing outside this backend, and the CPU never sees these buffers.
+//
+// `reorder` below is the older, narrower expression of the same idea (whole-tensor SoA for
+// weights) and is kept as-is because ~50 call sites read it.
+enum ggml_sycl_layout_kind : uint8_t {
+    GGML_SYCL_LAYOUT_CANONICAL = 0,  // exactly as ggml packs the type
+    GGML_SYCL_LAYOUT_SOA_SPAN  = 1,  // quants then scales, repeating every `span` elements
+};
+
+struct ggml_sycl_layout {
+    ggml_sycl_layout_kind kind = GGML_SYCL_LAYOUT_CANONICAL;
+    ggml_type             type = GGML_TYPE_COUNT;  // the block type the permutation applies to
+    int32_t               span = 0;                // elements per self-contained unit
+
+    bool is_canonical() const { return kind == GGML_SYCL_LAYOUT_CANONICAL; }
+};
+
 struct optimize_feature {
     bool reorder=false;
+    // richer description for layouts a bool cannot express; see kv-soa.hpp
+    ggml_sycl_layout layout;
 };
 
 struct sycl_device_info {
