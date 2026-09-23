@@ -90,10 +90,81 @@ static void concat_T_dim2(const T *x, const T *y, T *dst,
   }
 }
 
+// One work-item per destination element, over a flat range.
+//
+// The three kernels above give each row of the destination its own work-group of
+// SYCL_CONCAT_BLOCK_SIZE items and let everything past ne0 return immediately. That is fine when
+// ne0 is wide, and pathological when it is not: the qwen4exp conv-state rollover concatenates a
+// 3-column history with a 1-column token, so ne0 is 4 while ne1*ne2 is 10240 - 10240 work-groups
+// of 256 items to move 4 floats each, about 1.6% of the items doing anything. Indexing the whole
+// destination flat keeps every item busy whatever the shape.
+template <typename T, int DIM>
+static void concat_T_flat(const T * x, const T * y, T * dst, const int ne0, const int ne1,
+                          const int ne00, const int ne01, const int ne02, const int total,
+                          const sycl::uint3 ne0_fd, const sycl::uint3 ne1_fd,
+                          const sycl::nd_item<1> & item_ct1) {
+    const int i = (int) item_ct1.get_global_linear_id();
+    if (i >= total) {
+        return;
+    }
+    const sycl::uint2 dm0 = fast_div_modulo((uint32_t) i, ne0_fd);
+    const int         i0  = (int) dm0.y();
+    const sycl::uint2 dm1 = fast_div_modulo(dm0.x(), ne1_fd);
+    const int         i1  = (int) dm1.y();
+    const int         i2  = (int) dm1.x();
+
+    // same index arithmetic as the per-row kernels, so the two agree element for element
+    if constexpr (DIM == 0) {
+        if (i0 < ne00) {
+            dst[i] = x[i0 + i1 * ne00 + i2 * ne00 * ne1];
+        } else {
+            const int w = ne0 - ne00;
+            dst[i] = y[(i0 - ne00) + i1 * w + i2 * w * ne1];
+        }
+    } else if constexpr (DIM == 1) {
+        if (i1 < ne01) {
+            dst[i] = x[i0 + i1 * ne0 + i2 * ne0 * ne01];
+        } else {
+            dst[i] = y[i0 + (i1 - ne01) * ne0 + i2 * ne0 * (ne1 - ne01)];
+        }
+    } else {
+        if (i2 < ne02) {
+            dst[i] = x[i];
+        } else {
+            dst[i] = y[i0 + i1 * ne0 + (i2 - ne02) * ne0 * ne1];
+        }
+    }
+}
+
 template <typename T>
 static void concat_T_sycl(const T *x, const T *y, T *dst,
                             int ne00, int ne01, int ne02, int ne0, int ne1,
                             int ne2, int dim, queue_ptr stream) {
+  // 32-bit fastdiv is exact below 2^31; past that fall back to the per-row kernels
+  const int64_t total64 = (int64_t) ne0 * ne1 * ne2;
+  if (total64 < ((int64_t) 1 << 31)) {
+      const int          total  = (int) total64;
+      const size_t       blocks = (total + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
+      const sycl::nd_range<1> r(blocks * sycl::range<1>(SYCL_CONCAT_BLOCK_SIZE),
+                                sycl::range<1>(SYCL_CONCAT_BLOCK_SIZE));
+      const sycl::uint3 ne0_fd = init_fastdiv_values((uint32_t) ne0);
+      const sycl::uint3 ne1_fd = init_fastdiv_values((uint32_t) ne1);
+      switch (dim) {
+          case 0:
+              stream->parallel_for(r, [=](sycl::nd_item<1> it) {
+                  concat_T_flat<T, 0>(x, y, dst, ne0, ne1, ne00, ne01, ne02, total, ne0_fd, ne1_fd, it); });
+              return;
+          case 1:
+              stream->parallel_for(r, [=](sycl::nd_item<1> it) {
+                  concat_T_flat<T, 1>(x, y, dst, ne0, ne1, ne00, ne01, ne02, total, ne0_fd, ne1_fd, it); });
+              return;
+          default:
+              stream->parallel_for(r, [=](sycl::nd_item<1> it) {
+                  concat_T_flat<T, 2>(x, y, dst, ne0, ne1, ne00, ne01, ne02, total, ne0_fd, ne1_fd, it); });
+              return;
+      }
+  }
+
   int num_blocks = (ne0 + SYCL_CONCAT_BLOCK_SIZE - 1) / SYCL_CONCAT_BLOCK_SIZE;
   sycl::range<3> gridDim(ne2, ne1, num_blocks);
   switch (dim) {
