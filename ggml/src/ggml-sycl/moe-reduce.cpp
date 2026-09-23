@@ -37,7 +37,7 @@ static void moe_weighted_reduction_f32_sycl(const float * experts, const float *
 
 bool ggml_sycl_match_moe_weighted_reduction(const ggml_cgraph * cgraph, int node_idx,
                                             ggml_sycl_moe_reduce_match & match) {
-    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_moe_reduce) {
+    if (!g_ggml_sycl_enable_fusion || !(g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_REDUCE)) {
         return false;
     }
 
