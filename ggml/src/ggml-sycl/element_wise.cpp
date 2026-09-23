@@ -997,6 +997,59 @@ static inline void ggml_sycl_op_swiglu(ggml_backend_sycl_context & ctx, ggml_ten
 
 // dst = op(unary_node->src[0]) * other, written straight to the MUL output, saving the
 // standalone unary launch. Preconditions come from ggml_sycl_can_fuse(); re-asserted here.
+template <typename T, typename F>
+static void scale_unary_sycl(const T * x, T * dst, const int64_t k, const float scale, const float bias,
+                             queue_ptr main_stream, F op) {
+    const size_t            num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
+    const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE),
+                                  sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
+    main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+        const int64_t i = item_ct1.get_global_linear_id();
+        if (i >= k) {
+            return;
+        }
+        dst[i] = op(static_cast<T>(scale * static_cast<float>(x[i]) + bias));
+    });
+}
+
+void ggml_sycl_op_scale_unary_fused(ggml_backend_sycl_context & ctx, ggml_tensor * scale_node,
+                                    ggml_tensor * unary_node) {
+    scope_op_debug_print scope_dbg_print(__func__, unary_node, /*num_src=*/1);
+
+    const ggml_tensor * x = scale_node->src[0];
+
+    GGML_ASSERT(unary_node->src[0] == scale_node);
+    GGML_ASSERT(x->type == scale_node->type && x->type == unary_node->type);
+    GGML_ASSERT(ggml_are_same_shape(x, unary_node));
+    // both the scale and the unary index flat, so every operand must be fully contiguous
+    GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(unary_node));
+
+    float scale;
+    float bias;
+    memcpy(&scale, (const float *) scale_node->op_params + 0, sizeof(float));
+    memcpy(&bias,  (const float *) scale_node->op_params + 1, sizeof(float));
+
+    queue_ptr main_stream = ctx.stream();
+    SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    const int64_t k = ggml_nelements(unary_node);
+
+    // GGML_OP_SCALE is F32-only in this backend, and ggml_sycl_can_fuse() checks it
+    const auto dispatch_type = [&](auto op) {
+        GGML_ASSERT(unary_node->type == GGML_TYPE_F32);
+        scale_unary_sycl((const float *) x->data, (float *) unary_node->data, k, scale, bias, main_stream, op);
+    };
+
+    switch (ggml_get_unary_op(unary_node)) {
+        case GGML_UNARY_OP_SILU:     dispatch_type([](auto v) { return op_silu(v); });     break;
+        case GGML_UNARY_OP_SIGMOID:  dispatch_type([](auto v) { return op_sigmoid(v); });  break;
+        case GGML_UNARY_OP_SOFTPLUS: dispatch_type([](auto v) { return op_softplus(v); }); break;
+        default:
+            GGML_ABORT("fused scale+unary: unsupported unary op %s",
+                       ggml_unary_op_name(ggml_get_unary_op(unary_node)));
+    }
+}
+
 void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
     scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/2);
 
