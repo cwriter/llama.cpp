@@ -140,6 +140,7 @@ int g_ggml_sycl_enable_flash_attention = 1;
 int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
 int g_ggml_sycl_device_event_wait = 1;
 int g_ggml_sycl_async_copy = 1;
+int g_ggml_sycl_fuse_elementwise = 1;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
@@ -432,6 +433,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_dev2dev_memcpy = ggml_sycl_get_env("GGML_SYCL_DEV2DEV_MEMCPY", DEV2DEV_MEMCPY_SYCL);
         g_ggml_sycl_device_event_wait = ggml_sycl_get_env("GGML_SYCL_DEVICE_EVENT_WAIT", 1);
         g_ggml_sycl_async_copy = ggml_sycl_get_env("GGML_SYCL_ASYNC_COPY", 1);
+        g_ggml_sycl_fuse_elementwise = ggml_sycl_get_env("GGML_SYCL_FUSE_ELEMENTWISE", 1);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
@@ -501,6 +503,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s)\n", g_ggml_sycl_dev2dev_memcpy, dev2dev_int2str(g_ggml_sycl_dev2dev_memcpy));
         GGML_LOG_INFO("  GGML_SYCL_DEVICE_EVENT_WAIT: %d\n", g_ggml_sycl_device_event_wait);
         GGML_LOG_INFO("  GGML_SYCL_ASYNC_COPY: %d\n", g_ggml_sycl_async_copy);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_ELEMENTWISE: %d\n", g_ggml_sycl_fuse_elementwise);
         GGML_LOG_INFO("  GGML_SYCL_GET_MEM_API: %d (%s)\n", g_ggml_sycl_get_mem_api, mem_api_int2str(g_ggml_sycl_get_mem_api));
 #else
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s), enable to SYCL API since missing GGML_SYCL_SUPPORT_LEVEL_ZERO_API\n",
@@ -6943,6 +6946,36 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_UNARY &&
             ggml_sycl_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(node) })) {
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            i++;
+            continue;
+        }
+
+        // The hyper-connection gate is 2*sigmoid(inject/hc) over an (hc, n_tokens) tensor - a
+        // few floats per token built by three kernel launches, once per layer. Fold the chain
+        // into hc_post, which then reads its input and applies it inline. Tested before the
+        // plain scale+unary fusion below: both start at this SCALE, and this one absorbs more.
+        if (node->op == GGML_OP_SCALE &&
+            ggml_sycl_can_fuse(cgraph, i,
+                               { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST },
+                               { GGML_UNARY_OP_SIGMOID })) {
+            const ggml_tensor * scale1 = cgraph->nodes[i + 2];
+            ggml_sycl_dsv4_hc_post_gate gate;
+            gate.src = node->src[0];
+            memcpy(&gate.s0, (const float *) node->op_params + 0, sizeof(float));
+            memcpy(&gate.b0, (const float *) node->op_params + 1, sizeof(float));
+            memcpy(&gate.s1, (const float *) scale1->op_params + 0, sizeof(float));
+            memcpy(&gate.b1, (const float *) scale1->op_params + 1, sizeof(float));
+            ggml_sycl_op_dsv4_hc_post_fused_gate(*sycl_ctx, cgraph->nodes[i + 3], gate);
+            i += 3;
+            continue;
+        }
+
+        // ggml_get_unary_op() asserts on a non-unary node, so check the shape before asking
+        if (node->op == GGML_OP_SCALE && i + 1 < cgraph->n_nodes &&
+            cgraph->nodes[i + 1]->op == GGML_OP_UNARY &&
+            ggml_sycl_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY },
+                               { ggml_get_unary_op(cgraph->nodes[i + 1]) })) {
+            ggml_sycl_op_scale_unary_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i++;
             continue;
         }

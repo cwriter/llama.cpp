@@ -132,4 +132,9 @@ void ggml_sycl_arange(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
 // fused UNARY(silu|sigmoid|softplus) + MUL; see ggml_sycl_can_fuse() for the accepted shapes
 void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+// dst = unary(scale*x + bias): folds a SCALE that exists only to feed the next unary, which on
+// the hyper-connection path is a sub-microsecond kernel launched once per layer per token.
+void ggml_sycl_op_scale_unary_fused(ggml_backend_sycl_context & ctx, ggml_tensor * scale_node,
+                                    ggml_tensor * unary_node);
+
 #endif // GGML_SYCL_ELEMENTWISE_HPP

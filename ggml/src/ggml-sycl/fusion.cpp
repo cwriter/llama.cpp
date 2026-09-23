@@ -102,6 +102,89 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
         return ggml_sycl_should_fuse_mul_mat_glu(gate, up, glu);
     }
 
+    // The hyper-connection gate: SCALE -> SIGMOID -> SCALE feeding DSV4_HC_POST's src[2].
+    // ggml_can_fuse() cannot express it - the link is src[2], and hc_post has a different shape
+    // than the chain - so use the subgraph form with hc_post as the only materialised output.
+    if (ops.size() == 4 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
+        ops.begin()[2] == GGML_OP_SCALE && ops.begin()[3] == GGML_OP_DSV4_HC_POST) {
+        if (!g_ggml_sycl_fuse_elementwise) {
+            return false;
+        }
+        if (unary_ops.size() != 1 || unary_ops.begin()[0] != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+        if (!ggml_can_fuse_subgraph(cgraph, node_idx, ops, { node_idx + 3 })) {
+            return false;
+        }
+
+        const ggml_tensor * scale0  = cgraph->nodes[node_idx];
+        const ggml_tensor * sigmoid = cgraph->nodes[node_idx + 1];
+        const ggml_tensor * scale1  = cgraph->nodes[node_idx + 2];
+        const ggml_tensor * post    = cgraph->nodes[node_idx + 3];
+
+        if (ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID) {
+            return false;
+        }
+        // the chain has to be exactly that chain, and has to be what hc_post gates with
+        if (sigmoid->src[0] != scale0 || scale1->src[0] != sigmoid || post->src[2] != scale1) {
+            return false;
+        }
+
+        const ggml_tensor * gate_src = scale0->src[0];
+        if (gate_src->type != GGML_TYPE_F32 || scale0->type != GGML_TYPE_F32 ||
+            sigmoid->type != GGML_TYPE_F32 || scale1->type != GGML_TYPE_F32) {
+            return false;
+        }
+        // hc_post indexes the gate as gate[idst*nb0 + it*nb1]; folding the chain makes it read
+        // gate_src with gate_src's own strides, so the shape must be identical
+        if (!ggml_are_same_shape(gate_src, scale1)) {
+            return false;
+        }
+        if (!ggml_is_contiguous(gate_src)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    // A SCALE that exists only to feed the next unary.
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY &&
+        unary_ops.size() == 1) {
+        if (!g_ggml_sycl_fuse_elementwise) {
+            return false;
+        }
+        if (!ggml_can_fuse(cgraph, node_idx, ops)) {
+            return false;
+        }
+
+        const ggml_tensor * scale = cgraph->nodes[node_idx];
+        const ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+
+        const ggml_unary_op unary_op = ggml_get_unary_op(unary);
+        if (unary_op != unary_ops.begin()[0]) {
+            return false;
+        }
+        // the ops ggml_sycl_op_scale_unary_fused() has a kernel for
+        if (unary_op != GGML_UNARY_OP_SILU && unary_op != GGML_UNARY_OP_SIGMOID &&
+            unary_op != GGML_UNARY_OP_SOFTPLUS) {
+            return false;
+        }
+        if (unary->src[0] != scale) {
+            return false;
+        }
+
+        // SCALE is F32-only in this backend, and the fused kernel indexes every operand flat
+        const ggml_tensor * x = scale->src[0];
+        if (x->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (!ggml_are_same_shape(x, unary) || !ggml_is_contiguous(x) || !ggml_is_contiguous(unary)) {
+            return false;
+        }
+
+        return true;
+    }
+
     if (!ggml_can_fuse(cgraph, node_idx, ops)) {
         return false;
     }

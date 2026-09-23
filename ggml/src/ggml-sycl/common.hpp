@@ -103,6 +103,9 @@ extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_device_event_wait;
 // Copy into a SYCL backend by enqueuing, instead of draining both devices on the host.
 extern int g_ggml_sycl_async_copy;
+// The elementwise fusions that cut dispatch count on the hyper-connection path:
+// scale+sigmoid+scale into dsv4_hc_post, scale+unary, and cont+cpy.
+extern int g_ggml_sycl_fuse_elementwise;
 extern int g_ggml_sycl_fa_onednn;
 extern int g_ggml_sycl_fa_onednn_max_kv;
 extern int g_ggml_sycl_enable_mkl_fa;
