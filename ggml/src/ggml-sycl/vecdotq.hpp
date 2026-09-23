@@ -449,6 +449,37 @@ struct reorder_vec_dot_q8_0_wide {
     }
 };
 
+template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_NL> {
+    static constexpr ggml_type gtype = GGML_TYPE_IQ4_NL;
+
+    using q4_block  = ggml_sycl_reordered::block_q_t<GGML_TYPE_IQ4_NL>;
+    using q4_traits = typename q4_block::traits;
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+        const uint8_t *   qs     = static_cast<const uint8_t *>(vbq) + ibx_offset.first;
+        const ggml_half   d      = *(reinterpret_cast<const ggml_half *>(static_cast<const uint8_t *>(vbq) + d_offset.first));
+        const uint8_t *   values = (const uint8_t *) kvalues_iq4nl;
+
+        int sumi1 = 0;
+        int sumi2 = 0;
+
+#pragma unroll
+        for (size_t i = 0; i < q4_traits::vdr_mmvq; ++i) {
+            const uint32_t aux = get_int_from_uint8(qs, iqs + i);
+            int v1, v2;
+            get_int_from_table_16(aux, values, v1, v2);
+            sumi1 = dpct::dp4a(v1, get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i), sumi1);
+            sumi2 = dpct::dp4a(v2, get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i + q4_traits::qi), sumi2);
+        }
+
+        const sycl::float2 ds8f = q8_1_ds->convert<float, sycl::rounding_mode::automatic>();
+        // the lookup table already carries the sign, so there is no -8 correction here
+        return static_cast<float>(d) * ds8f.x() * (sumi1 + sumi2);
+    };
+};
+
 template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
     static constexpr ggml_type gtype = GGML_TYPE_Q8_0;
 
