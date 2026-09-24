@@ -322,8 +322,25 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
 // Which flash-attention kernels can read the packed mask directly. Everything else is handed a
 // dense expansion, so adding a kernel here is what turns the saving on for it.
 bool ggml_sycl_fattn_reads_mask_bits(const ggml_tensor * dst) {
-    return ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst) == BEST_FATTN_KERNEL_TILE &&
-           ggml_sycl_fattn_tile_reads_mask_bits(dst);
+    if (!ggml_sycl_kq_mask_is_bits(dst->src[3])) {
+        return false;
+    }
+    switch (ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst)) {
+        case BEST_FATTN_KERNEL_TILE:
+            return ggml_sycl_fattn_tile_reads_mask_bits(dst);
+        case BEST_FATTN_KERNEL_MKL:
+            // the chunked oneMKL kernel already takes a one-bit-per-cell selection map, added for
+            // the QSA mask fusion; its SEL=2 mode folds the mask into the bit and never reads a
+            // dense one, which is exactly what a packed causal mask is. A bit carries no
+            // magnitude, so only where no ALiBi slope applies.
+            {
+                float max_bias = 0.0f;
+                memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+                return max_bias == 0.0f;
+            }
+        default:
+            return false;
+    }
 }
 
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -336,7 +353,12 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     ggml_tensor                      dst_sub;
     ggml_tensor                      mask_sub;
     ggml_sycl_pool_alloc<sycl::half> mask_dense(ctx.pool());
-    if (ggml_sycl_kq_mask_is_bits(dst->src[3]) && ggml_sycl_fattn_reads_mask_bits(dst)) {
+    const bool mask_packed = ggml_sycl_kq_mask_is_bits(dst->src[3]);
+    const bool mkl_takes_bits =
+        mask_packed && ggml_sycl_fattn_reads_mask_bits(dst) &&
+        ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst) == BEST_FATTN_KERNEL_MKL;
+
+    if (mask_packed && ggml_sycl_fattn_reads_mask_bits(dst) && !mkl_takes_bits) {
         // taught reader: same bytes, but the row stride it must walk is the packed one
         const ggml_tensor * m = dst->src[3];
         mask_sub        = *m;
@@ -346,7 +368,7 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
         dst_sub         = *dst;
         dst_sub.src[3]  = &mask_sub;
         dst             = &dst_sub;
-    } else if (ggml_sycl_kq_mask_is_bits(dst->src[3])) {
+    } else if (mask_packed && !mkl_takes_bits) {
         const ggml_tensor * m     = dst->src[3];
         const int64_t       nrows = ggml_nelements(m) / m->ne[0];
         mask_dense.alloc(ggml_nelements(m));
@@ -414,7 +436,14 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
             ggml_sycl_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MKL:
-            ggml_sycl_flash_attn_ext_mkl(ctx, dst);
+            if (mkl_takes_bits) {
+                const ggml_tensor * m = dst->src[3];
+                ggml_sycl_flash_attn_ext_mkl(ctx, dst, (const uint32_t *) m->data,
+                                             (int64_t) (ggml_sycl_kq_mask_row_bytes(m->ne[0]) / sizeof(uint32_t)),
+                                             /* sel_mode = */ 2);
+            } else {
+                ggml_sycl_flash_attn_ext_mkl(ctx, dst);
+            }
             break;
     }
 
