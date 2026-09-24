@@ -1,4 +1,5 @@
 #include "qsa-mask.hpp"
+#include "kq-mask-bits.hpp"
 
 #include "ggml-impl.h"
 
@@ -187,6 +188,11 @@ static bool qsa_fa_mask_core(const ggml_cgraph * cgraph, ggml_tensor * fa, qsa_m
         return false;
     }
     if (!qsa_mask_chain_from_add(cgraph, ad, out)) {
+        return false;
+    }
+    // A packed causal mask is itself a bitmap, and this fusion would hand oneMKL a second one
+    // with different semantics, so the two features must not combine.
+    if (ggml_sycl_kq_mask_is_bits(ad) || ggml_sycl_kq_mask_is_bits(fa->src[3])) {
         return false;
     }
     // only the chunked oneMKL kernel can take a bitmap; every other kernel must keep the dense mask
