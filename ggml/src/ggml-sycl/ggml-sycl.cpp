@@ -84,6 +84,7 @@
 #include "ggml-sycl/conv2d-transpose.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
+#include "kq-mask-bits.hpp"
 #include "kv-soa.hpp"
 #include "moe-reduce.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
@@ -146,6 +147,7 @@ int g_ggml_sycl_async_copy = 1;
 int g_ggml_sycl_fuse_types = GGML_SYCL_FUSE_DEFAULT;
 int g_ggml_sycl_float_commutative = 1;
 int g_ggml_sycl_kv_soa = 0;
+int g_ggml_sycl_kq_mask_bits = 0;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
@@ -444,6 +446,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_types = ggml_sycl_get_env("GGML_SYCL_FUSE_TYPES", GGML_SYCL_FUSE_DEFAULT);
         g_ggml_sycl_float_commutative = ggml_sycl_get_env("GGML_SYCL_FLOAT_COMMUTATIVE", 1);
         g_ggml_sycl_kv_soa = ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0);
+        g_ggml_sycl_kq_mask_bits = ggml_sycl_get_env("GGML_SYCL_KQ_MASK_BITS", 0);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
@@ -523,6 +526,7 @@ static void ggml_check_sycl() try {
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_GLU_ID)  != 0);
         GGML_LOG_INFO("  GGML_SYCL_FLOAT_COMMUTATIVE: %d\n", g_ggml_sycl_float_commutative);
         GGML_LOG_INFO("  GGML_SYCL_KV_SOA: %d\n", g_ggml_sycl_kv_soa);
+        GGML_LOG_INFO("  GGML_SYCL_KQ_MASK_BITS: %d\n", g_ggml_sycl_kq_mask_bits);
         GGML_LOG_INFO("  GGML_SYCL_GET_MEM_API: %d (%s)\n", g_ggml_sycl_get_mem_api, mem_api_int2str(g_ggml_sycl_get_mem_api));
 #else
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s), enable to SYCL API since missing GGML_SYCL_SUPPORT_LEVEL_ZERO_API\n",
@@ -833,6 +837,14 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
             default:
                 break;
         }
+
+        // the causal mask is f16, so the quantized switch above never sees it
+        if (tensor->type == GGML_TYPE_F16 && ggml_sycl_kq_mask_eligible(tensor)) {
+            ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
+            tensor->extra                 = extra;
+            ctx->tensor_extras.push_back(extra);
+            ggml_sycl_kq_mask_mark(tensor);
+        }
     }
 
     if (ggml_is_quantized(tensor->type)) {
@@ -864,6 +876,18 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // A caller always hands over canonical bytes (a session file has to be readable by any build),
     // so permute into span order here rather than making every writer aware of the layout. The
     // staging loop below memcpy()s out of this buffer on the host, so the local outlives the copy.
+    // The producer always hands over a dense f16 mask; pack it here so only the bits are sent.
+    std::vector<char> mask_buf;
+    if (ggml_sycl_kq_mask_is_bits(tensor)) {
+        GGML_ASSERT(offset == 0 && size == ggml_nbytes(tensor) &&
+                    "a packed mask must be written whole; see kq-mask-bits.hpp");
+        const int64_t nrows = ggml_nelements(tensor) / tensor->ne[0];
+        mask_buf.resize(ggml_sycl_kq_mask_row_bytes(tensor->ne[0]) * nrows);
+        ggml_sycl_kq_mask_pack(mask_buf.data(), data, tensor->ne[0], nrows);
+        data = mask_buf.data();
+        size = mask_buf.size();
+    }
+
     std::vector<char> soa_buf;
     if (ggml_sycl_kv_is_soa(tensor)) {
         GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
@@ -927,7 +951,10 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
     // Hand back canonical bytes whatever the device holds, so a session file stays portable.
-    const bool soa = ggml_sycl_kv_is_soa(tensor);
+    const bool soa  = ggml_sycl_kv_is_soa(tensor);
+    const bool bits = ggml_sycl_kq_mask_is_bits(tensor);
+    GGML_ASSERT((!bits || (offset == 0 && size == ggml_nbytes(tensor))) &&
+                "a packed mask must be read whole; see kq-mask-bits.hpp");
     GGML_ASSERT((!soa || ggml_sycl_kv_soa_range_ok(offset, size)) &&
                 "a SoA KV read must cover whole spans; see kv-soa.hpp");
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
@@ -942,6 +969,14 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     if (soa) {
         // spans keep their byte range, so this unpermutes in place
         ggml_sycl_kv_soa_span_to_canonical(data, data, size);
+    }
+
+    if (bits) {
+        // hand back the dense mask the caller expects, from however few bytes actually hold it
+        const int64_t     nrows = ggml_nelements(tensor) / tensor->ne[0];
+        std::vector<char> packed(ggml_sycl_kq_mask_row_bytes(tensor->ne[0]) * nrows);
+        SYCL_CHECK(CHECK_TRY_ERROR(stream.memcpy(packed.data(), tensor->data, packed.size()).wait()));
+        ggml_sycl_kq_mask_unpack(data, packed.data(), tensor->ne[0], nrows);
     }
 }
 catch (sycl::exception const &exc) {

@@ -136,6 +136,10 @@ extern int g_ggml_sycl_fuse_types;
 extern int g_ggml_sycl_float_commutative;
 // Store the q8_0 KV cache per-row SoA so its quants load 16-byte aligned. See kv-soa.hpp.
 extern int g_ggml_sycl_kv_soa;
+// Pack the causal mask to one bit per cell in device memory. The tensor keeps its f16 type and
+// shape, so ggml and supports_op never see a difference; only the bytes change, and only the
+// backend reads them. Cuts what a flash-attention kernel re-reads per cell from 16 bits to 1.
+extern int g_ggml_sycl_kq_mask_bits;
 // ggml_can_fuse_subgraph() takes at most 31 nodes, and the span is 2*n_expert_used.
 static constexpr int GGML_SYCL_MOE_REDUCE_MAX_EXPERTS = 15;
 extern int g_ggml_sycl_fa_onednn;
@@ -296,6 +300,7 @@ enum ggml_sycl_layout_kind : uint8_t {
     GGML_SYCL_LAYOUT_CANONICAL = 0,  // exactly as ggml packs the type
     GGML_SYCL_LAYOUT_SOA_SPAN  = 1,  // quants then scales, repeating every `span` elements
     GGML_SYCL_LAYOUT_SOA_WHOLE = 2,  // quants then scales, once over the whole tensor
+    GGML_SYCL_LAYOUT_MASK_BITS = 3,  // a {0,-inf} mask packed to one bit per element
 };
 
 struct ggml_sycl_layout {

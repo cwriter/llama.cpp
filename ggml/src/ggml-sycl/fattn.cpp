@@ -18,6 +18,7 @@
 #include "fattn-tile.hpp"
 #include "fattn-vec.hpp"
 #include "fattn.hpp"
+#include "kq-mask-bits.hpp"
 #include "fattn-onednn.hpp"
 #include "fattn-sparse.hpp"
 
@@ -318,8 +319,46 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_TILE;
 }
 
+// Which flash-attention kernels can read the packed mask directly. Everything else is handed a
+// dense expansion, so adding a kernel here is what turns the saving on for it.
+bool ggml_sycl_fattn_reads_mask_bits(const ggml_tensor * dst) {
+    return ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst) == BEST_FATTN_KERNEL_TILE &&
+           ggml_sycl_fattn_tile_reads_mask_bits(dst);
+}
+
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
+
+    // The packed mask is backend-local and only some kernels read it. Rather than let an
+    // untaught one reinterpret bits as f16 - the way the QSA mask fusion once did, silently -
+    // expand it here for every reader that has not been taught, and substitute the dense copy.
+    // A taught kernel is excluded above this point, so it never pays for the expansion.
+    ggml_tensor                      dst_sub;
+    ggml_tensor                      mask_sub;
+    ggml_sycl_pool_alloc<sycl::half> mask_dense(ctx.pool());
+    if (ggml_sycl_kq_mask_is_bits(dst->src[3]) && ggml_sycl_fattn_reads_mask_bits(dst)) {
+        // taught reader: same bytes, but the row stride it must walk is the packed one
+        const ggml_tensor * m = dst->src[3];
+        mask_sub        = *m;
+        mask_sub.nb[1]  = ggml_sycl_kq_mask_row_bytes(m->ne[0]);
+        mask_sub.nb[2]  = mask_sub.nb[1] * m->ne[1];
+        mask_sub.nb[3]  = mask_sub.nb[2] * m->ne[2];
+        dst_sub         = *dst;
+        dst_sub.src[3]  = &mask_sub;
+        dst             = &dst_sub;
+    } else if (ggml_sycl_kq_mask_is_bits(dst->src[3])) {
+        const ggml_tensor * m     = dst->src[3];
+        const int64_t       nrows = ggml_nelements(m) / m->ne[0];
+        mask_dense.alloc(ggml_nelements(m));
+        ggml_sycl_kq_mask_to_f16(m->data, mask_dense.get(), m->ne[0], nrows, ctx.stream());
+
+        mask_sub        = *m;
+        mask_sub.data   = mask_dense.get();
+        mask_sub.extra  = nullptr;  // so it no longer answers "packed"
+        dst_sub         = *dst;
+        dst_sub.src[3]  = &mask_sub;
+        dst             = &dst_sub;
+    }
 
     // sparse nodes are gathered down to n_kv_max rows and re-dispatched here
     if (ggml_sycl_flash_attn_ext_sparse(ctx, dst)) {
