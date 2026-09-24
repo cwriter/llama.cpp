@@ -4,6 +4,7 @@
 #include "dpct/helper.hpp"
 #include "common.hpp"
 #include "fattn-common.hpp"
+#include "kq-mask-bits.hpp"
 
 #include <cmath>
 #include <float.h>
@@ -519,6 +520,7 @@ template <int  warp_size,
           bool use_logit_softcap,
           bool oob_check,
           bool kv_q8_0,
+          bool mask_bits,
           typename T_vec_dot,
           typename T_KQ,
           typename T_acc>
@@ -604,10 +606,21 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
             }
 
             if (!oob_check || i_KQ < k_VKQ_sup) {
-                KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] +=
-                    (ncols2 > 1 || mask) ? slope * sycl::vec<sycl::half, 1>(mask[j * stride_mask + k_VKQ_0 + i_KQ])
-                                                       .convert<float, sycl::rounding_mode::automatic>()[0] :
-                                           0.0f;
+                float mask_val = 0.0f;
+                if (ncols2 > 1 || mask) {
+                    if constexpr (mask_bits) {
+                        // stride_mask is the packed row stride in 32-bit words; bits carry no
+                        // magnitude, so no slope applies (the caller only picks this at max_bias 0)
+                        const int        c  = k_VKQ_0 + i_KQ;
+                        const uint32_t * mb = (const uint32_t *) mask;
+                        mask_val = ((mb[j * stride_mask + (c >> 5)] >> (c & 31)) & 1u)
+                                       ? 0.0f : -INFINITY;
+                    } else {
+                        mask_val = slope * sycl::vec<sycl::half, 1>(mask[j * stride_mask + k_VKQ_0 + i_KQ])
+                                               .convert<float, sycl::rounding_mode::automatic>()[0];
+                    }
+                }
+                KQ_acc[(i_KQ_0 / (np * warp_size)) * cpw + jc0] += mask_val;
 
                 KQ_max_new[jc0] =
                     sycl::fmax((float) KQ_max_new[jc0],
@@ -773,7 +786,7 @@ static __dpct_inline__ void flash_attn_tile_iter(T_vec_dot * const Q_tmp,
     }
 }
 
-template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool kv_q8_0, int warp_size>  // D == head size
+template <int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool kv_q8_0, bool mask_bits, int warp_size>  // D == head size
 /*
 The total declared local variable size in device function flash_attn_tile exceeds 128 bytes and may cause high register pressure. Consult with your hardware vendor to find the total register size available and adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
@@ -853,7 +866,7 @@ static void flash_attn_tile(const char *  Q,
 
     const int stride_K    = kv_q8_0 ? nb11 : nb11 / sizeof(sycl::half2);
     const int stride_V    = kv_q8_0 ? nb21 : nb21 / sizeof(sycl::half2);
-    const int stride_mask = nb31 / sizeof(sycl::half);
+    const int stride_mask = mask_bits ? (int) (nb31 / sizeof(uint32_t)) : (int) (nb31 / sizeof(sycl::half));
 
     const float slope = ncols2 == 1 ? get_alibi_slope(max_bias, head0, n_head_log2, m0, m1) : 1.0f;
 
@@ -985,7 +998,7 @@ static void flash_attn_tile(const char *  Q,
         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, kv_q8_0>(Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K,
+                                 oob_check, kv_q8_0, mask_bits>(Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K,
                                             stride_V, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
             k_VKQ_0 += item_ct1.get_group_range(1) * nbatch_fa;
@@ -993,7 +1006,7 @@ static void flash_attn_tile(const char *  Q,
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, kv_q8_0>(Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K,
+                                 oob_check, kv_q8_0, mask_bits>(Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K,
                                             stride_V, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
         }
@@ -1004,7 +1017,7 @@ static void flash_attn_tile(const char *  Q,
 
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap,
-                                 oob_check, kv_q8_0>(Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K,
+                                 oob_check, kv_q8_0, mask_bits>(Q_tmp, K_data, V_data, maskh, ne01, logit_softcap, slope, KQ, KV_tmp, stride_K,
                                             stride_V, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0,
                                             KQ_max_new_shared);
         }
@@ -1194,6 +1207,18 @@ static constexpr bool ggml_sycl_fattn_tile_q8_0_ok(const int DKQ, const int DV) 
     return DKQ % QK8_0 == 0 && DV % QK8_0 == 0;
 }
 
+// Whether the tile kernel will read the packed mask directly for this node. False means the
+// dispatcher hands it a dense expansion instead, which is correct but pays for the expansion.
+// Bits carry no magnitude, so this can only ever be true where no ALiBi slope applies.
+static bool ggml_sycl_fattn_tile_reads_mask_bits(const ggml_tensor * dst) {
+    if (!ggml_sycl_kq_mask_is_bits(dst->src[3])) {
+        return false;
+    }
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+    return max_bias == 0.0f;
+}
+
 static bool ggml_sycl_fattn_tile_use_q8_0(const ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -1216,18 +1241,32 @@ static void launch_fattn_tile_case(ggml_backend_sycl_context & ctx, ggml_tensor 
     const int nwarps    = ggml_sycl_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
     const int nbatch_fa = ggml_sycl_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
 
+    const bool mbits = ggml_sycl_fattn_tile_reads_mask_bits(dst);
+
     if constexpr (ggml_sycl_fattn_tile_q8_0_ok(DKQ, DV)) {
         if (ggml_sycl_fattn_tile_use_q8_0(dst)) {
-            launch_fattn<DV, cols_per_block/ncols2, ncols2,
-                flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true, warp_size>, warp_size>
-                (ctx, dst, nwarps, nbytes_shared, nbatch_fa, false, false, false);
+            if (mbits) {
+                launch_fattn<DV, cols_per_block/ncols2, ncols2,
+                    flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true, true, warp_size>, warp_size>
+                    (ctx, dst, nwarps, nbytes_shared, nbatch_fa, false, false, false);
+            } else {
+                launch_fattn<DV, cols_per_block/ncols2, ncols2,
+                    flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true, false, warp_size>, warp_size>
+                    (ctx, dst, nwarps, nbytes_shared, nbatch_fa, false, false, false);
+            }
             return;
         }
     }
 
-    launch_fattn<DV, cols_per_block/ncols2, ncols2,
-        flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, false, warp_size>, warp_size>
-        (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+    if (mbits) {
+        launch_fattn<DV, cols_per_block/ncols2, ncols2,
+            flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, false, true, warp_size>, warp_size>
+            (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+    } else {
+        launch_fattn<DV, cols_per_block/ncols2, ncols2,
+            flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, false, false, warp_size>, warp_size>
+            (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
+    }
 }
 
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
