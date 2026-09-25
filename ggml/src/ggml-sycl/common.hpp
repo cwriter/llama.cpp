@@ -110,9 +110,59 @@ enum ggml_sycl_xmx_gather_type {
     GGML_SYCL_XMX_GATHER_IQ2_S    = 1 << 6,
     GGML_SYCL_XMX_GATHER_IQ1_S    = 1 << 7,
     GGML_SYCL_XMX_GATHER_IQ1_M    = 1 << 8,
+    GGML_SYCL_XMX_GATHER_Q8_0     = 1 << 9,
+    GGML_SYCL_XMX_GATHER_Q4_K     = 1 << 10,
+    GGML_SYCL_XMX_GATHER_Q5_K     = 1 << 11,
+    GGML_SYCL_XMX_GATHER_Q6_K     = 1 << 12,
 };
 static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
 extern int g_ggml_sycl_xmx_gather_types;
+
+// Opt-in to paths that are faster but give up accuracy in edge cases the library GEMM handles.
+// Currently gates q4_K on the XMX gather: the A stage carries the dequantized weight as f16, so a
+// weight whose magnitude exceeds the f16 range (65504) becomes inf and the product NaN. Real
+// weights are nowhere near that; the synthetic amax=100000 case in test-backend-ops is.
+extern int g_ggml_sycl_fast_and_sloppy;
+
+// MUL_MAT_ID tile scheduling. The host path reads the routing back and sorts it on the CPU, which
+// costs a full queue drain per node; these bits select a device-built schedule instead and the
+// checks that prove the two agree. Off by default: the host path stays the correctness oracle.
+enum ggml_sycl_mmid_sched_bit {
+    GGML_SYCL_MMID_SCHED_DEVICE    = 1 << 0,  // build the schedule on the device, no drain
+    GGML_SYCL_MMID_SCHED_UNBOUNDED = 1 << 1,  // skip the slice-width heuristic the device cannot ask
+    GGML_SYCL_MMID_SCHED_VERIFY    = 1 << 2,  // read the device schedule back and check it
+    GGML_SYCL_MMID_SCHED_VERIFY_DST = 1 << 3, // run both arms and compare the output bitwise
+    GGML_SYCL_MMID_SCHED_HOST_TABLE = 1 << 4, // host schedule, but padded to the device arm's bound
+    GGML_SYCL_MMID_SCHED_PACKB_TIGHT = 1 << 5, // pack B at the tile's own row base, not at t * FG_BN
+    GGML_SYCL_MMID_SCHED_MTILE32     = 1 << 6, // 32 rows per work-group, not 16: half the packed-B re-reads
+    GGML_SYCL_MMID_SCHED_GRF256      = 1 << 7, // 256 GRF on the wide M tile, which holds 8 accumulator tiles
+    GGML_SYCL_MMID_SCHED_MTILE64     = 1 << 8, // 64 rows per work-group; always 256 GRF, and wins over bit 64
+    GGML_SYCL_MMID_SCHED_SLM_A       = 1 << 9, // stage the raw quantized A bytes of a stored block through SLM
+    GGML_SYCL_MMID_SCHED_PIPELINE_A  = 1 << 10, // stage the A of k step n+1 while the MADs of step n run
+    GGML_SYCL_MMID_SCHED_REGS_A      = 1 << 11, // hold one stored A block in registers over all of its k steps
+    GGML_SYCL_MMID_SCHED_REGS_LITE_A = 1 << 12, // hold only the cheap, high-reuse streams of the block in registers
+    GGML_SYCL_MMID_SCHED_BLK_A       = 1 << 15, // lay the staged A tile out as whole 8x16 matrix tiles, not row major
+    GGML_SYCL_MMID_SCHED_GRID_SLM    = 1 << 16, // hold the iq3_s lookup table in SLM, one copy per work-group
+    GGML_SYCL_MMID_SCHED_SPLIT_C     = 1 << 17, // reduce the K-split partials 8 rows at a time: half the tile_c
+    // DIAGNOSTIC ONLY - these produce WRONG OUTPUT. They exist to time half the kernel: with the
+    // execution units idle ~92% and no traffic, spill, instruction-count or barrier explanation
+    // left, the question is whether the time is in the A dequant or in the XMX MADs.
+    GGML_SYCL_MMID_SCHED_DIAG_NO_MAD = 1 << 13, // decode A, skip the MADs
+    GGML_SYCL_MMID_SCHED_DIAG_NO_A   = 1 << 14, // skip the A decode, run the MADs on stale tile_a
+};
+extern int g_ggml_sycl_mmid_sched;
+
+// USM system allocations. Bit 0 is what the flag meant as a boolean: back a large SYCL buffer with
+// the system allocator instead of device memory. Bit 1 lets the device read a weight that llama.cpp
+// keeps mapped in host memory, so a gather of that weight runs here and only the row indices cross
+// the bus, instead of the host gathering and staging the dense result. Both need a device that
+// reports usm_system_allocations.
+enum ggml_sycl_usm_system_bit {
+    GGML_SYCL_USM_SYSTEM_ALLOC          = 1 << 0, // large SYCL buffers come from the system allocator
+    GGML_SYCL_USM_SYSTEM_MAPPED_WEIGHTS = 1 << 1, // gather a host-mapped weight on the device
+};
+extern int g_ggml_sycl_usm_system;
+
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 // Wait for a cross-split event by enqueuing a barrier instead of blocking the host on it.
@@ -126,10 +176,14 @@ enum ggml_sycl_fuse_type {
     GGML_SYCL_FUSE_MUL_ADD     = 1 << 1,  // multiply-accumulate pair
     GGML_SYCL_FUSE_MOE_REDUCE  = 1 << 2,  // MoE weighted sum: mul + per-expert views + add chain
     GGML_SYCL_FUSE_MOE_GLU_ID  = 1 << 3,  // gate + up MoE mat-vec folded with their GLU
+    GGML_SYCL_FUSE_UNARY_MUL_B = 1 << 4,  // unary + mul where the unary side is one value per row
+    GGML_SYCL_FUSE_NORM_SCALE  = 1 << 5,  // rms_norm + the scale that turns it into an l2 norm
 };
 
-// Everything on. A fusion added later is on unless it is measured otherwise.
-static constexpr int GGML_SYCL_FUSE_DEFAULT = ~0;
+// The fusions that are measured on. A new one starts off and gets its own bit, so it can be
+// switched on alone with GGML_SYCL_FUSE_TYPES.
+static constexpr int GGML_SYCL_FUSE_DEFAULT =
+    GGML_SYCL_FUSE_ELEMENTWISE | GGML_SYCL_FUSE_MUL_ADD | GGML_SYCL_FUSE_MOE_REDUCE | GGML_SYCL_FUSE_MOE_GLU_ID;
 
 extern int g_ggml_sycl_fuse_types;
 // Allow a fusion to rely on a+b == b+a, which is exact in IEEE754. Not associativity.
@@ -196,6 +250,29 @@ enum ggml_sycl_backend_gpu_mode {
   SYCL_SINGLE_GPU_MODE = 0,
   SYCL_MUL_GPU_MODE
 };
+
+// GGML_SYCL_ASYNC_COPY is a bitset, not a bool. Bit 0 is the original behaviour, so the
+// historical value 1 still means exactly what it used to.
+enum ggml_sycl_async_copy_bits {
+    // Order a cross-device peer copy with a barrier on the destination queue instead of
+    // draining both devices on the host. Requires ext_oneapi_can_access_peer.
+    GGML_SYCL_ASYNC_COPY_PEER = 1 << 0,
+    // L0_ASYNC_COPY: append the Level Zero device-to-device copy to an ASYNCHRONOUS immediate
+    // command list and order the destination SYCL queue behind it with a host-visible L0 event,
+    // instead of blocking the host inside zeCommandListAppendMemoryCopy. Off by default: it is
+    // unproven, and measures as noise in layer-split mode where cross-device traffic is ~10 KB
+    // per token. Enable with GGML_SYCL_ASYNC_COPY=3 together with GGML_SYCL_DEV2DEV_MEMCPY=1.
+    GGML_SYCL_ASYNC_COPY_L0 = 1 << 1,
+};
+static constexpr int GGML_SYCL_ASYNC_COPY_DEFAULT = GGML_SYCL_ASYNC_COPY_PEER;
+
+// intel/compute-runtime issue #995: a peer-to-peer copy hangs the GPU engine (10 s timeout,
+// "Fault response: Unsuccessful -ENOENT", "exec queue reset detected") when the remote range
+// crosses from one zeVirtualMemMap()'d physical allocation into the next inside a single
+// zeVirtualMemReserve() range, for copies larger than the 2 MiB page. Local access to the same
+// memory is fine. PR #996 fixes it by splitting the copy at block ends, but it is still open, so
+// no shipping driver has it. We never split, so decline peer/L0 routes in the exposed case.
+static constexpr size_t GGML_SYCL_P2P_BLOCK_SPLIT_BYTES = 2u * 1024u * 1024u;
 
 enum ggml_sycl_dev2dev_memcpy_mode {
   DEV2DEV_MEMCPY_SYCL = 0,
