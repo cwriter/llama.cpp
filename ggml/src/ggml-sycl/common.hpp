@@ -66,6 +66,18 @@ extern int g_ggml_sycl_debug;
 extern int g_ggml_sycl_enable_optimize;
 extern int g_ggml_sycl_enable_fusion;
 extern int g_ggml_sycl_enable_dnn;
+// GGML_SYCL_ENABLE_ESIMD. Any nonzero value turns the ESIMD kernels on, exactly as when it was a
+// boolean; bit 1 additionally lets the reordered q8_0 / q6_K mat-vec kernels take 2..8 (q8_0: 2..4) activation
+// columns (MTP verification, small-batch decode) instead of the quantize + MMVQ path. On by default
+// (GGML_SYCL_ENABLE_ESIMD=3); =1 keeps single-column ESIMD only, =0 turns ESIMD off.
+enum ggml_sycl_esimd_bit {
+    GGML_SYCL_ESIMD_ON    = 1 << 0,
+    GGML_SYCL_ESIMD_NCOLS = 1 << 1,
+};
+// q6_K keeps winning over MMVQ up to 8 columns (1.85x at 8 on the LM head); q8_0 stops at 4: at 8
+// columns the per-row-pair f32 activation re-reads outweigh the shared weight load (0.87-0.89x).
+static constexpr int GGML_SYCL_ESIMD_MAX_NCOLS      = 8;
+static constexpr int GGML_SYCL_ESIMD_MAX_NCOLS_Q8_0 = 4;
 extern int g_ggml_sycl_enable_esimd;
 extern int g_ggml_sycl_esimd_q8_0;
 extern int g_ggml_sycl_prioritize_dmmv;
@@ -178,12 +190,16 @@ enum ggml_sycl_fuse_type {
     GGML_SYCL_FUSE_MOE_GLU_ID  = 1 << 3,  // gate + up MoE mat-vec folded with their GLU
     GGML_SYCL_FUSE_UNARY_MUL_B = 1 << 4,  // unary + mul where the unary side is one value per row
     GGML_SYCL_FUSE_NORM_SCALE  = 1 << 5,  // rms_norm + the scale that turns it into an l2 norm
+    GGML_SYCL_FUSE_GLU_NCOLS   = 1 << 6,  // dense q8_0 gate + up + SWIGLU also at 3..8 columns, not only 1..2
+    GGML_SYCL_FUSE_FLAT_BATCH  = 1 << 7,  // 2D quantized weight x contiguous 3D/4D activation: one launch, not one per batch
 };
 
-// The fusions that are measured on. A new one starts off and gets its own bit, so it can be
-// switched on alone with GGML_SYCL_FUSE_TYPES.
+// The fusions that are on by default. Every fusion has its own bit, so GGML_SYCL_FUSE_TYPES can
+// switch any of them on or off alone.
 static constexpr int GGML_SYCL_FUSE_DEFAULT =
-    GGML_SYCL_FUSE_ELEMENTWISE | GGML_SYCL_FUSE_MUL_ADD | GGML_SYCL_FUSE_MOE_REDUCE | GGML_SYCL_FUSE_MOE_GLU_ID;
+    GGML_SYCL_FUSE_ELEMENTWISE | GGML_SYCL_FUSE_MUL_ADD | GGML_SYCL_FUSE_MOE_REDUCE | GGML_SYCL_FUSE_MOE_GLU_ID |
+    GGML_SYCL_FUSE_NORM_SCALE | GGML_SYCL_FUSE_GLU_NCOLS | GGML_SYCL_FUSE_FLAT_BATCH;   // = 239; UNARY_MUL_B (bit 4) stays off: measured as noise
+static constexpr int GGML_SYCL_ESIMD_DEFAULT = 3;  // GGML_SYCL_ESIMD_ON | GGML_SYCL_ESIMD_NCOLS
 
 extern int g_ggml_sycl_fuse_types;
 // Allow a fusion to rely on a+b == b+a, which is exact in IEEE754. Not associativity.

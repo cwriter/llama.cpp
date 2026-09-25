@@ -9929,6 +9929,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Multi-column mat-vec for q8_0 and q6_K, the SYCL reordered ESIMD kernels at 2..4 columns
+    // (MTP verification): odd row counts for the row-pair tail, k both inside one stripe and
+    // across several, and the qwen4exp shapes (k=320 is a partial q8_0 stripe).
+    for (ggml_type type_a : { GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+        for (int n = 1; n <= 8; ++n) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, n, 1024, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1023, n, 4096, { 1, 1 }, { 1, 1 }));
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 321, n, 2560, { 1, 1 }, { 1, 1 }));
+            if (type_a == GGML_TYPE_Q8_0) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 257, n, 320, { 1, 1 }, { 1, 1 }));
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 321, n, 10240, { 1, 1 }, { 1, 1 }));
+            }
+        }
+    }
+
+    // 2D quantized weight against a 3D activation (the MTP eh_proj, [K, 4 streams, n_tokens])
+    for (int nt : {1, 2, 3, 42}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 4, 512, {1, 1}, {nt, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 4, 512, {1, 1}, {nt, 2}));
+    }
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
@@ -10963,6 +10984,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //    }
     //}
 
+    // q8_0 dense gate/up + SWIGLU over 1..8 tokens at the qwen4exp shared-expert shape, and an
+    // odd row count for the row tail.
+    for (int64_t m_batch = 1; m_batch <= 8; ++m_batch) {
+        for (int64_t rows : {640, 321}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, m_batch, rows, 2560,
+                false, 16, 8, false, false, true, false, { 1, 1 }));
+        }
+    }
+
     // Both sides of the same row-count boundary as above, on the fused path.
     for (int64_t rows : {6271, 6272, 6273}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, 2, rows, 256,
@@ -11266,6 +11296,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
         }
+    }
+
+    // qwen4exp (Qwen3.8-Flash-Next) dense mat-vecs at MTP verification widths: {m, k} of the q8_0
+    // projections, and the q6_K LM head
+    for (int bs : {1, 2, 3, 4, 5, 8}) {
+        for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {6144, 2560}, {12288, 2560}, {512, 2560},
+                                                            {2560, 6144}, {640, 2560}, {2560, 640}, {10240, 320},
+                                                            {320, 10240} }) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], bs, mk[1], {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, bs, 2560, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, bs, 640, 2560,
+            false, 16, 8, false, false, true, false, { 1, 1 }));
+    }
+
+    // the MTP eh_proj: a 2D q8_0 weight against a [5120, 4 streams, n_tokens] activation, and the
+    // same product with the activation flattened to [5120, 4 * n_tokens]
+    for (int nt : {1, 2, 3, 4, 42}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 4, 5120, {1, 1}, {nt, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 4 * nt, 5120, {1, 1}, {1, 1}));
+    }
+
+    // the MTP draft sampler's top-k: k=10 over the qwen4exp vocabulary
+    for (int nrows : {1, 2, 3, 4}) {
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, 10));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, 8));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, nrows, 1, 1}, 9));
     }
 
     // Q4_K multi-column mat-vec

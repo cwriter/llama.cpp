@@ -114,7 +114,7 @@ int g_ggml_sycl_memtrace = 0;
 int g_ggml_sycl_memtrace_step = 64;
 int g_ggml_sycl_enable_vmm = 1;
 int g_ggml_sycl_enable_fusion = 1;
-int g_ggml_sycl_enable_esimd = 1;
+int g_ggml_sycl_enable_esimd = GGML_SYCL_ESIMD_DEFAULT;
 int g_ggml_sycl_esimd_q8_0 = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_moe_reorder = -1;
@@ -416,7 +416,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
-        g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", 1);
+        g_ggml_sycl_enable_esimd = ggml_sycl_get_env("GGML_SYCL_ENABLE_ESIMD", GGML_SYCL_ESIMD_DEFAULT);
         g_ggml_sycl_esimd_q8_0 = ggml_sycl_get_env("GGML_SYCL_ESIMD_Q8_0", 1);
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_moe_reorder = ggml_sycl_get_env("GGML_SYCL_MOE_REORDER", -1);
@@ -524,14 +524,16 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ASYNC_COPY: %d (peer=%d l0_async=%d)\n", g_ggml_sycl_async_copy,
                       (g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_PEER) ? 1 : 0,
                       (g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_L0) ? 1 : 0);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_TYPES: 0x%x (elementwise=%d mul_add=%d moe_reduce=%d moe_glu_id=%d unary_mul_b=%d norm_scale=%d)\n",
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_TYPES: 0x%x (elementwise=%d mul_add=%d moe_reduce=%d moe_glu_id=%d unary_mul_b=%d norm_scale=%d glu_ncols=%d flat_batch=%d)\n",
                       g_ggml_sycl_fuse_types,
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_ELEMENTWISE) != 0,
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MUL_ADD)     != 0,
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_REDUCE)  != 0,
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_MOE_GLU_ID)  != 0,
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_UNARY_MUL_B) != 0,
-                      (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_NORM_SCALE)  != 0);
+                      (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_NORM_SCALE)  != 0,
+                      (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_GLU_NCOLS)   != 0,
+                      (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_FLAT_BATCH)  != 0);
         GGML_LOG_INFO("  GGML_SYCL_FLOAT_COMMUTATIVE: %d\n", g_ggml_sycl_float_commutative);
         GGML_LOG_INFO("  GGML_SYCL_KV_SOA: %d\n", g_ggml_sycl_kv_soa);
         GGML_LOG_INFO("  GGML_SYCL_KQ_MASK_BITS: %d\n", g_ggml_sycl_kq_mask_bits);
@@ -601,7 +603,8 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FUSION: %d\n", g_ggml_sycl_enable_fusion);
 
 #if defined(__INTEL_LLVM_COMPILER)
-        GGML_LOG_INFO("  GGML_SYCL_ENABLE_ESIMD: %d\n", g_ggml_sycl_enable_esimd);
+        GGML_LOG_INFO("  GGML_SYCL_ENABLE_ESIMD: %d (ncols=%d)\n", g_ggml_sycl_enable_esimd,
+                      (g_ggml_sycl_enable_esimd & GGML_SYCL_ESIMD_NCOLS) != 0);
 #else
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_ESIMD: %d disabled by compile flag\n", g_ggml_sycl_enable_esimd);
 #endif
@@ -5358,6 +5361,56 @@ static bool can_use_dequantize_mul_mat_vec(const ggml_tensor * src0, const ggml_
            src0->ne[0] % dmmv_x_required == 0 && src1->ne[1] == 1;
 }
 
+// The reordered ESIMD q8_0 / q6_K kernels over 2..GGML_SYCL_ESIMD_MAX_NCOLS columns, which read the f32
+// activation directly: shape, type and flag checks only. The layout is installed and checked by
+// ggml_sycl_esimd_ncols_ready().
+static bool can_use_esimd_ncols(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+                                ggml_tensor * dst) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (!(g_ggml_sycl_enable_esimd & GGML_SYCL_ESIMD_NCOLS) || g_ggml_sycl_prioritize_dmmv) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q6_K) {
+        return false;
+    }
+    // q8_0 keeps honouring GGML_SYCL_ESIMD_Q8_0
+    if (!ggml_sycl_supports_reorder_esimd(src0->type) || !ggml_sycl_supports_reorder_mmvq(src0->type)) {
+        return false;
+    }
+    // the kernel writes dst->data columns directly and reads src0 as one reordered 2D matrix
+    if (ggml_backend_buffer_is_sycl_split(src0->buffer) || !ggml_is_contiguous(src0) || src0->ne[2] != 1 ||
+        src0->ne[3] != 1) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst)) {
+        return false;
+    }
+    const int64_t max_ncols = src0->type == GGML_TYPE_Q8_0 ? GGML_SYCL_ESIMD_MAX_NCOLS_Q8_0 : GGML_SYCL_ESIMD_MAX_NCOLS;
+    if (src1->ne[1] < 2 || src1->ne[1] > max_ncols) {
+        return false;
+    }
+    if (src0->ne[0] % ggml_blck_size(src0->type) != 0) {
+        return false;
+    }
+    // MUL_MAT only, one 2D activation: the same cases the reorder is installed for
+    return should_reorder_tensor(ctx, dst);
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(src0);
+    GGML_UNUSED(src1);
+    GGML_UNUSED(dst);
+    return false;
+#endif
+}
+
+// install the reorder layout the kernel reads, as the N=1 DMMV path does; false if it is not there
+static bool ggml_sycl_esimd_ncols_ready(ggml_backend_sycl_context & ctx, const ggml_tensor * src0,
+                                        const ggml_tensor * src1, ggml_tensor * dst) {
+    opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    return extra && extra->optimized_feature.is_reordered();
+}
+
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
@@ -5392,6 +5445,37 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     }
 
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
+
+    // One 2D weight against a contiguous activation with batch dims (the MTP eh_proj, [K, 4 streams,
+    // n_tokens]): ggml_sycl_op_mul_mat() would loop once per batch index, each with its own
+    // quantize and launch, and never installs the reorder layout for a 3D activation. The product
+    // is the same as one matrix with ne11*ne12*ne13 columns, so run it as that, as CUDA does.
+    if ((g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_FLAT_BATCH) && !split && dst->op == GGML_OP_MUL_MAT &&
+        ggml_is_quantized(src0->type) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->ne[2] * src1->ne[3] > 1 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        const int64_t ncols = src1->ne[1] * src1->ne[2] * src1->ne[3];
+        // just past the mat-vec batch limit the product would drop to the GEMM path, which at 12
+        // columns costs 4x a mat-vec of 8; up to a few mat-vec widths, run it as column chunks
+        const int64_t chunk = ncols > MMVQ_MAX_BATCH_SIZE && ncols <= 3 * MMVQ_MAX_BATCH_SIZE ? MMVQ_MAX_BATCH_SIZE : ncols;
+        for (int64_t c0 = 0; c0 < ncols; c0 += chunk) {
+            const int64_t nc = std::min(chunk, ncols - c0);
+            ggml_tensor src1_flat = *src1;
+            ggml_tensor dst_flat  = *dst;
+            src1_flat.data  = (char *) src1->data + c0 * src1->nb[1];
+            src1_flat.ne[1] = nc;
+            src1_flat.ne[2] = src1_flat.ne[3] = 1;
+            src1_flat.nb[2] = src1_flat.nb[3] = src1_flat.nb[1] * nc;
+            dst_flat.data  = (char *) dst->data + c0 * dst->nb[1];
+            dst_flat.ne[1] = nc;
+            dst_flat.ne[2] = dst_flat.ne[3] = 1;
+            dst_flat.nb[2] = dst_flat.nb[3] = dst_flat.nb[1] * nc;
+            dst_flat.src[1] = &src1_flat;
+            ggml_sycl_mul_mat(ctx, src0, &src1_flat, &dst_flat);
+        }
+        return;
+    }
+
     int64_t min_compute_capability = INT_MAX;
 
     if (split) {
@@ -5453,6 +5537,8 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
         // KQ + KQV multi-batch
         ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
+    } else if (!split && can_use_esimd_ncols(ctx, src0, src1, dst) && ggml_sycl_esimd_ncols_ready(ctx, src0, src1, dst)) {
+        ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);
     } else if (use_dequantize_mul_mat_vec) {
         opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::DMMV);
         ggml_sycl_op_mul_mat<no_quantize_q8_1>(ctx, src0, src1, dst, ggml_sycl_op_dequantize_mul_mat_vec);

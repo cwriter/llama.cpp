@@ -2153,6 +2153,276 @@ static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const
     }
 }
 
+
+// Multi-column variants of the two reordered ESIMD kernels above, for 2..GGML_SYCL_ESIMD_MAX_NCOLS activation columns
+// (MTP verification, small-batch decode). Each work-group keeps the N=1 decomposition: the same
+// row pair, the same WG threads, the same stripes, the same per-lane accumulation order and the
+// same lane-0 reduction. Each column agrees with the N=1 kernel to float rounding (measured
+// max|diff| / max|y| <= 2.8e-7 on the qwen4exp shapes; the compiler contracts the products into
+// FMAs differently, so not bitwise), where the q8_1 MMVQ path it replaces differs by ~4e-3.
+// What changes is that a weight stripe is loaded and dequantized once and then MACed against
+// every column, so the weight bytes - which are what bound these kernels - are read once for all
+// columns. The activations are read as f32, like the N=1 kernels: no q8_1 quantize launch.
+// Kept separate from the N=1 kernels so that path stays the code it was.
+
+// dequantize one q8_0 stripe of a row into floats, with the arithmetic of q8_0_mac_stripe
+template <int NBLK>
+ESIMD_INLINE sycl::ext::intel::esimd::simd<float, 32 * NBLK> q8_0_dequant_stripe(
+        const int8_t * qs, const sycl::half * d, bool valid) {
+    using namespace sycl::ext::intel::esimd;
+    simd<int8_t, 32 * NBLK> q  = 0;
+    simd<sycl::half, NBLK>  dh = 0;
+    if (valid) {
+        q  = block_load<int8_t, 32 * NBLK>(qs);
+        dh = block_load<sycl::half, NBLK>(d, element_aligned_tag{});
+    }
+    simd<float, NBLK>       df = convert<float>(dh);
+    simd<float, 32 * NBLK>  w;
+#pragma unroll
+    for (int s = 0; s < NBLK; ++s) {
+        simd<int8_t, 32> q_s = q.template select<32, 1>(s * 32);
+        const float      sc  = df[s];
+        w.template select<32, 1>(s * 32) = convert<float>(q_s) * sc;
+    }
+    return w;
+}
+
+template <int NBLK, int NCOLS>
+ESIMD_INLINE void q8_0_mac_stripe_ncols(
+        const int8_t * qs_a, const int8_t * qs_b,
+        const sycl::half * d_a, const sycl::half * d_b, bool has_b,
+        const float * y, const int stride_col_y,
+        sycl::ext::intel::esimd::simd<float, 32 * NCOLS> & acc_a,
+        sycl::ext::intel::esimd::simd<float, 32 * NCOLS> & acc_b) {
+    using namespace sycl::ext::intel::esimd;
+
+    simd<float, 32 * NBLK> wa = q8_0_dequant_stripe<NBLK>(qs_a, d_a, true);
+    simd<float, 32 * NBLK> wb = q8_0_dequant_stripe<NBLK>(qs_b, d_b, has_b);
+
+#pragma unroll
+    for (int c = 0; c < NCOLS; ++c) {
+        simd<float, 32 * NBLK> y_vec = block_load<float, 32 * NBLK>(y + (size_t) c * stride_col_y);
+        simd<float, 32> a = acc_a.template select<32, 1>(c * 32);
+        simd<float, 32> b = acc_b.template select<32, 1>(c * 32);
+#pragma unroll
+        for (int s = 0; s < NBLK; ++s) {
+            simd<float, 32> y_s = y_vec.template select<32, 1>(s * 32);
+            a += y_s * simd<float, 32>(wa.template select<32, 1>(s * 32));
+            b += y_s * simd<float, 32>(wb.template select<32, 1>(s * 32));
+        }
+        acc_a.template select<32, 1>(c * 32) = a;
+        acc_b.template select<32, 1>(c * 32) = b;
+    }
+}
+
+// lmem layout [thread][column][row of the pair]; lane 0 sums the threads in the N=1 order
+template <int WG, int NCOLS>
+ESIMD_INLINE void esimd_ncols_epilogue(
+        sycl::ext::intel::esimd::simd<float, 32 * NCOLS> & acc0,
+        sycl::ext::intel::esimd::simd<float, 32 * NCOLS> & acc1,
+        float * dst, const int row0, const bool has_row1, const int stride_col_dst,
+        sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
+    using namespace sycl::ext::intel::esimd;
+    const int tid = it.get_local_id(0);
+#pragma unroll
+    for (int c = 0; c < NCOLS; ++c) {
+        lmem[(tid * NCOLS + c) * 2 + 0] = reduce<float>(simd<float, 32>(acc0.template select<32, 1>(c * 32)), std::plus<>{});
+        lmem[(tid * NCOLS + c) * 2 + 1] = reduce<float>(simd<float, 32>(acc1.template select<32, 1>(c * 32)), std::plus<>{});
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    if (tid == 0) {
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            float sum0 = 0.0f;
+            float sum1 = 0.0f;
+            for (int p = 0; p < WG; ++p) {
+                sum0 += lmem[(p * NCOLS + c) * 2 + 0];
+                sum1 += lmem[(p * NCOLS + c) * 2 + 1];
+            }
+            dst[(size_t) c * stride_col_dst + row0 + 0] = sum0;
+            if (has_row1) {
+                dst[(size_t) c * stride_col_dst + row0 + 1] = sum1;
+            }
+        }
+    }
+}
+
+template <int WG, int NCOLS>
+ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd_ncols(
+        const void * vx, const float * y, float * dst,
+        const int ncols, const int nrows, const int stride_col_y, const int stride_col_dst,
+        sycl::local_accessor<float, 1> lmem,
+        const sycl::nd_item<1> & it) {
+    using namespace sycl::ext::intel::esimd;
+
+    constexpr int STRIPE = 8;
+
+    const int          nblk_row = ncols / QK8_0;
+    const size_t       nb       = (size_t) nrows * nblk_row;
+    const int8_t *     qs       = (const int8_t *) vx;
+    const sycl::half * d        = (const sycl::half *) (qs + nb * QK8_0);
+
+    const int  tid      = it.get_local_id(0);
+    const int  row0     = it.get_group(0) * 2;
+    const bool has_row1 = row0 + 1 < nrows;
+
+    const size_t base0 = (size_t) (row0 + 0) * nblk_row;
+    const size_t base1 = (size_t) (row0 + 1) * nblk_row;
+
+    simd<float, 32 * NCOLS> acc0 = 0.0f;
+    simd<float, 32 * NCOLS> acc1 = 0.0f;
+
+    int ib = 0;
+    for (; ib + WG * STRIPE <= nblk_row; ib += WG * STRIPE) {
+        const int b = ib + tid * STRIPE;
+        q8_0_mac_stripe_ncols<STRIPE, NCOLS>(qs + (base0 + b) * QK8_0, qs + (base1 + b) * QK8_0,
+                                             d + base0 + b, d + base1 + b, has_row1,
+                                             y + (size_t) b * QK8_0, stride_col_y, acc0, acc1);
+    }
+    for (int b = ib + tid; b < nblk_row; b += WG) {
+        q8_0_mac_stripe_ncols<1, NCOLS>(qs + (base0 + b) * QK8_0, qs + (base1 + b) * QK8_0,
+                                        d + base0 + b, d + base1 + b, has_row1,
+                                        y + (size_t) b * QK8_0, stride_col_y, acc0, acc1);
+    }
+
+    esimd_ncols_epilogue<WG, NCOLS>(acc0, acc1, dst, row0, has_row1, stride_col_dst, lmem, it);
+}
+
+template <int WG, int NCOLS>
+static void q8_0_esimd_ncols_launch(const void * vx, const float * y, float * dst, const int ncols,
+                                    const int nrows, const int stride_col_y, const int stride_col_dst,
+                                    dpct::queue_ptr stream) {
+    const int workgroups = (nrows + 1) / 2;
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * NCOLS * 2), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * WG), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                dequantize_mul_mat_vec_q8_0_reorder_esimd_ncols<WG, NCOLS>(
+                    vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, lmem, it);
+            });
+    });
+}
+
+template <int NCOLS>
+static void q8_0_esimd_ncols_launch_wg(const void * vx, const float * y, float * dst, const int ncols,
+                                       const int nrows, const int stride_col_y, const int stride_col_dst,
+                                       dpct::queue_ptr stream) {
+    // the same work-group choice as the N=1 launcher, so the per-column arithmetic matches it
+    const int nblk_row = ncols / QK8_0;
+    if (nblk_row >= 64) {
+        q8_0_esimd_ncols_launch<8, NCOLS>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream);
+    } else if (nblk_row >= 32) {
+        q8_0_esimd_ncols_launch<4, NCOLS>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream);
+    } else if (nblk_row >= 16) {
+        q8_0_esimd_ncols_launch<2, NCOLS>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream);
+    } else {
+        q8_0_esimd_ncols_launch<1, NCOLS>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream);
+    }
+}
+
+template <int NCOLS>
+ESIMD_INLINE void dequantize_mul_mat_vec_q6_K_reorder_esimd_ncols(
+        const void * vx, const float * y, float * dst,
+        const int ncols, const int nrows, const int stride_col_y, const int stride_col_dst,
+        sycl::local_accessor<float, 1> lmem,
+        const sycl::nd_item<1> & it) {
+    using namespace sycl::ext::intel::esimd;
+    using traits = ggml_sycl_esimd::esimd_reorder_q_traits<GGML_TYPE_Q6_K>;
+    constexpr int WG = GGML_SYCL_DMMV_ESIMD_WG_SIZE;
+
+    const int    num_blocks_per_row = ncols / QK_K;
+    const size_t nb = (size_t) nrows * num_blocks_per_row;
+    const auto   ps = traits::make_ptrs(vx, nb);
+
+    const int  tid      = it.get_local_id(0);
+    const int  row0     = it.get_group(0) * 2;
+    const bool has_row1 = row0 + 1 < nrows;
+
+    simd<float, 32 * NCOLS> acc0 = 0.0f;
+    simd<float, 32 * NCOLS> acc1 = 0.0f;
+
+    for (int ib = tid; ib < num_blocks_per_row; ib += WG) {
+        const size_t bi0 = (size_t) (row0 + 0) * num_blocks_per_row + ib;
+        const size_t bi1 = (size_t) (row0 + 1) * num_blocks_per_row + ib;
+
+        simd<float, 256> deq_a;
+        simd<float, 256> deq_b;
+        traits::dequant_pair(ps, bi0, bi1, has_row1, deq_a, deq_b);
+
+#pragma unroll
+        for (int c = 0; c < NCOLS; ++c) {
+            simd<float, 256> y_vec = block_load<float, 256>(y + (size_t) c * stride_col_y + (size_t) ib * QK_K);
+            simd<float, 32> a = acc0.template select<32, 1>(c * 32);
+            simd<float, 32> b = acc1.template select<32, 1>(c * 32);
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                simd<float, 32> y_g = y_vec.template select<32, 1>(32 * g);
+                a += y_g * simd<float, 32>(deq_a.template select<32, 1>(32 * g));
+                b += y_g * simd<float, 32>(deq_b.template select<32, 1>(32 * g));
+            }
+            acc0.template select<32, 1>(c * 32) = a;
+            acc1.template select<32, 1>(c * 32) = b;
+        }
+    }
+
+    esimd_ncols_epilogue<WG, NCOLS>(acc0, acc1, dst, row0, has_row1, stride_col_dst, lmem, it);
+}
+
+template <int NCOLS>
+static void q6_K_esimd_ncols_launch(const void * vx, const float * y, float * dst, const int ncols,
+                                    const int nrows, const int stride_col_y, const int stride_col_dst,
+                                    dpct::queue_ptr stream) {
+    constexpr int WG = GGML_SYCL_DMMV_ESIMD_WG_SIZE;
+    const int workgroups = (nrows + 1) / 2;
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * NCOLS * 2), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * WG), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                dequantize_mul_mat_vec_q6_K_reorder_esimd_ncols<NCOLS>(
+                    vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, lmem, it);
+            });
+    });
+}
+
+// 2..GGML_SYCL_ESIMD_MAX_NCOLS columns of a reordered q8_0 or q6_K weight. Returns false for
+// anything it does not cover, so the caller can assert rather than silently compute garbage.
+static bool dequantize_mul_mat_vec_reorder_esimd_ncols(ggml_type type, const void * vx, const float * y,
+                                                       float * dst, const int ncols, const int nrows,
+                                                       const int ncols_dst, const int stride_col_y,
+                                                       const int stride_col_dst, dpct::queue_ptr stream) {
+    switch (type) {
+        case GGML_TYPE_Q8_0:
+            GGML_ASSERT(ncols % QK8_0 == 0);
+            switch (ncols_dst) {
+                case 2: q8_0_esimd_ncols_launch_wg<2>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 3: q8_0_esimd_ncols_launch_wg<3>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 4: q8_0_esimd_ncols_launch_wg<4>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 5: q8_0_esimd_ncols_launch_wg<5>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 6: q8_0_esimd_ncols_launch_wg<6>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 7: q8_0_esimd_ncols_launch_wg<7>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 8: q8_0_esimd_ncols_launch_wg<8>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                default: return false;
+            }
+        case GGML_TYPE_Q6_K:
+            GGML_ASSERT(ncols % QK_K == 0);
+            switch (ncols_dst) {
+                case 2: q6_K_esimd_ncols_launch<2>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 3: q6_K_esimd_ncols_launch<3>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 4: q6_K_esimd_ncols_launch<4>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 5: q6_K_esimd_ncols_launch<5>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 6: q6_K_esimd_ncols_launch<6>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 7: q6_K_esimd_ncols_launch<7>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                case 8: q6_K_esimd_ncols_launch<8>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream); return true;
+                default: return false;
+            }
+        default:
+            return false;
+    }
+}
+
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 
 static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
@@ -2214,6 +2484,23 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t ne00 = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+    // several columns: only the reordered ESIMD q8_0 / q6_K kernels take them, and
+    // ggml_sycl_mul_mat() only sends them here when they will
+    if (src1_ncols > 1) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+        const auto * extra = (const ggml_tensor_extra_gpu *) src0->extra;
+        GGML_ASSERT(extra && extra->optimized_feature.is_reordered());
+        const bool ok = dequantize_mul_mat_vec_reorder_esimd_ncols(
+            src0->type, src0_dd_i, src1_ddf_i, dst_dd_i, (int) ne00, (int) row_diff, (int) src1_ncols,
+            /*stride_col_y=*/(int) src1->ne[0], /*stride_col_dst=*/(int) dst->ne[0], stream);
+        GGML_ASSERT(ok);
+        return;
+#else
+        GGML_ABORT("multi-column dequantize_mul_mat_vec needs ESIMD");
+#endif
+    }
+
     // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
 #ifdef GGML_SYCL_F16
     ggml_sycl_pool_alloc<sycl::half> src1_dfloat_a(ctx.pool());

@@ -4277,6 +4277,30 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
                 launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 2>(
                     vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
                 return true;
+            case 3:
+                launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 3>(
+                    vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
+                return true;
+            case 4:
+                launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 4>(
+                    vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
+                return true;
+            case 5:
+                launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 5>(
+                    vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
+                return true;
+            case 6:
+                launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 6>(
+                    vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
+                return true;
+            case 7:
+                launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 7>(
+                    vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
+                return true;
+            case 8:
+                launch_mul_mat_vec_q_reorder_glu<vec_dot_q8_0, 8>(
+                    vx, vgate, vy, dst, ncols, nrows, stride_col_y_bytes, stride_col_dst, glu_op, stream);
+                return true;
             default:
                 return false;
         }

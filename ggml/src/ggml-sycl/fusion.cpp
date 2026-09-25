@@ -61,8 +61,9 @@ static bool ggml_sycl_should_fuse_mul_mat_glu(const ggml_tensor * gate, const gg
     if (act->ne[1] > MMVQ_MAX_BATCH_SIZE) {
         return false;
     }
-    // the q8_0 reorder GLU kernel is instantiated for one and two columns
-    if (wu->type == GGML_TYPE_Q8_0 && act->ne[1] > 2) {
+    // the q8_0 reorder GLU kernel always serves one and two columns; 3..8 (MTP verification) are
+    // the same kernel template at more columns, behind their own bit
+    if (wu->type == GGML_TYPE_Q8_0 && act->ne[1] > 2 && !(g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_GLU_NCOLS)) {
         return false;
     }
 
