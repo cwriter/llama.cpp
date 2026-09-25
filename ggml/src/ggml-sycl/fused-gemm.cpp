@@ -1165,6 +1165,7 @@ static void fused_dequant_gemm_tile(
     float * __restrict__ dst,
     const int M, const int Npad, const int K, const int ldd,
     const int b0, const int n0, const int n1,
+    const ggml_sycl_gg_rows dst_rows,
     const bool diag_no_a, const bool diag_no_mad,
     sycl::local_accessor<sycl::half, 1> tile_a,
     sycl::local_accessor<float, 1> tile_c,
@@ -1470,7 +1471,13 @@ static void fused_dequant_gemm_tile(
                 for (int s = 0; s < FG_KSPLIT; ++s) {
                     sum += tile_c[s * C_ROWS * FG_BN + r * FG_BN + c];
                 }
-                dst[(size_t) n * ldd + m] = sum;
+                if (dst_rows.map) {
+                    // grouped: routed row n goes straight to its place in the MUL_MAT_ID dst
+                    const mmid_row_mapping rm = dst_rows.map[n];
+                    ((float *) (dst_rows.base + (rm.i1 % dst_rows.ne1) * dst_rows.nb1 + rm.i2 * dst_rows.nb2))[m] = sum;
+                } else {
+                    dst[(size_t) n * ldd + m] = sum;
+                }
             }
         }
     }
@@ -1490,7 +1497,7 @@ static void fused_dequant_gemm(
     // the plain path has at most two column groups, so its B re-read is already small: it keeps
     // the narrow M tile and the wide one is instantiated for the grouped path only
     fused_dequant_gemm_tile<block_q_t, reordered, FG_SG_ROWS, false, false, false, false, false, false, false>(x, packed_b, dst, M, Npad, K, ldd,
-                                                                            n0, n0, N, false, false, tile_a, tile_c, item);
+                                                                            n0, n0, N, ggml_sycl_gg_rows{}, false, false, tile_a, tile_c, item);
 }
 
 // grouped: work-group (t, mt) is tile t of the schedule. Its B columns sit at t * FG_BN in the
@@ -1505,6 +1512,7 @@ static void grouped_dequant_gemm(
     const sycl::half * __restrict__ packed_b,
     float * __restrict__ dst,
     const int M, const int Npad, const int K, const bool tight,
+    const ggml_sycl_gg_rows dst_rows,
     const bool diag_no_a, const bool diag_no_mad,
     sycl::local_accessor<sycl::half, 1> tile_a,
     sycl::local_accessor<float, 1> tile_c,
@@ -1521,7 +1529,7 @@ static void grouped_dequant_gemm(
     const block_q_t * x = (const block_q_t *) (src0_base + (size_t) tile.expert * expert_stride);
     fused_dequant_gemm_tile<block_q_t, reordered, SG_ROWS, STAGE_A, PIPELINE_A, REGS_A, REGS_LITE, BLK_A, GRID_SLM,
                             SPLIT_C>(x, packed_b, dst, M, Npad, K,
-                                                                               M, b0, tile.n0, tile.n1, diag_no_a, diag_no_mad, tile_a, tile_c, item);
+                                                                               M, b0, tile.n0, tile.n1, dst_rows, diag_no_a, diag_no_mad, tile_a, tile_c, item);
 }
 
 // A kernel functor instead of a lambda, so the GRF size can ride along as a kernel property:
@@ -1539,6 +1547,7 @@ struct grouped_dequant_gemm_kernel {
     int                                 Npad;
     int                                 K;
     bool                                tight;
+    ggml_sycl_gg_rows                   dst_rows;
     bool                                diag_no_a;
     bool                                diag_no_mad;
     sycl::local_accessor<sycl::half, 1> tile_a;
@@ -1548,7 +1557,7 @@ struct grouped_dequant_gemm_kernel {
     void operator()(sycl::nd_item<2> item) const {
         grouped_dequant_gemm<block_q_t, reordered, SG_ROWS, STAGE_A, PIPELINE_A, REGS_A, REGS_LITE, BLK_A, GRID_SLM,
                              SPLIT_C>(src0_dd, expert_stride,
-                                            tiles, packed, dst, M, Npad, K, tight, diag_no_a, diag_no_mad, tile_a, tile_c, item);
+                                            tiles, packed, dst, M, Npad, K, tight, dst_rows, diag_no_a, diag_no_mad, tile_a, tile_c, item);
     }
 
     auto get(syclexp::properties_tag) const {
@@ -1608,6 +1617,7 @@ template <typename block_q_t, bool reordered, int SG_ROWS, bool GRF256, bool STA
 static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t expert_stride,
                                         const ggml_sycl_gg_tile * tiles_ptr, const sycl::half * packed, float * dst,
                                         const int M, const int Npad, const int K, const bool tight,
+                                        const ggml_sycl_gg_rows dst_rows,
                                         const bool diag_no_a, const bool diag_no_mad,
                                         const int64_t n_tiles, const int64_t groups_m, dpct::queue_ptr stream) {
     constexpr int slm_x_floats = STAGE_A ? FG_KSPLIT * (fg_slm_x_region<block_q_t, SG_ROWS>() / 4) : 0;
@@ -1620,7 +1630,7 @@ static void grouped_dequant_gemm_launch(const char * src0_dd, const size_t exper
             sycl::nd_range<2>(sycl::range<2>(n_tiles, groups_m * FG_WG_SIZE), sycl::range<2>(1, FG_WG_SIZE)),
             grouped_dequant_gemm_kernel<block_q_t, reordered, SG_ROWS, GRF256, STAGE_A, PIPELINE_A, REGS_A,
                                         REGS_LITE, BLK_A, GRID_SLM, SPLIT_C>{
-                src0_dd, expert_stride, tiles_ptr, packed, dst, M, Npad, K, tight, diag_no_a, diag_no_mad, tile_a, tile_c });
+                src0_dd, expert_stride, tiles_ptr, packed, dst, M, Npad, K, tight, dst_rows, diag_no_a, diag_no_mad, tile_a, tile_c });
     });
 }
 
@@ -1666,6 +1676,41 @@ static void grouped_gemm_pack_b(const float * y, sycl::half * packed, const ggml
         sycl::half v1 = (sycl::half) 0.0f;
         if (row < tile.n1) {
             const float * src = y + (size_t) row * K + 2 * kp;
+            v0 = (sycl::half) src[0];
+            v1 = (sycl::half) src[1];
+        }
+        sycl::half * out = packed + ((size_t) kp * Npad + n) * 2;
+        out[0] = v0;
+        out[1] = v1;
+    });
+}
+
+// grouped_gemm_pack_b, but row n of B is read in place through the route map instead of from a
+// gathered copy; the packed values are the same
+static void grouped_gemm_pack_b_rows(const ggml_sycl_gg_rows & y, sycl::half * packed, const ggml_sycl_gg_tile * tiles,
+                                     int Npad, int K, int total_rows, bool tight, dpct::queue_ptr stream) {
+    const int                kpairs = K / 2;
+    const char *             base   = y.base;
+    const mmid_row_mapping * map    = y.map;
+    const int64_t            ne1    = y.ne1;
+    const size_t             nb1    = y.nb1;
+    const size_t             nb2    = y.nb2;
+    stream->parallel_for(sycl::range<1>((size_t) Npad * kpairs), [=](sycl::id<1> id) {
+        const size_t idx = id[0];
+        const int    kp  = idx / Npad;
+        const int    n   = idx - (size_t) kp * Npad;
+        int          row = n;
+        bool         in  = n < total_rows;
+        if (!tight) {
+            const ggml_sycl_gg_tile tile = tiles[n / FG_BN];
+            row = tile.n0 + n % FG_BN;
+            in  = row < tile.n1;
+        }
+        sycl::half v0 = (sycl::half) 0.0f;
+        sycl::half v1 = (sycl::half) 0.0f;
+        if (in) {
+            const mmid_row_mapping rm  = map[row];
+            const float *          src = (const float *) (base + (rm.i1 % ne1) * nb1 + rm.i2 * nb2) + 2 * kp;
             v0 = (sycl::half) src[0];
             v1 = (sycl::half) src[1];
         }
@@ -1904,6 +1949,7 @@ struct grouped_gemm_launcher {
     int                       Npad;
     int                       K;
     bool                      tight;
+    ggml_sycl_gg_rows         dst_rows;  // map null: dst is expert-major and contiguous
     int                       mrows;   // FG_SG_ROWS, FG_WIDE_ROWS or FG_HUGE_ROWS
     bool                      grf256;  // 32-row tile only; the 64-row one is always 256 GRF
     bool                      slm_a;   // stage the quantized A bytes through SLM; never on the 64-row tile
@@ -1924,7 +1970,7 @@ struct grouped_gemm_launcher {
     void launch_c() const {
         grouped_dequant_gemm_launch<block_q_t, reordered, SG_ROWS, GRF256, STAGE_A, PIPELINE_A, REGS_A,
                                     REGS_LITE, BLK_A, GRID_SLM, SPLIT_C>(
-            src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, tight, diag_no_a, diag_no_mad,
+            src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, tight, dst_rows, diag_no_a, diag_no_mad,
             n_tiles, groups_m, stream);
     }
 
@@ -2137,6 +2183,7 @@ bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_b
     const grouped_gemm_launcher launcher{ (const char *) src0_base, expert_stride, tiles_dev.get(),
                                           packed_b.get(),           dst,           (int) M,
                                           Npad,                     (int) K,       tight,
+                                          ggml_sycl_gg_rows{},
                                           mrows,                    fg_grf256(),   slm_a,
                                           fg_pipeline_a(mrows, slm_a, regs_a, regs_lite_a), regs_a,
                                           regs_lite_a,              fg_blk_a(regs_a, regs_lite_a),
@@ -2285,7 +2332,8 @@ bool ggml_sycl_grouped_dequant_gemm_f16_dev_ok(ggml_type src0_type, int64_t M, i
 }
 
 bool ggml_sycl_grouped_dequant_gemm_f16_dev(ggml_type src0_type, const void * src0_base, size_t expert_stride,
-                                            const float * src1, float * dst, const ggml_sycl_gg_tile * tiles_dev,
+                                            const ggml_sycl_gg_rows & src1, const ggml_sycl_gg_rows & dst,
+                                            const ggml_sycl_gg_tile * tiles_dev,
                                             int64_t n_tiles_max, int64_t M, int64_t K, int64_t total_rows,
                                             bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
     // the SoA offsets are derived from the slice block count, so a slice must be exactly that
@@ -2307,14 +2355,15 @@ bool ggml_sycl_grouped_dequant_gemm_f16_dev(ggml_type src0_type, const void * sr
     const int     Npad     = (int) (tight ? ggml_sycl_grouped_gemm_tight_npad(total_rows) : n_tiles_max * FG_BN);
 
     ggml_sycl_pool_alloc<sycl::half> packed_b(pool, grouped_gemm_packed_capacity((size_t) K * Npad));
-    grouped_gemm_pack_b(src1, packed_b.get(), tiles_dev, Npad, (int) K, (int) total_rows, tight, stream);
+    grouped_gemm_pack_b_rows(src1, packed_b.get(), tiles_dev, Npad, (int) K, (int) total_rows, tight, stream);
 
     const bool slm_a       = fg_slm_a(mrows);
     const bool regs_a      = fg_regs_a(mrows, slm_a, reordered);
     const bool regs_lite_a = fg_regs_lite_a(mrows, slm_a, regs_a, reordered);
     const grouped_gemm_launcher launcher{ (const char *) src0_base, expert_stride, tiles_dev,
-                                          packed_b.get(),           dst,           (int) M,
+                                          packed_b.get(),           nullptr,       (int) M,
                                           Npad,                     (int) K,       tight,
+                                          dst,
                                           mrows,                    fg_grf256(),   slm_a,
                                           fg_pipeline_a(mrows, slm_a, regs_a, regs_lite_a), regs_a,
                                           regs_lite_a,              fg_blk_a(regs_a, regs_lite_a),
