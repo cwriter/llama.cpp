@@ -411,9 +411,11 @@ static void unary_gated_op_generic_kernel(
     }
 }
 
-// Fused UNARY + MUL. Unlike the gated ops above, `x` and `g` are separate tensors of the
-// same shape; `o0`/`o1` are their row strides in elements, so a half-view needs no repack.
-// `dst` is contiguous and indexed flat. Math is done in f32, as the CPU and CUDA references do.
+// Fused UNARY + MUL. Unlike the gated ops above, `x` and `g` are separate tensors; `o0`/`o1`
+// are their row strides in elements, so a half-view needs no repack. `c0` is the column stride
+// of `x`: 1 when it has a value per column, 0 when it has one value per row that the MUL
+// broadcasts over the row. `dst` is contiguous and indexed flat. Math is done in f32, as the
+// CPU and CUDA references do.
 template<typename T, typename F>
 static void unary_mul_flat_kernel(const T * x, const T * g, T * dst, const int64_t k, const sycl::nd_item<1> &item_ct1, F op) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
@@ -422,22 +424,22 @@ static void unary_mul_flat_kernel(const T * x, const T * g, T * dst, const int64
 }
 
 template<typename T, typename F>
-static void unary_mul_strided_kernel(const T * x, const T * g, T * dst, const int64_t k, const sycl::uint3 n_fd, const int64_t o0, const int64_t o1, const sycl::nd_item<1> &item_ct1, F op) {
+static void unary_mul_strided_kernel(const T * x, const T * g, T * dst, const int64_t k, const sycl::uint3 n_fd, const int64_t o0, const int64_t o1, const int64_t c0, const sycl::nd_item<1> &item_ct1, F op) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
         const sycl::uint2 rc = fast_div_modulo((uint32_t) i, n_fd);
-        const int64_t j0 = rc.x() * o0 + rc.y();
-        const int64_t j1 = o0 == o1 ? j0 : rc.x() * o1 + rc.y();
+        const int64_t j0 = rc.x() * o0 + rc.y() * c0;
+        const int64_t j1 = (o0 == o1 && c0 == 1) ? j0 : rc.x() * o1 + rc.y();
         dst[i] = (T) (op((float) x[j0]) * (float) g[j1]);
     }
 }
 
 template<typename T, typename F>
-static void unary_mul_sycl(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, queue_ptr main_stream, F op) {
+static void unary_mul_sycl(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const int64_t c0, queue_ptr main_stream, F op) {
     const size_t            num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
     const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
 
     // o0 == o1 == n makes (i/n)*o0 + (i%n) == i, so the strided kernel degenerates to the flat one
-    if (o0 == n && o1 == n) {
+    if (c0 == 1 && o0 == n && o1 == n) {
         main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             unary_mul_flat_kernel(x, g, dst, k, item_ct1, op);
         });
@@ -448,7 +450,7 @@ static void unary_mul_sycl(const T * x, const T * g, T * dst, const int64_t k, c
     GGML_ASSERT(k < ((int64_t) 1 << 31));
     const sycl::uint3 n_fd = init_fastdiv_values((uint32_t) n);
     main_stream->parallel_for(range, [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-        unary_mul_strided_kernel(x, g, dst, k, n_fd, o0, o1, item_ct1, op);
+        unary_mul_strided_kernel(x, g, dst, k, n_fd, o0, o1, c0, item_ct1, op);
     });
 }
 
@@ -1059,7 +1061,11 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     // g is picked by elimination; ggml_can_fuse()'s single-use rule rules out MUL(unary, unary)
     GGML_ASSERT(g != unary_node);
     GGML_ASSERT(x->type == g->type && x->type == mul_node->type);
-    GGML_ASSERT(ggml_are_same_shape(x, g) && ggml_are_same_shape(x, mul_node));
+    // the unary side either matches the MUL column for column, or holds one value per row that
+    // the MUL broadcasts; ggml_sycl_can_fuse() accepts nothing else
+    const bool bcast_row = x->ne[0] == 1 && mul_node->ne[0] != 1;
+    GGML_ASSERT(bcast_row || ggml_are_same_shape(x, g));
+    GGML_ASSERT(ggml_are_same_shape(g, mul_node));
     GGML_ASSERT(ggml_is_contiguous_1(x) && ggml_is_contiguous_1(g));
     // dst is indexed flat
     GGML_ASSERT(ggml_is_contiguous(mul_node));
@@ -1067,18 +1073,19 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     queue_ptr main_stream = ctx.stream();
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
-    const int64_t k = ggml_nelements(mul_node);
-    const int64_t n = mul_node->ne[0];
+    const int64_t k  = ggml_nelements(mul_node);
+    const int64_t n  = mul_node->ne[0];
+    const int64_t c0 = bcast_row ? 0 : 1;
 
     const auto dispatch_type = [&](auto op) {
         switch (mul_node->type) {
             case GGML_TYPE_F32:
                 unary_mul_sycl((const float *) x->data, (const float *) g->data, (float *) mul_node->data,
-                               k, n, x->nb[1] / sizeof(float), g->nb[1] / sizeof(float), main_stream, op);
+                               k, n, x->nb[1] / sizeof(float), g->nb[1] / sizeof(float), c0, main_stream, op);
                 break;
             case GGML_TYPE_F16:
                 unary_mul_sycl((const sycl::half *) x->data, (const sycl::half *) g->data, (sycl::half *) mul_node->data,
-                               k, n, x->nb[1] / sizeof(sycl::half), g->nb[1] / sizeof(sycl::half), main_stream, op);
+                               k, n, x->nb[1] / sizeof(sycl::half), g->nb[1] / sizeof(sycl::half), c0, main_stream, op);
                 break;
             default:
                 GGML_ABORT("fused unary+mul: unsupported type %s", ggml_type_name(mul_node->type));
