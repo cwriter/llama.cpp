@@ -571,8 +571,16 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     res->add_input(std::move(inp));
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
+
+    // A decode with no outputs is the speculative catch-up over the verified tokens: its only
+    // lasting effect is this block's K/V in the draft cache. The draft's next hidden state comes
+    // from the target, and with the h_nextn export masked no row of it is read back. So build
+    // just what reaches the cache, as DFlash's KV-injection pass does, instead of the query,
+    // attention, output projection, FFN and LM head for zero rows (and a sampler on a dummy row).
+    const bool kv_only = n_outputs == 0;
+
+    ggml_tensor * inp_out_ids = kv_only ? nullptr : build_inp_out_ids();
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -603,6 +611,37 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     const int64_t n_embd_head = hparams.n_embd_head_v();
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
+
+    if (kv_only) {
+        // the same K/V nodes as below, stored the way build_attn() stores them
+        ggml_tensor * Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+        Kcur = build_norm(Kcur, layer.attn_k_norm, nullptr, LLM_NORM_RMS, il);
+        cb(Kcur, "mtp_Kcur_normed", il);
+
+        ggml_tensor * Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+        cb(Vcur, "mtp_Vcur", il);
+
+        Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        cb(Kcur, "mtp_Kcur", il);
+
+        if (inp_attn->self_k_rot) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+        }
+        if (inp_attn->self_v_rot) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+        }
+
+        // v before k, as build_attn() expands them, so a rope + store fusion still sees its pair
+        ggml_build_forward_expand(gf, Vcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        return;
+    }
 
     ggml_tensor * Qcur_full = build_lora_mm(layer.wq, cur, layer.wq_s);
     cb(Qcur_full, "mtp_Qcur_full", il);
