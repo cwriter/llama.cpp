@@ -395,3 +395,136 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 
     return false;
 }
+
+// The shared-expert gate is one sigmoided scalar per token multiplied over the whole expert
+// output, so the MUL is wider than the unary and ggml_can_fuse() declines the pair on shape.
+// Match it here instead: the unary keeps one value per row and the fused kernel reads it with
+// a zero column stride.
+bool ggml_sycl_can_fuse_unary_mul_bcast(const ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !(g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_UNARY_MUL_B)) {
+        return false;
+    }
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * unary = cgraph->nodes[node_idx];
+    const ggml_tensor * mul   = cgraph->nodes[node_idx + 1];
+
+    if (unary->op != GGML_OP_UNARY || mul->op != GGML_OP_MUL) {
+        return false;
+    }
+    // the compute loop skips an empty node without fusing, so never report one as absorbed
+    if (ggml_is_empty(unary) || ggml_is_empty(mul)) {
+        return false;
+    }
+
+    // the ops ggml_sycl_op_unary_mul_fused() has a kernel for
+    const ggml_unary_op unary_op = ggml_get_unary_op(unary);
+    if (unary_op != GGML_UNARY_OP_SILU && unary_op != GGML_UNARY_OP_SIGMOID &&
+        unary_op != GGML_UNARY_OP_SOFTPLUS) {
+        return false;
+    }
+
+    // the subgraph form drops the same-shape rule that blocks the pair, and still requires the
+    // unary to be used only by the MUL, so skipping it cannot strand another reader
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, { GGML_OP_UNARY, GGML_OP_MUL }, { node_idx + 1 })) {
+        return false;
+    }
+    if (unary->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+
+    if (mul->src[0] != unary && mul->src[1] != unary) {
+        return false;
+    }
+    const ggml_tensor * other = (mul->src[0] == unary) ? mul->src[1] : mul->src[0];
+    if (other == unary) {
+        return false;
+    }
+
+    if (unary->type != GGML_TYPE_F32 && unary->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (other->type != unary->type || mul->type != unary->type) {
+        return false;
+    }
+
+    // one value per row on the unary side, and the MUL as wide as the other operand
+    const ggml_tensor * x = unary->src[0];
+    if (x->type != unary->type || !ggml_are_same_shape(x, unary)) {
+        return false;
+    }
+    if (unary->ne[0] != 1 || mul->ne[0] == 1) {
+        return false;
+    }
+    if (!ggml_are_same_shape(other, mul)) {
+        return false;
+    }
+    // the kernel folds rows and columns into one flat index, so keep it to 2D
+    if (unary->ne[2] != 1 || unary->ne[3] != 1 || mul->ne[2] != 1 || mul->ne[3] != 1) {
+        return false;
+    }
+    if (unary->ne[1] != mul->ne[1]) {
+        return false;
+    }
+
+    // one row stride per source comes from nb[1]; dst is written flat
+    if (!ggml_is_contiguous(x) || !ggml_is_contiguous_1(other) || !ggml_is_contiguous(mul)) {
+        return false;
+    }
+
+    // the 32-bit fastdiv is inexact past 2^31; decline, the unfused path handles it
+    if (ggml_nelements(mul) >= ((int64_t) 1 << 31)) {
+        return false;
+    }
+
+    return true;
+}
+
+// build_gdn_l2_norm() is ggml_scale(ggml_rms_norm(x, eps/n), 1/sqrt(n)), so every GDN q and k
+// norm costs two launches. The scale is a plain affine map over the norm output, so it folds
+// into the store loop without changing the order of the two roundings.
+bool ggml_sycl_can_fuse_rms_norm_scale(const ggml_cgraph * cgraph, int node_idx) {
+    if (!g_ggml_sycl_enable_fusion || !(g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_NORM_SCALE)) {
+        return false;
+    }
+    if (node_idx + 1 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    const ggml_tensor * norm  = cgraph->nodes[node_idx];
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+
+    if (norm->op != GGML_OP_RMS_NORM || scale->op != GGML_OP_SCALE) {
+        return false;
+    }
+    // the compute loop skips an empty node without fusing, so never report one as absorbed
+    if (ggml_is_empty(norm) || ggml_is_empty(scale)) {
+        return false;
+    }
+    // same shape, adjacent, and the norm used only by the scale
+    if (!ggml_can_fuse(cgraph, node_idx, { GGML_OP_RMS_NORM, GGML_OP_SCALE })) {
+        return false;
+    }
+    if (norm->flags & GGML_TENSOR_FLAG_OUTPUT) {
+        return false;
+    }
+    if (scale->src[0] != norm) {
+        return false;
+    }
+
+    const ggml_tensor * x = norm->src[0];
+    if (x->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the fused kernel walks x with x's own strides and writes the scale output directly
+    if (!ggml_are_same_shape(x, scale)) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(x) || !ggml_is_contiguous_rows(scale)) {
+        return false;
+    }
+
+    return true;
+}

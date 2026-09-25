@@ -3450,7 +3450,14 @@ static void launch_mul_mat_vec_q_moe_ordered(
 template <int qk, int qi, typename block_q_t, int vdr, vec_dot_q_sycl_t vec_dot_q_sycl>
 [[sycl::reqd_sub_group_size(WARP_SIZE)]]
 static void mul_mat_vec_q_moe(
-    const ggml_sycl_mmvq_moe_multi mats,
+    // one pointer pair per fused weight, as separate scalar arguments: a runtime index into a
+    // by-value struct argument makes the compiler keep the struct in private memory
+    const void * vx_base0,
+    const void * vx_base1,
+    const void * vx_base2,
+    float *      dst_base0,
+    float *      dst_base1,
+    float *      dst_base2,
     const void * __restrict__ vy_base,
     const int32_t * __restrict__ ids_dev,
     const int ncols,
@@ -3495,9 +3502,13 @@ static void mul_mat_vec_q_moe(
     }
     const int32_t i02 = sycl::group_broadcast(sg, tmp_id, 0);
 
-    const char * vx  = (const char *) mats.vx_base[mat_idx] + (size_t) i02 * expert_weight_stride;
+    static_assert(GGML_SYCL_MMVQ_MULTI_MAX == 3, "one vx_base/dst_base argument pair per fused weight");
+    const void * vx_base  = mat_idx == 1 ? vx_base1 : mat_idx == 2 ? vx_base2 : vx_base0;
+    float *      dst_base = mat_idx == 1 ? dst_base1 : mat_idx == 2 ? dst_base2 : dst_base0;
+
+    const char * vx  = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
     const char * vy  = (const char *) vy_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride;
-    float *      dst = (float *) ((char *) mats.dst_base[mat_idx] + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+    float *      dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
 
     const int blocks_per_row = ncols / qk;
     constexpr int blocks_per_warp = (vdr * WARP_SIZE + qi - 1) / qi;
@@ -3572,6 +3583,14 @@ static void launch_mul_mat_vec_q_moe(
         mats.n_mats      = 1;
     }
 
+    // capture one scalar per pointer, so the kernel gets scalar arguments instead of a struct
+    const void * vx_base0  = mats.vx_base[0];
+    const void * vx_base1  = mats.vx_base[1];
+    const void * vx_base2  = mats.vx_base[2];
+    float *      dst_base0 = mats.dst_base[0];
+    float *      dst_base1 = mats.dst_base[1];
+    float *      dst_base2 = mats.dst_base[2];
+
     constexpr int rows_per_wg = 8; // Process 8 rows per work-group for high occupancy
     const int block_num_y     = (nrows + rows_per_wg - 1) / rows_per_wg;
     const int total_wgs       = mats.n_mats * n_tokens * n_experts_used * block_num_y;
@@ -3583,7 +3602,7 @@ static void launch_mul_mat_vec_q_moe(
         sycl::nd_range<1>(global_range, local_range),
         [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
             mul_mat_vec_q_moe<qk, qi, block_q_t, vdr, vec_dot_q_sycl>(
-                mats, vy, ids_dev,
+                vx_base0, vx_base1, vx_base2, dst_base0, dst_base1, dst_base2, vy, ids_dev,
                 ncols, nrows, block_num_y, n_experts_used, n_tokens,
                 expert_weight_stride, dst_row_stride, src1_row_stride,
                 ids_token_stride, dst_token_stride, src1_token_stride,
@@ -4313,9 +4332,29 @@ bool ggml_sycl_mul_mat_vec_q_glu_reorder(enum ggml_type src0_type, enum ggml_glu
 // rows, and each sub-group maps its row back to (weight, row within that weight). Unlike the
 // GLU fusion above, each weight keeps its own destination, so the row counts may differ.
 template <typename reorder_vec_dot_q_sycl, int ncols_dst>
-static void mul_mat_vec_q_reorder_multi(const ggml_sycl_mmvq_multi mats, const void * __restrict__ vy,
-                                        const int ncols, const int stride_col_y_bytes,
-                                        const sycl::nd_item<3> & nd_item) {
+static void mul_mat_vec_q_reorder_multi(
+    // one descriptor set per fused weight, as separate scalar arguments: a runtime index into a
+    // by-value struct argument makes the compiler keep the struct in private memory
+    const void * vx0,
+    const void * vx1,
+    const void * vx2,
+    float *      dst0,
+    float *      dst1,
+    float *      dst2,
+    const int    nrows0,
+    const int    nrows1,
+    const int    nrows2,
+    const int    row_begin0,
+    const int    row_begin1,
+    const int    row_begin2,
+    const int    stride_col_dst0,
+    const int    stride_col_dst1,
+    const int    stride_col_dst2,
+    const int    n_mats,
+    const int    nrows_total,
+    const void * __restrict__ vy,
+    const int ncols, const int stride_col_y_bytes,
+    const sycl::nd_item<3> & nd_item) {
     using block_type   = ggml_sycl_reordered::block_q_t<reorder_vec_dot_q_sycl::gtype>;
     using block_traits = typename block_type::traits;
 
@@ -4324,19 +4363,26 @@ static void mul_mat_vec_q_reorder_multi(const ggml_sycl_mmvq_multi mats, const v
 
     // global_row is sub-group uniform, so this retires whole sub-groups and the reduction
     // below stays convergent
-    if (global_row >= mats.nrows_total) {
+    if (global_row >= nrows_total) {
         return;
     }
 
+    static_assert(GGML_SYCL_MMVQ_MULTI_MAX == 3, "one scalar argument set per fused weight");
+
     int mat = 0;
-#pragma unroll
-    for (int m = 1; m < GGML_SYCL_MMVQ_MULTI_MAX; ++m) {
-        mat = (m < mats.n_mats && global_row >= mats.row_begin[m]) ? m : mat;
+    if (n_mats > 1 && global_row >= row_begin1) {
+        mat = 1;
+    }
+    if (n_mats > 2 && global_row >= row_begin2) {
+        mat = 2;
     }
 
-    const void * vx    = mats.vx[mat];
-    const int    nrows = mats.nrows[mat];
-    const int    row   = global_row - mats.row_begin[mat];
+    const void * vx             = mat == 1 ? vx1 : mat == 2 ? vx2 : vx0;
+    float *      dst            = mat == 1 ? dst1 : mat == 2 ? dst2 : dst0;
+    const int    nrows          = mat == 1 ? nrows1 : mat == 2 ? nrows2 : nrows0;
+    const int    row_begin      = mat == 1 ? row_begin1 : mat == 2 ? row_begin2 : row_begin0;
+    const int    stride_col_dst = mat == 1 ? stride_col_dst1 : mat == 2 ? stride_col_dst2 : stride_col_dst0;
+    const int    row            = global_row - row_begin;
 
     const int     blocks_per_row              = ncols / block_traits::qk;
     constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
@@ -4373,7 +4419,7 @@ static void mul_mat_vec_q_reorder_multi(const ggml_sycl_mmvq_multi mats, const v
         const float sum = sycl::reduce_over_group(sg, partial_sum[j], std::plus<>());
 
         if (sg.leader()) {
-            mats.dst[mat][j * mats.stride_col_dst[mat] + row] = sum;
+            dst[j * stride_col_dst + row] = sum;
         }
     }
 }
@@ -4387,11 +4433,33 @@ static void launch_mul_mat_vec_q_reorder_multi(const ggml_sycl_mmvq_multi & mats
     const sycl::range<3> block_nums(1, 1, block_num_y);
     const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
+    // capture one scalar per field, so the kernel gets scalar arguments instead of a struct
+    const void * vx0             = mats.vx[0];
+    const void * vx1             = mats.vx[1];
+    const void * vx2             = mats.vx[2];
+    float *      dst0            = mats.dst[0];
+    float *      dst1            = mats.dst[1];
+    float *      dst2            = mats.dst[2];
+    const int    nrows0          = mats.nrows[0];
+    const int    nrows1          = mats.nrows[1];
+    const int    nrows2          = mats.nrows[2];
+    const int    row_begin0      = mats.row_begin[0];
+    const int    row_begin1      = mats.row_begin[1];
+    const int    row_begin2      = mats.row_begin[2];
+    const int    stride_col_dst0 = mats.stride_col_dst[0];
+    const int    stride_col_dst1 = mats.stride_col_dst[1];
+    const int    stride_col_dst2 = mats.stride_col_dst[2];
+    const int    n_mats          = mats.n_mats;
+    const int    nrows_total     = mats.nrows_total;
+
     stream->submit([&](sycl::handler & cgh) {
         cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
                          [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
                              mul_mat_vec_q_reorder_multi<reorder_vec_dot_q_sycl, ncols_dst>(
-                                 mats, vy, ncols, stride_col_y_bytes, nd_item);
+                                 vx0, vx1, vx2, dst0, dst1, dst2, nrows0, nrows1, nrows2,
+                                 row_begin0, row_begin1, row_begin2,
+                                 stride_col_dst0, stride_col_dst1, stride_col_dst2,
+                                 n_mats, nrows_total, vy, ncols, stride_col_y_bytes, nd_item);
                          });
     });
 }

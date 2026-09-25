@@ -14,4 +14,13 @@
 bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializer_list<enum ggml_op> ops,
                         std::initializer_list<enum ggml_unary_op> unary_ops);
 
+// UNARY at `node_idx` feeding a MUL that broadcasts it over the row: the unary side has one
+// value per row (ne0 == 1) and the MUL is wider. ggml_can_fuse() cannot express this - it
+// requires every node in the run to have the same shape - so this is its own matcher.
+// Purely structural, so ggml_backend_sycl_fusion_absorbs() can ask it at allocation time.
+bool ggml_sycl_can_fuse_unary_mul_bcast(const ggml_cgraph * cgraph, int node_idx);
+
+// RMS_NORM at `node_idx` feeding a SCALE that exists only to finish an L2 norm.
+bool ggml_sycl_can_fuse_rms_norm_scale(const ggml_cgraph * cgraph, int node_idx);
+
 #endif  // GGML_SYCL_FUSION_HPP
