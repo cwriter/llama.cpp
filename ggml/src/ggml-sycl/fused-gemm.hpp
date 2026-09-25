@@ -3,6 +3,15 @@
 
 #include "common.hpp"
 
+// A grouped GEMM operand addressed in place: routed row n is at
+// base + (map[n].i1 % ne1)*nb1 + map[n].i2*nb2, so no expert-major copy of it is staged
+struct ggml_sycl_gg_rows {
+    char *                   base;
+    const mmid_row_mapping * map;
+    int64_t                  ne1;
+    size_t                   nb1;
+    size_t                   nb2;
+};
 
 // Shape and type gates, shared by the kernels below and by the graph compatibility check, so
 // the two cannot drift. Device capability is separate: it needs a queue to ask.
@@ -167,8 +176,10 @@ bool ggml_sycl_grouped_dequant_gemm_f16_dev_ok(ggml_type src0_type, int64_t M, i
 // bounded by n_tiles_max and the empty tiles exit early.
 // Npad is derived from n_tiles_max ONCE here and is the packed-B column stride for both the pack
 // and the GEMM; the two must never be given different values.
+// src1 is read and dst written through their row maps, so the caller stages no expert-major copies.
 bool ggml_sycl_grouped_dequant_gemm_f16_dev(ggml_type src0_type, const void * src0_base, size_t expert_stride,
-                                            const float * src1, float * dst, const ggml_sycl_gg_tile * tiles_dev,
+                                            const ggml_sycl_gg_rows & src1, const ggml_sycl_gg_rows & dst,
+                                            const ggml_sycl_gg_tile * tiles_dev,
                                             int64_t n_tiles_max, int64_t M, int64_t K, int64_t total_rows,
                                             bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
