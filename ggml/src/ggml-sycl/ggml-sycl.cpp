@@ -5834,6 +5834,7 @@ static void mmid_counting_sort_rows(
 // staging buffers live on the context, and this arm must not be able to reach them.
 static bool ggml_sycl_mul_mat_id_device_sched(ggml_sycl_pool & pool, queue_ptr stream,
                                               unsigned int max_work_group_size, ggml_tensor * dst) {
+    GGML_UNUSED(max_work_group_size);
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -5888,44 +5889,16 @@ static bool ggml_sycl_mul_mat_id_device_sched(ggml_sycl_pool & pool, queue_ptr s
         return false;
     }
 
-    ggml_sycl_pool_alloc<char> src1_contiguous(pool, sizeof(float) * n_routed_rows * ne10);
-    ggml_sycl_pool_alloc<char>  dst_contiguous(pool, sizeof(float) * n_routed_rows * ne0);
-
-    {
-        sycl::range<3> block_dims(1, 1, std::min((unsigned int) ne10, max_work_group_size));
-        sycl::range<3> grid_dims(1, 1, n_routed_rows);
-        stream->submit([&](sycl::handler & cgh) {
-            const char *__restrict src1_original     = (const char *) src1->data;
-            char *__restrict       src1_contiguous_get = src1_contiguous.get();
-            const mmid_row_mapping *__restrict row_mapping_get = row_mapping.get();
-            cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                             [=](sycl::nd_item<3> item_ct1) {
-                                 k_copy_src1_to_contiguous(src1_original, src1_contiguous_get, row_mapping_get,
-                                                           ne11, ne10, nb11, nb12, item_ct1);
-                             });
-        });
-    }
+    // the B pack reads src1 and the GEMM writes dst through the route map, so neither is staged
+    // in an expert-major copy
+    const ggml_sycl_gg_rows src1_rows = { (char *) src1->data, row_mapping.get(), ne11, nb11, nb12 };
+    const ggml_sycl_gg_rows dst_rows  = { (char *) dst->data, row_mapping.get(), dst->ne[1], nb1, nb2 };
 
     // the type and device gates above are the whole decision, so this cannot decline here
     const bool launched = ggml_sycl_grouped_dequant_gemm_f16_dev(
-        src0->type, src0->data, nb02, (const float *) src1_contiguous.get(), (float *) dst_contiguous.get(),
+        src0->type, src0->data, nb02, src1_rows, dst_rows,
         tiles.get(), n_tiles_max, ne01, ne10, n_routed_rows, reordered, pool, stream);
     GGML_ASSERT(launched && "device-scheduled grouped GEMM declined after its gate passed");
-
-    {
-        sycl::range<3> block_dims(1, 1, std::min((unsigned int) ne0, max_work_group_size));
-        sycl::range<3> grid_dims(1, 1, n_routed_rows);
-        stream->submit([&](sycl::handler & cgh) {
-            char *__restrict       dst_original       = (char *) dst->data;
-            const char *__restrict dst_contiguous_get = dst_contiguous.get();
-            const mmid_row_mapping *__restrict row_mapping_get = row_mapping.get();
-            cgh.parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                             [=](sycl::nd_item<3> item_ct1) {
-                                 k_copy_dst_from_contiguous(dst_original, dst_contiguous_get, row_mapping_get,
-                                                            ne0, nb1, nb2, item_ct1);
-                             });
-        });
-    }
     return true;
 }
 
