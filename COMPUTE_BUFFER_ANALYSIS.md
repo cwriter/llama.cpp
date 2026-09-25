@@ -633,3 +633,664 @@ on. Measured same-arm floor: 2/5 prompts identical off vs off, 3/5 on vs on, sim
 `test-backend-ops test -b SYCL0`: same failure set in both arms - the 18 known pre-existing
 (16 CONV_2D, 1 FLASH_ATTN_EXT, 1 ROLL). The extras that showed up on one side only
 (ADD_ADD f16, two CPY, one MUL_MAT_ID q5_0) all pass in isolation, three runs per arm.
+
+---
+
+# Update 2026-09-19 (2): the QSA mask chain fusion - bit-exact, 0 MiB, +12% prefill
+
+Built as a SYCL backend fusion, flag-gated `GGML_SYCL_FUSE_QSA_MASK`, default OFF. New files
+`ggml/src/ggml-sycl/qsa-mask.{cpp,hpp}`. No model-graph change.
+
+## What it matches
+
+`qwen4exp.cpp:732-758` emits five CONTIGUOUS nodes per QSA layer:
+
+```
+i    FILL      [n_kv, n_tps, 1, n_stream] -inf, src0 = the kq mask copy   <- absorbed
+i+1  VIEW      the same tensor as rows of one cell
+i+2  SET_ROWS  writes 0.0f at the top-k cells (itself a VIEW of the FILL)
+i+3  VIEW      back to the mask shape
+i+4  ADD       + kq_mask = the only node of the chain that keeps a buffer
+```
+
+The set_rows payload is a sixth node, a FILL of zeros, and it is NOT adjacent: the graph emits
+it exactly 53 nodes earlier (node_5054 against node_5107 for layer 35, and the same gap in
+every layer). That is plain DFS order, not a reordering pass. `ggml_visit_parents` takes
+SET_ROWS src[0], the zeros, first; then src[1], the top-k index view, which drags the whole
+indexer tail (score GEMM, relu, gather, TOP_K, CONT) into the graph before it ever reaches
+src[2] and the mask FILL. The matcher therefore anchors on the mask FILL and reaches the zeros
+through `src[]`, never by node index. A matcher that assumed the seven nodes were contiguous
+matched in a standalone harness, where `top_k` is an input leaf, and never fired in the model.
+
+Since `-inf + x == -inf` and `0 + x == x`, the chain is exactly
+`out[c, t] = selected(c, t) ? kq_mask[c, t] : -inf`, which one fill plus one scatter writes
+straight into the ADD's buffer.
+
+## Worth 0 MiB, because the FILL's buffer already IS the final mask
+
+`ggml_set_rows` returns a VIEW of its `a` argument, so SET_ROWS never had a buffer. And with
+the inplace-over-view fix on, ggml-alloc gives the ADD the FILL's buffer. The chain therefore
+materialises exactly ONE 256 MiB tensor in either arm, and that tensor is the mask flash
+attention reads. `GGML_ALLOC_INPLACE_DEBUG=1`, flag off:
+
+```
+[INPL] node_575 (256 MiB) parent (view)(view)(view): n_children=1 n_views=0 is_view=1
+[INPL]   view_src node_571: n_children=0 n_views=1 same_data=1
+```
+
+By the time the ADD is allocated the three views of the FILL have all been released, so
+`n_views` is 1 and `n_children` is 0 and the branch fires. Nothing is allocated or freed
+between the FILL and the ADD, so the allocator hands the ADD the same offset, and the ladder
+is identical except for the name on one line:
+
+```
+off:  869.85 <- node_571  (256.00 MiB) op=FILL ne=[131072,1024] src0=SYCL0#attn_inp_kq_mask#0
+on:   869.85 <- node_575  (256.00 MiB) op=ADD  ne=[131072,1024] src0=(view)(view)(view)
+both: 1173.85 <- node_576 (304.00 MiB) op=FLASH_ATTN_EXT
+```
+
+Measured both arms, three devices, `GGML_ALLOC_INPLACE_VIEWS=1 FUSE_QSA_GATHER=1
+FUSE_QSA_TOPK=1 FUSE_QSA_SCORE=1 SPARSE_FA=0`: 1173.85 / 1181.10 / 1181.10 in BOTH arms.
+The fusion needs no pool buffer, so net VRAM is 0 as well.
+
+## It is worth exactly 256 MiB when the allocator fix is off
+
+Same binary, same arms, `GGML_ALLOC_INPLACE_VIEWS=0`:
+
+| | SYCL0 | SYCL1 | SYCL2 |
+|---|---|---|---|
+| off | 1125.85 | 1133.10 | 1133.10 |
+| on  |  869.85 |  877.10 |  877.10 |
+
+Exactly -256.00 MiB on all three. The fusion and the allocator's inplace-over-view fix are two
+routes to the same 256 MiB and they do not stack. The allocator fix got there first.
+
+## CORRECTION to "The real remaining wall"
+
+That section reads the ladder as "560 MiB of wall, FILL 256 plus FLASH_ATTN_EXT 304". The
+FILL's 256 MiB is not a redundant copy a fusion can delete: it is the mask itself, under the
+name of whichever node happens to allocate it. The wall is 304 MiB of FA output plus 256 MiB
+of irreducible mask, and no rearrangement of the chain touches the second number.
+
+Removing it needs flash attention to stop reading a dense [n_kv, n_tps] mask:
+- absorb the whole chain INCLUDING the ADD and hand the FA kernel `kq_mask` plus the `top_k`
+  list. `GGML_SYCL_SPARSE_FA` already passes a sparsity hint but still reads the dense mask,
+  which is why it does not change the reserve;
+- or the bitfield mask candidate, which shrinks the graph input as well.
+
+The matcher in `qsa-mask.cpp` is most of the plumbing for the first option.
+
+## Where it does pay: prefill throughput
+
+The unfused chain moves about 4x the bytes the fused one does: FILL writes the mask, then ADD
+reads two masks and writes a third. Four arms under a GPU mutex, order on/off/off/on so that
+page-cache warming cannot favour one side:
+
+| | off | off | on | on |
+|---|---|---|---|---|
+| prefill 15k   | 333.03 | 332.74 | 374.99 | 373.86 |
+| prefill 63.7k | 159.57 | 159.55 | 169.51 | 169.21 |
+| decode short  | 23.68/23.75 | 23.68/23.65 | 23.70/23.70 | 23.69/23.68 |
+| decode 15k    | 19.89 | 19.84 | 19.83 | 19.85 |
+| decode 63.7k  | 13.14 | 13.15 | 12.99 | 13.01 |
+
++12.4% prefill at 15k and +6.2% at 63.7k, with under 0.4% spread inside each arm. Decode is
+flat, except 63.7k which is 1.1% down and consistently so - small, but the sign does not vary.
+
+These absolute numbers are much lower than the 468 / 410 baseline recorded above because the
+tree carried another in-flight change to the SYCL flash attention at the time. The A/B is
+sound: every arm ran on one binary, alone on the GPUs under the lock.
+
+## Correctness
+
+Standalone check through `ggml_backend_sched` on 9 shapes (production 131072 x 16 x 2051,
+decode n_tps = 1, n_stream 2 and 3, f16 and f32 masks, duplicate indices, and rows where the
+top-k picks cells the causal mask already dropped): zero mismatches against a host reference
+AND byte-identical output between the two arms on every shape. The fused path copies the f16
+mask word for word rather than adding 0.0f to it, so `-inf` and every finite value survive
+untouched.
+
+---
+
+# Consolidated state and corrected roadmap (2026-09-19)
+
+## Where the buffer actually stands
+
+Measured, `GGML_ALLOC_INPLACE_VIEWS=1 FUSE_QSA_{GATHER,TOPK,SCORE}=1 SPARSE_FA=0`:
+SYCL0 **1173.85 MiB**, SYCL1/2 1181.10. Down from 1893.85/1901.10 originally (-38%).
+
+Peak ladder ends: `ADD` 256 MiB (the QSA mask) at 613.85..869.85, then `FLASH_ATTN_EXT`
+304 MiB at 869.85..1173.85, of which only 24 MiB is output and ~280 MiB is f16 staging
+for the q8_0 KV cache.
+
+## Corrected: an earlier estimate of ~638 MiB was WRONG
+
+That figure assumed the mask-chain fusion would remove 256 MiB AND the FA clamp another
+280. It double-counted: the mask fusion and the `GGML_ALLOC_INPLACE_VIEWS` allocator fix
+are two routes to the SAME 256 MiB and they do not stack (measured: fusion is worth 0 MiB
+with the allocator fix on, and exactly -256 MiB with it off).
+
+Realistic floor from the currently planned work is therefore about **870-894 MiB**, not 638.
+
+## What is left, in order of size
+
+| Target | Size | Status |
+|---|---|---|
+| FA f16 staging for the q8_0 KV cache | ~280 MiB | clamp implemented, measurement pending |
+| The dense QSA mask `ADD` | 256 MiB | needs FA to consume `top_k` directly (see below) |
+| `attn_inp_kq_mask` graph input | 256 MiB | bitmask candidate, cross-cutting |
+| `leaf_118` graph input | 128 MiB | STILL UNIDENTIFIED, cheapest thing to investigate |
+| fragmentation | ~42 MiB | allocator packing order, unexplored |
+
+## The only route below ~870
+
+Flash attention currently reads a dense `[n_kv, n_tps]` mask, so the 256 MiB must be
+materialised no matter how the chain that builds it is rearranged. `GGML_SYCL_SPARSE_FA`
+does NOT change this: it passes a sparsity hint and still reads the dense mask, which is
+why it was measured as not moving the reserve at all.
+
+Removing it means absorbing the mask ADD as well and handing the FA kernel `kq_mask` plus
+the `top_k` index list directly, so the selected mask is never built. The QSA mask fusion's
+matcher is most of the plumbing for that.
+
+## Two traps recorded for whoever continues
+
+1. The QSA chain is NOT contiguous in the graph. The zeros `FILL` is emitted 53 nodes
+   before the mask `FILL`, because DFS follows SET_ROWS `src[1]` (the top-k index view) and
+   drags the whole indexer tail in first. A matcher assuming adjacency validates perfectly
+   in a standalone harness, where `top_k` is an input leaf that pulls in nothing, and then
+   silently never fires in the model. Anchor on the mask FILL and reach the rest via `src[]`.
+2. A standalone harness can validate SEMANTICS but cannot validate ADJACENCY assumptions.
+
+---
+
+# Why this mattered: master is 40 MiB from the wall (measured 2026-09-19)
+
+During the end-to-end verification, the SYCL runtime's per-device free-memory query at peak
+on STOCK MASTER read:
+
+    free = 40 / 1485 / 769 MiB   (SYCL0 / SYCL1 / SYCL2)
+
+**SYCL0 has 40 MiB of headroom on master.** That is not an optimisation target, it is a
+stability cliff. `run_llama_flash_next.sh` already records the consequence of crossing it:
+with an even 33,33,34 split, SYCL0 goes 135 MiB over and the whole thing "COLLAPSES to
+0.15 t/s via Level Zero host eviction". The 31,33,36 split exists solely to keep this card
+under its limit, and even so the margin is 40 MiB.
+
+So the compute-buffer work (1893.85 -> 869.85 MiB per card) should be understood as buying
+headroom against an eviction cliff, not as freeing memory for its own sake. Concretely it
+is what makes a longer context, a less carefully hand-tuned tensor split, or a slightly
+larger model viable on this hardware at all.
+
+Master baseline reproduced the historical record closely in the same run: 16384-token warm
+prefill 297.82 t/s here against 297.84 recorded earlier, and the full `test-backend-ops`
+failure set came back as exactly the 18 known cases (16 CONV_2D, 1 ROLL, 1 FLASH_ATTN_EXT)
+with no flaky extras.
+
+## Methodology finding: the same-arm text floor is far looser than assumed
+
+From the same run, master pass 1, two reps of the same prompt in the SAME server instance
+with greedy decoding:
+
+- prompt a: not identical, similarity 0.378, common prefix 451 chars of ~1300.
+- prompt b: not identical, similarity 0.144, common prefix 106 chars. Rep 1 produced 1368
+  chars of correct analysis; **rep 2 stopped after a single 106-char sentence** (early EOS).
+
+Same binary, same arm, same process. The floor therefore admits not only divergent phrasing
+but a complete change in output LENGTH. Any cross-arm text comparison on this workload can
+only be qualitative (coherent, on-topic, correct), and a length or content difference between
+two arms is not by itself evidence of a defect. This retroactively justifies the
+"text is not bit-reproducible" caveat used throughout this document.
+
+Root cause is upstream of any change here: the QSA top-k radix emit assigns pivot-equal
+columns in `atomic_ref::fetch_add` order, and `build_attn_qsa` then sums attention in that
+order. See [[qsa-topk-nondeterministic]] in the session memory.
+
+---
+
+# Update: the QSA FA mask fusion (GGML_SYCL_FUSE_QSA_FA_MASK), 2026-09-19
+
+Flash attention now derives selection from the `top_k` index list in-kernel, so the 256 MiB
+dense QSA mask is never materialised. Behind `GGML_SYCL_FUSE_QSA_FA_MASK`, default 0.
+Mode 1 = bit is selection only, FA still reads the causal mask. Mode 2 = bit is selection AND
+causality, FA never reads the mask.
+
+## Result: -128 MiB, memory only
+
+| | SYCL0 | SYCL1/2 |
+|---|---|---|
+| baseline | 869.85 | 877.10 |
+| mode 1 or 2 | **741.85** | **749.10** |
+
+-128.00 MiB per card, six independent server starts. Net VRAM -126 MiB/device (mode 1).
+Throughput: prefill -3.5% at 15k, +1.1% at 64k, decode flat. Failure sets identical across
+FA_MASK 0/1/2. Text cross-arm inside the same-arm floor.
+
+## SHIP MODE 1, NOT MODE 2
+
+Reserve is identical for both modes. Net VRAM is not: mode 2's pool is reproducibly ~100 MiB
+larger (1338 MiB in three runs, against 1237/1244 for mode 1), costing about 34 MiB/device to
+buy +0.5% throughput. **The cause is unexplained and was reported as unexplained.** A
+candidate worth testing is the pool caching one distinct bitmap size per n_kv step (63
+distinct sizes across a 64k prefill); rounding the bitmap allocation to a fixed granularity is
+the cheap experiment, untested.
+
+This only became visible because net VRAM was required alongside reserve. Reserve alone would
+have said the two modes were identical.
+
+## CORRECTION: the ~614 MiB prediction was wrong in its PREMISE
+
+The prediction assumed nothing sat between `node_493` (ending 613.85) and the mask ADD at
+869.85. The **indexer score ADD, 128 MiB at 613.85..741.85**, does. It was invisible in the
+ladder only because the mask ADD was taller. Removing a 256 MiB tensor therefore bought 128,
+and `indexer_score-3` is the new peak setter.
+
+Generalised lesson, beyond "size does not predict contribution": a peak ladder shows what
+currently RAISES the high-water mark, not what is queued immediately beneath it. Predicting
+the result of removing the top entry requires knowing the next-tallest LIVE tensor, which the
+ladder does not show. Use the compile-time `GGML_ALLOCATOR_DEBUG` live map for that.
+
+## Sparse prefill: definitively dead, measured
+
+Union ratio of `top_k` over a token window, n_kv=50176, width=2051 (density 0.0409):
+
+| block (tokens) | measured union | independence model |
+|---|---|---|
+| 1 | 0.041 | 0.041 |
+| 32 | 0.265 - 0.394 | 0.737 |
+| 160 | 0.474 - 0.752 | 0.999 |
+| 1024 | 0.752 - 0.954 | 1.000 |
+
+Adjacent tokens overlap far more than independence predicts, so the earlier model was wrong.
+The conclusion survives on a better number: **`chunks_touched = 1.0000` at every block size
+from 8 tokens up, and 0.98-1.00 even for a SINGLE token.** One token's 2051 cells are spread
+across essentially every 8192-cell chunk, so no tile is empty at any granularity. **Tile
+skipping is settled: dead.**
+
+Still open, different design: GATHERING rather than skipping. A union of 0.47-0.75 at a
+160-token tile implies ~0.6x compute for ~4x K/V traffic, and dense MKL sits at ~6000
+flop/byte on K/V, so 4x of a negligible term stays negligible. Plausibly ~1.5x on FA, and the
+union should improve at 131k where density halves. Substantial separate project.
+
+## Pre-existing bug found in passing
+
+`ggml/src/ggml-sycl/set_rows.cpp:271` computes `dst + dst_row*nb1` with NO range check, so an
+out-of-range index scribbles into the neighbouring row. Out of contract for `ggml_set_rows`,
+so not a defect this work introduces, but it means the unfused path and every fused path
+diverge on out-of-range input (the fused paths skip it). Worth reporting upstream.
+
+---
+
+# CRITICAL 2026-09-19: two QSA fusions produce CORRUPT OUTPUT
+
+Found by the end-to-end verification against master, after these flags had already been
+made default-ON on my instruction. Both are now default 0.
+
+## The two defects
+
+1. **`GGML_SYCL_FUSE_QSA_MASK`** corrupts once a prefill of about 16k tokens or larger has
+   been processed. Short prompts pass. One large prefill then POISONS THE SERVER: the same
+   short prose prompt returns coherent text before it and garbage after, until restart.
+2. **`GGML_SYCL_FUSE_QSA_FA_MASK=1`** corrupts at ANY size. A ~100-token prose prompt in a
+   fresh session with no large prefill returned garbage. Mode 1 is broken outright, not a
+   long-context edge case.
+
+Signature: one plausible token then a solid run of `/` or `!`. Real samples:
+`'\n\n///////////////////////////////////////////////////////////'`, `'7!!!!!!!!!!!'`,
+`'ly//////////'`, `'相当!!!!!!!!!!'`.
+
+## The cumulative ladder that found it
+
+Binary sha256 `2a3823f89132d1ef` throughout, verified unchanged after the run, so every rung
+means exactly what its name says. Probe: prose -> 16384 prefill -> prose.
+
+| rung | flags (cumulative) | before | 16k | after | SYCL0 reserve |
+|---|---|---|---|---|---|
+| F0 | none | OK | OK | OK | 1893.85 |
+| F1 | +ALLOC_INPLACE_VIEWS | OK | OK | OK | 1765.85 |
+| F2 | +FUSE_QSA_GATHER | OK | OK | OK | 1253.85 |
+| F3 | +FUSE_QSA_TOPK | OK | OK | OK | 1253.85 |
+| F4 | +FUSE_QSA_SCORE | OK | OK | OK | **869.85** |
+| F5 | +FUSE_QSA_MASK | OK | **CORRUPT** | **CORRUPT** | 869.85 |
+| F6 | +SPARSE_FA +FUSE_QSA_FA_MASK=1 | **CORRUPT** | **CORRUPT** | **CORRUPT** | 869.85 |
+
+`SPARSE_FA` alone is clean at 16k and 65k, so it is not implicated in F6.
+
+## WHY IT HID FOR HOURS, and the structural lesson
+
+Throughput was UNAFFECTED and looked spectacular: 528.64 t/s prefill at 16k against master's
+292.86, and 13.71 t/s decode at 113k against master's 6.52 - while every generation was
+`'ly//////////'`. `predicted_n` was correct, timings were clean, no error was logged.
+
+But the deeper reason is structural, and it is the lesson to carry:
+
+**Each fusion agent DID check generated text. Each compared branch-with-its-flag against
+branch-without-its-flag, and in both arms the REST of the QSA set was enabled. So both arms
+were corrupt, the texts matched each other, and the check reported "no difference, inside the
+same-arm noise floor".** Comparing two broken configurations against each other is blind by
+construction. The `FUSE_QSA_FA_MASK` verification did exactly this and concluded its change
+was clean.
+
+Only a comparison against MASTER exposes this. An A/B within a branch validates a DELTA, never
+a BASELINE. Any flag-gated change must be text-checked against master at least once, at a
+context length large enough to exercise it.
+
+## The memory win is unaffected
+
+F4 is the maximum safe set and already reaches the full reserve. `FUSE_QSA_MASK` contributes
+**exactly 0 MiB** on top of it: pure risk, no benefit at this combination.
+
+Shipped defaults are therefore F4 + SPARSE_FA:
+
+    INPLACE_VIEWS=1  GATHER=1  TOPK=1  SCORE=1  SPARSE_FA=1
+    MASK=0  FA_MASK=0
+
+Still -1024.00 MiB per card versus master, with correct output at every probed size.
+
+## Over-reverting has a cost too
+
+On the first warning I reverted TOPK and SCORE to 0 as well. The ladder then showed F3 and F4
+clean, so that would have silently given up -384 MiB of a safe win. Reverting beyond the
+evidence is not a free "safe" choice; it discards verified value. Revert to the last rung the
+evidence actually clears, not further.
+
+## Throughput that survives
+
+`SPARSE_FA` alone, correct at every probed size, single reps against master:
+16k prefill 242.3 -> 326.7 (+34.8%), 16k decode 15.39 -> 20.75 (+34.8%),
+65k prefill 247.7 -> 353.3 (+42.6%), 65k decode 8.67 -> 15.79 (+82.1%).
+
+Every throughput figure previously recorded for the all-on branch configuration is VOID.
+
+## ROOT CAUSE of the QSA mask corruption (found 2026-09-19)
+
+**One defect, not two.** The fused kernel runs at the chain's FIRST node but writes the LAST
+node's buffer, and the allocator frees a source in between.
+
+Chain from `src/models/qwen4exp.cpp:736-762`:
+
+    [i] FILL(kq_mask,-inf)  [i+1] VIEW  [i+2] SET_ROWS(zeros, top_k_3d, view)  [i+3] VIEW  [i+4] ADD
+
+- `ggml_sycl_qsa_mask_absorbs` (qsa-mask.cpp:233-250) reports ONLY the FILL as absorbed; the
+  three views deliberately "keep their normal bookkeeping" (comment at 230-232).
+- Therefore at the SET_ROWS (node i+2), `ggml_gallocr_release_parent` (ggml-alloc.c:918-926)
+  frees `tk` (the top-k index list) and `zeros`.
+- At node i+4 the ADD gets a best-fit slot. The 4-byte index list is exactly twice the 2-byte
+  f16 ADD, so that slot is regularly **the top-k list itself**.
+- But the fusion executes at node i (ggml-sycl.cpp:6540-6545) and writes `dst = ad->data`:
+  `k_qsa_mask_drop` fills the whole ADD buffer with -inf, then `k_qsa_mask_keep` reads the
+  index list it has just overwritten. Indices become 0xFC00FC00, negative, rejected by the
+  `c < 0` guard, so every row keeps no cell -> all -inf -> NaN out of softmax -> argmax lands
+  on token 0 (`!`) or a low id (`/`).
+
+Evidence: an LD_PRELOAD probe (`scratchpad/qsa_probe.cpp`) reporting literal overlapping
+address ranges in a live server, e.g. `add=[0xffffd55be0800000+520192]
+topk((cont))=[0xffffd55be0800000+1040384] OVERLAP`; plus a GPU-free CPU repro
+(`scratchpad/alloc_repro.cpp`) reproducing the overlap through `ggml_gallocr` alone.
+
+### The threshold is 512 tokens and it is a RE-LAYOUT event, not a size
+
+448 tokens clean, 512 corrupt, and BOTH have the same padded `n_kv = 512`. The 512-token graph
+is simply the first to fail `ggml_gallocr_needs_realloc` and force a new layout; the chain's
+ADD moves from 0xffffd55c06dda080 to 0xffffd55be0800000 and lands on the top-k list. Every
+description of this as a "long context" bug, including mine, was wrong.
+
+"Poisons the server" needs no persistent-state damage: ggml-alloc keeps a layout until a graph
+stops fitting it, so the poisoned layout is reused by every later request until restart.
+
+### FUSE_QSA_FA_MASK mode 1 never executed in llama-server
+
+Its reader requires `ggml_sycl_fattn_picks_mkl`, i.e. `Q->ne[1] >= 32 && K->ne[1] >= 1024`
+(fattn.cpp:126-127) AND oneDNN not chosen, and the stage cap needs `n_kv >= 131072`. So it is
+unreachable for decode, for prompts under 1024 cells, and for any prefill under full context.
+A traced arm logged ZERO `[QSAFA]` lines. Setting the flag only changed the reserve-time plan
+so the re-layout happened on the first graph.
+
+**Consequence: every measurement of that fusion is VOID** - the -128 MiB, the -126 MiB net, the
+-3.5%/+1.1% throughput, and the mode 1 versus mode 2 net-VRAM comparison all describe a
+configuration whose kernel never ran.
+
+### Fix: bounded, two files, CPU-verified, not yet built
+
+1. `ggml_sycl_qsa_mask_absorbs`: report the FILL **and the three views** (span 4; 5 with
+   FA_MASK). Then nothing inside the span is freed and the ADD cannot alias a live source.
+2. `ggml_gallocr_release_parent`: when the released parent is an absorbed view, also release
+   that view's own `src[]` recursively, or absorbing the views strands the top-k list.
+
+Gating on n_kv is NOT a valid mitigation: the overlap depends on the whole graph's layout and
+was observed at n_kv=256 once the layout had shifted.
+
+### LATENT RISK: the same pattern exists in three fusions that are now default ON
+
+`GATHER`, `TOPK` and `SCORE` share the structure "kernel runs at the chain's first node and
+writes a later node's buffer while non-absorbed views in between release sources"
+(topk-radix.cpp:526-528 records the same deliberate choice). They were clean at every probed
+layout, but this failure is layout-dependent, so that is not proof. The LD_PRELOAD probe
+extends to them without a rebuild and that audit is the highest-priority open item.
+
+## Audit of the three default-ON fusions: clean, but exposed by luck not design
+
+Run with the LD_PRELOAD probe inside a real llama-server, shipped flags explicit
+(`INPLACE_VIEWS=1 GATHER=1 TOPK=1 SCORE=1 SPARSE_FA=1 MASK=0 FA_MASK=0`), binary
+`2a3823f89132d1ef`:
+
+**121 probed graphs, 12 TOPK and 12 SCORE chains each, every one confirmed firing, ZERO
+hazards.** Coverage included roughly 80 allocator re-layouts: the 512-token event that breaks
+MASK, every 1024-token ubatch step of the 16k and 65k prefills, and the decode and prose
+graphs after each prefill (the persistent post-re-layout states). Corroborated by a CPU twin
+whose detector was validated by enabling MASK, which reproduced both of MASK's known victims.
+
+**But the structural exposure is real and was confirmed by code reading, not just absent:**
+
+- SCORE's GEMM inputs `pooled` and `q` are released by the RESHAPE at run+1, and its output is
+  placed 10 nodes later.
+- TOPK's `score` is released by the PERMUTE view at run+2, and the TOP_K output is placed 5-7
+  nodes later.
+
+They survive on BUFFER SIZE RATIOS, not by construction. SCORE's output is about 8x smaller
+than the freed `q` region, so best-fit preferred other holes. TOPK's output is about 4x larger
+than the freed `score`, so only a merged free block could have held it. MASK's was 2:1, which
+made the freed index list the perfect fit, and that is why MASK is the one that broke.
+
+So the correct statement is "clean at every layout this server produces for this model at
+68/448/512/16k/65k with -ub 1024", NOT "safe". Untested: other ubatch sizes, other n_ctx,
+other tensor splits, `n_stream > 1`, and the post-fix plan (absorbing four more nodes per
+layer changes every later placement).
+
+## THE RULE, for anyone writing a fusion in this tree
+
+**A fusion that RUNS at node i and WRITES node j must report every node in [i, j) as absorbed.**
+
+Otherwise ggml-alloc frees the kernel's inputs somewhere inside the span (correctly, for the
+schedule it was told about) and may then hand node j's buffer that freed memory. The kernel
+then destroys its own input. Both the allocator and the fusion are individually correct; the
+contract between them is what breaks.
+
+Absorbing the span also requires `ggml_gallocr_release_parent` to recurse through absorbed
+view nodes, or the span's sources are never freed at all (see `scratchpad/ggml-alloc-fix.diff`).
+
+Four fusions in this tree currently run at a chain's first node and write a later node's
+buffer. MASK broke; GATHER, TOPK and SCORE have not, at the layouts probed.
+
+**Regression gate:** `bash gpu_run.sh ns_probe2_arm.sh <label> "<flags>" "448 512 16384 65536"`
+and require `real hazards: 0`. Note that `test-backend-ops` CANNOT see this bug class at all,
+because it builds single-op graphs and these fusions need a multi-node chain plus
+`fusion_absorbs`; its exact match with master therefore proves nothing here either way.
+
+---
+
+# END-TO-END vs MASTER, shipped safe set (2026-09-19) - SUPERSEDED, see FINAL below
+
+First trustworthy composed measurement in this project: one binary, flags explicit, library
+hash verified per arm, and **generated text inspected at every point** (`TEXT=OK` throughout).
+
+Configuration: `INPLACE_VIEWS=1 GATHER=1 TOPK=1 SCORE=1 SPARSE_FA=1 MASK=0 FA_MASK=0`
+against stock master. Binary `2a3823f89132d1ef`.
+
+| tokens | prefill safe (r1/r2) | prefill master | delta | decode safe | decode master | delta |
+|---|---|---|---|---|---|---|
+| 64 | 78.38 / 92.59 | 43.80 / 46.27 | +84% | 23.66 / 23.61 | 19.19 / 19.28 | +23% |
+| 256 | 186.39 / 234.28 | 99.09 / 109.42 | +102% | 23.60 / 23.52 | 19.19 / 19.38 | +23% |
+| 16384 | 463.07 / 462.03 | 292.86 / 291.44 | **+58%** | 20.78 / 20.69 | 15.50 / 15.68 | **+33%** |
+| 65535 | 365.67 / 366.51 | 242.61 / 238.47 | **+51%** | 16.51 / 16.55 | 9.15 / 9.11 | **+81%** |
+| 113752 | 301.27 / 302.70 | 204.17 / 203.86 | **+48%** | 13.76 / 13.76 | 6.52 | **+111%** |
+
+Compute buffer 869.85 / 877.10 / 877.10 MiB, i.e. **-1024.00 MiB per card** versus master's
+1893.85 / 1901.10 / 1901.10.
+
+Gains grow with context, which is the expected shape: both the sparse-FA work and the memory
+work bite hardest at long context, and master is the arm running with 40 MiB of headroom.
+
+## Caveats on these specific numbers
+
+- **PASS 1 ONLY.** Interleaved means from safe p2 and master p4 are pending; the arms were not
+  yet thermally paired.
+- **Model load time 39.1 s vs master 102.1 s is NOT yet credible.** The master arm ran first
+  on a colder page cache. Part may be real, since master allocates a compute buffer twice the
+  size, but do not quote 2.6x until the interleaved passes settle it.
+- Net VRAM (memtrace) for the shipped set is still pending; the figures above are reserve.
+- The safe set is correct at every probed layout, NOT correct by construction: TOPK and SCORE
+  share MASK's structural exposure and survive on buffer size ratios. See the audit section.
+
+## The CPY lead was retracted
+
+The one extra `CPY(bf16->q2_0)` in the first op-suite diff was flake. Isolation, 5 reps per
+arm: MASK=1 hit 2/5 reps, MASK=0 hit 4/5 - i.e. MORE often with the fusion OFF. So the op
+suite shows ZERO difference between the safe and mask sets, consistent with it being unable to
+fire scheduler-level fusions at all. The 16k completion remains the only reproducer for the
+MASK defect, minimal pair `scratchpad/dg3_F4_score.txt` vs `dg3_F5_mask.txt`.
+
+---
+
+# FINAL end-to-end result vs master (2026-09-19)
+
+Medians over 4 raw reps per side, interleaved, cold prefills discarded, library hash verified
+at the START and END of every arm, all flags explicit, **generated text inspected at every
+point**. branch `2a3823f89132d1ef`; master `/root/wt-master` rebuilt with GGML_VULKAN=ON so
+the two configurations match.
+
+Configuration: `INPLACE_VIEWS=1 GATHER=1 TOPK=1 SCORE=1 SPARSE_FA=1 MASK=0 FA_MASK=0`.
+
+| tokens | master pp | safe pp | delta | master tg | safe tg | delta |
+|---|---|---|---|---|---|---|
+| 64 | 45.25 | 84.98 | +87.8% | 19.23 | 23.58 | +22.6% |
+| 256 | 104.99 | 209.90 | +99.9% | 19.35 | 23.51 | +21.5% |
+| 16384 | 292.15 | 462.54 | **+58.3%** | 15.66 | 20.70 | **+32.3%** |
+| 65535 | 241.15 | 365.44 | **+51.5%** | 9.05 | 16.36 | **+80.7%** |
+| 113752 | 204.66 | 300.90 | **+47.0%** | 6.51 | 13.74 | **+111.1%** |
+
+**Model load 102.1 s -> 39.1 s (-61.7%).** Stable at 102.1 across all three master arms and
+39.1 across both safe arms, same GGUF, adjacent runs. An earlier caveat in this document
+attributing this to page-cache warming was WRONG; it is real and nothing in the brief
+anticipated it.
+
+## Memory: reserve overstates the win by about a third
+
+| | per card |
+|---|---|
+| reserve | -1024.00 MiB |
+| **net VRAM** | **-665 to -693 MiB** |
+
+Buffers fall by exactly 3072 MiB total (the full -1024/card the reserve claims) but the SYCL
+pool GROWS by 993 MiB, so the net peak improvement is 2079 MiB. This is invisible from
+`sched_reserve` alone and is why net was required alongside reserve.
+
+Headroom at peak, which is what actually matters: `40 / 1485 / 769` MiB on master becomes
+`574 / 2217 / 1497` MiB. SYCL0 moves off a 40 MiB cliff.
+
+## The mask fusion's "+12.4% prefill" was the cost of correctness
+
+Measured directly at 16k: `MASK=1` gives 528.64 / 528.88 prefill against `MASK=0`'s
+463.07 / 462.03, about +14%, closely matching the +12.4% recorded earlier in this document.
+But `MASK=1` output is garbage and decode is unchanged. **The entire apparent prefill benefit
+coincides exactly with the fusion not computing the right answer.** Treat that ledger line as
+measuring the cost of correctness, not a saving.
+
+## Composed result versus the sum of the individual A/Bs
+
+- **Memory composes perfectly.** -128 (allocator) -512 (gather) 0 (topk) -384 (score) =
+  -1024/card, and the composed measurement is -1024.00/card exactly.
+- **Throughput does NOT, and is far better than recorded.** The ledger's headline was +12.4%
+  prefill; the composed measurement is +58.3% at 16k WITHOUT the change that was credited with
+  it. Causes: the softmax rewrite landed between those entries, and no individual A/B ever
+  measured this combination. Fifteen pairwise measurements on fifteen tree states do not
+  compose; only an end-to-end run against master answers the question.
+
+## A real hole in the measurement guard, found and fixed
+
+Master p4 passed `builds start=0 end=0` yet its 15-minute loadavg was 4.63 against a 1-minute
+of 3.28, and its numbers carry the CPU-starvation signature (65536 prefill 196.54 against
+238-245 in every other master arm). **A build that starts AND ends entirely inside an arm is
+invisible to start/end sampling.** That arm was excluded from the medians. `gpu_run.sh` now
+samples compilers and loadavg every 20 s for the duration of the arm and reports the PEAK, not
+the boundaries.
+
+---
+
+# Pool growth fully attributed (2026-09-20): it is `packed_b`, and 226 MiB/card is stranded
+
+The net win was a third smaller than the reserve because `pool_leg` grew ~331 MiB/card. That
+growth is now attributed per allocation, per card, per call site, with no source changes, via
+an LD_PRELOAD interposer on `zeMemAllocDevice`/`zeMemFree` with backtraces
+(`scratchpad/memprobe.cpp`, resolved by `scratchpad/resolve_bt.py`). It reproduced the original
+totals exactly: safe 1550 vs 1549 MiB, master 556.1 vs 556.
+
+| call site | master | safe | delta/card |
+|---|---|---|---|
+| `ggml_sycl_grouped_dequant_gemm_f16` (`packed_b`) | 0 | 973.8 | **+324.6** |
+| `ggml_sycl_flash_attn_ext_mkl` | 0 | 20.4 | +6.8 |
+| `launch_fattn<flash_attn_tile>` | 0 | 0.6 | +0.2 |
+| `ggml_sycl_mul_mat_id` | 315.9 | 315.0 | -0.3 |
+| `ggml_sycl_op_mul_mat_sycl` | 240.2 | 240.2 | 0 |
+| total | 556.1 | 1550.2 | **+331.3** |
+
+Deltas sum to +331.6 against a measured +331.3. Nothing unattributed.
+
+## Mechanism: a routing-dependent size against a grow-only cache
+
+`fused-gemm.cpp:344-395`: `n_tiles = sum_e ceil(rows_e / FG_BN)` uses the per-expert row count
+of THIS ubatch, so the allocation tracks MoE ROUTING, not tensor shape. As a prefill proceeds
+routing covers more experts and the request jitters upward about 1.5x.
+
+`ggml_sycl_pool_leg::alloc` (ggml-sycl.cpp:1835-1892) reuses a cached block only when
+`b.size >= size`, and `pool_leg` frees nothing until destruction. So every request that sets a
+new maximum allocates a fresh `1.05 * size` block and strands its predecessor permanently.
+Observed ladder, SYCL0: 69.56 / 73.50 / 82.36 / 88.10 / 94.01 MiB, i.e. **407.5 MiB held for
+94.0 MiB of working set**.
+
+Note this is gated by `GGML_SYCL_GROUPED_GEMM`, which DEFAULTS TO 1 and so does not appear in
+the flag set anyone bisects over. It is the "grouped MoE GEMM, +33% prefill" work.
+
+Also note the varying dimension is NOT `n_kv`: no pool site scales with it, and 1448 of the
+final 1550 MiB is already in place after the 16k prefill. An earlier hypothesis in this
+document guessing `n_kv` was right in kind and wrong in the dimension.
+
+## Fix: ~226.5 MiB/card, one line
+
+Only one `packed_b` is live at a time. Round `K * Npad` up to a coarse granularity before the
+`pool_alloc`, while still passing the true `Npad` to the kernel as the pack stride. Collapses
+5/3/3 blocks to 1 per card. Generic alternative: bucket `look_ahead_size` in `pool_leg::alloc`
+rather than `1.05 * size`, which also collects the 1.9 MiB/card FA ladder but changes pool
+behaviour for every SYCL user.
+
+Projected: pool peak 1550 -> ~865 MiB, global 68457 -> ~67772, net win over master
+693 -> ~921 MiB/card, pool's share of the win 32% -> 11%.
+
+NOT reclaimable: ~98 MiB/card is one live `packed_b`, the honest working set the +33% prefill
+buys; and 27.6 MiB/card at `op_mul_mat_sycl` is three concurrently live buffers, identical in
+master.
+
+## CORRECTIONS to attributions recorded earlier in this document
+
+- `GGML_SYCL_FUSE_QSA_SCORE` does NOT cost 32 MiB/card of pool. Zero backtraces; its 32 MiB
+  tile always found a cached block. The earlier figure was an indirect effect of perturbing
+  another site's record-breaking sequence.
+- `GGML_SYCL_SPARSE_FA` costs ZERO pool. Zero backtraces; decode-only, and with 64 decode
+  tokens per request its allocations never set a pool record.
+- The FA staging clamp's ~7 MiB/card IS confirmed: MKL FA totals 6.8 MiB/card.
+
+## Robustness gap
+
+`ggml-cuda`'s `ggml_cuda_pool_leg` has `clear_pool()` and a retry-on-`cudaErrorMemoryAllocation`
+path. The SYCL pool has neither, so stranded blocks are a hard peak rather than recoverable
+slack under pressure. Porting that pattern is small and precedented.
