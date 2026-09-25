@@ -582,6 +582,80 @@ template <> struct esimd_reorder_q_traits<GGML_TYPE_Q6_K> {
             }
         }
     }
+
+    // Dequantize the same two blocks mac_pair does, into 8 groups of 32 floats in the order
+    // mac_pair walks them, with the same arithmetic. For the multi-column kernel, which reuses
+    // one dequantized block across its activation columns.
+    static ESIMD_INLINE void dequant_pair(
+            const ptrs & p, size_t bia, size_t bib, bool has_b,
+            sycl::ext::intel::esimd::simd<float, 256> & deq_a,
+            sycl::ext::intel::esimd::simd<float, 256> & deq_b) {
+        using namespace sycl::ext::intel::esimd;
+
+        simd<uint8_t, 128> ql_a     = block_load<uint8_t, 128>(p.ql + bia * (QK_K / 2));
+        simd<uint8_t, 128> ql_b     = 0;
+        simd<uint8_t, 64>  qh_a     = block_load<uint8_t, 64>(p.qh + bia * (QK_K / 4));
+        simd<uint8_t, 64>  qh_b     = 0;
+        simd<int8_t, 16>   scales_a = block_load<int8_t, 16>(p.scales + bia * (QK_K / 16));
+        simd<int8_t, 16>   scales_b = 0;
+
+        const float d_a = (float) p.d[bia];
+        float d_b = 0.0f;
+        if (has_b) {
+            ql_b     = block_load<uint8_t, 128>(p.ql + bib * (QK_K / 2));
+            qh_b     = block_load<uint8_t, 64>(p.qh + bib * (QK_K / 4));
+            scales_b = block_load<int8_t, 16>(p.scales + bib * (QK_K / 16));
+            d_b = (float) p.d[bib];
+        }
+
+        simd<float, 16> sc_a = convert<float>(scales_a);
+        simd<float, 16> sc_b = convert<float>(scales_b);
+
+#pragma unroll
+        for (int im = 0; im < 2; ++im) {
+            simd<uint8_t, 32> ql_lo_a   = ql_a.select<32, 1>(64 * im);
+            simd<uint8_t, 32> ql_hi_a   = ql_a.select<32, 1>(64 * im + 32);
+            simd<uint8_t, 32> qh_bits_a = qh_a.select<32, 1>(32 * im);
+            simd<uint8_t, 32> ql_lo_b   = ql_b.select<32, 1>(64 * im);
+            simd<uint8_t, 32> ql_hi_b   = ql_b.select<32, 1>(64 * im + 32);
+            simd<uint8_t, 32> qh_bits_b = qh_b.select<32, 1>(32 * im);
+
+#pragma unroll
+            for (int g = 0; g < 4; ++g) {
+                const float scale_a_lo = sc_a[8 * im + 2 * g + 0] * d_a;
+                const float scale_a_hi = sc_a[8 * im + 2 * g + 1] * d_a;
+                const float scale_b_lo = sc_b[8 * im + 2 * g + 0] * d_b;
+                const float scale_b_hi = sc_b[8 * im + 2 * g + 1] * d_b;
+
+                simd<float, 32> scale_vec_a = splat_lo_hi(scale_a_lo, scale_a_hi);
+                simd<float, 32> scale_vec_b = splat_lo_hi(scale_b_lo, scale_b_hi);
+
+                simd<uint8_t, 32> qa;
+                simd<uint8_t, 32> qb;
+                switch (g) {
+                    case 0:
+                        qa = (ql_lo_a & simd<uint8_t, 32>(0x0F)) | ((qh_bits_a & simd<uint8_t, 32>(0x03)) << simd<uint8_t, 32>(4));
+                        qb = (ql_lo_b & simd<uint8_t, 32>(0x0F)) | ((qh_bits_b & simd<uint8_t, 32>(0x03)) << simd<uint8_t, 32>(4));
+                        break;
+                    case 1:
+                        qa = (ql_hi_a & simd<uint8_t, 32>(0x0F)) | ((qh_bits_a & simd<uint8_t, 32>(0x0C)) << simd<uint8_t, 32>(2));
+                        qb = (ql_hi_b & simd<uint8_t, 32>(0x0F)) | ((qh_bits_b & simd<uint8_t, 32>(0x0C)) << simd<uint8_t, 32>(2));
+                        break;
+                    case 2:
+                        qa = (ql_lo_a >> simd<uint8_t, 32>(4)) | (qh_bits_a & simd<uint8_t, 32>(0x30));
+                        qb = (ql_lo_b >> simd<uint8_t, 32>(4)) | (qh_bits_b & simd<uint8_t, 32>(0x30));
+                        break;
+                    default:
+                        qa = (ql_hi_a >> simd<uint8_t, 32>(4)) | ((qh_bits_a & simd<uint8_t, 32>(0xC0)) >> simd<uint8_t, 32>(2));
+                        qb = (ql_hi_b >> simd<uint8_t, 32>(4)) | ((qh_bits_b & simd<uint8_t, 32>(0xC0)) >> simd<uint8_t, 32>(2));
+                        break;
+                }
+
+                deq_a.select<32, 1>(32 * (4 * im + g)) = (convert<float>(qa) - 32.0f) * scale_vec_a;
+                deq_b.select<32, 1>(32 * (4 * im + g)) = (convert<float>(qb) - 32.0f) * scale_vec_b;
+            }
+        }
+    }
 };
 
 } // namespace ggml_sycl_esimd
