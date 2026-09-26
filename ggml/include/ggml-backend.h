@@ -95,6 +95,11 @@ extern "C" {
     GGML_API void ggml_backend_tensor_get_2d(const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data);
     GGML_API void ggml_backend_tensor_memset(      struct ggml_tensor * tensor,     uint8_t value, size_t offset, size_t size);
 
+    // bytes the tensor's data occupies in its buffer: ggml_nbytes, unless the buffer type stores the
+    // tensor in a compact layout and reports less from get_alloc_size. Views and tensors without a
+    // buffer report ggml_nbytes. ggml_backend_tensor_set/get still take ggml_nbytes-sized data.
+    GGML_API size_t ggml_compacted_nbytes(const struct ggml_tensor * tensor);
+
     GGML_API void ggml_backend_synchronize(ggml_backend_t backend);
 
     GGML_API ggml_backend_graph_plan_t ggml_backend_graph_plan_create(ggml_backend_t backend, struct ggml_cgraph * cgraph);

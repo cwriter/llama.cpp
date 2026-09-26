@@ -195,7 +195,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // calling _supported() on every decode FA call.
     const bool stage_capped = ggml_sycl_fattn_stage_capped(dst);
 
-    if (Q->ne[1] >= 32 && !stage_capped
+    // oneDNN needs a dense f16 mask, and a compact one could only be expanded into as much
+    // scratch as the compaction saved; the MKL kernel below reads the bits directly
+    if (Q->ne[1] >= 32 && !stage_capped && !ggml_sycl_kq_mask_is_compact(mask)
         && ggml_sycl_flash_attn_ext_onednn_supported(dst)) {
         return BEST_FATTN_KERNEL_ONEDNN;
     }
@@ -354,6 +356,9 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     ggml_tensor                      mask_sub;
     ggml_sycl_pool_alloc<sycl::half> mask_dense(ctx.pool());
     const bool mask_packed = ggml_sycl_kq_mask_is_bits(dst->src[3]);
+    if (mask_packed) {
+        ggml_sycl_kq_mask_taught(ctx, dst);  // both branches below read it correctly
+    }
     const bool mkl_takes_bits =
         mask_packed && ggml_sycl_fattn_reads_mask_bits(dst) &&
         ggml_sycl_get_best_fattn_kernel(ggml_sycl_get_device(), dst) == BEST_FATTN_KERNEL_MKL;

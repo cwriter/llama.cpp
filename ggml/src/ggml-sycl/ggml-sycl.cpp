@@ -72,6 +72,7 @@
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/qsa-mask.hpp"
+#include "ggml-sycl/census.hpp"
 #include "ggml-sycl/qsa-score.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
@@ -150,7 +151,7 @@ int g_ggml_sycl_copy_ring_depth = GGML_SYCL_COPY_RING_DEPTH_DEFAULT;
 int g_ggml_sycl_fuse_types = GGML_SYCL_FUSE_DEFAULT;
 int g_ggml_sycl_float_commutative = 1;
 int g_ggml_sycl_kv_soa = 0;
-int g_ggml_sycl_kq_mask_bits = 0;
+int g_ggml_sycl_kq_mask_bits = GGML_SYCL_KQ_MASK_DEFAULT;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_mem_save = GGML_SYCL_MEM_SAVE_DEFAULT;
 size_t g_ggml_sycl_reorder_chunk_bytes = 32ull << 20;
@@ -417,6 +418,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_enable_mkl_fa = ggml_sycl_get_env("GGML_SYCL_ENABLE_MKL_FA", 1);
         g_ggml_sycl_fa_max_mem_mib = ggml_sycl_get_env("GGML_SYCL_FA_MAX_MEM_MIB", 256);
         g_ggml_sycl_memtrace = ggml_sycl_get_env("GGML_SYCL_MEMTRACE", 0);
+        g_ggml_sycl_census = ggml_sycl_get_env("GGML_SYCL_CENSUS", 0);
         g_ggml_sycl_memtrace_step = ggml_sycl_get_env("GGML_SYCL_MEMTRACE_STEP", 64);
         g_ggml_sycl_enable_vmm = ggml_sycl_get_env("GGML_SYCL_ENABLE_VMM", 1);
         g_ggml_sycl_enable_fusion = ggml_sycl_get_env("GGML_SYCL_ENABLE_FUSION", 1);
@@ -456,7 +458,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_types = ggml_sycl_get_env("GGML_SYCL_FUSE_TYPES", GGML_SYCL_FUSE_DEFAULT);
         g_ggml_sycl_float_commutative = ggml_sycl_get_env("GGML_SYCL_FLOAT_COMMUTATIVE", 1);
         g_ggml_sycl_kv_soa = ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0);
-        g_ggml_sycl_kq_mask_bits = ggml_sycl_get_env("GGML_SYCL_KQ_MASK_BITS", 0);
+        g_ggml_sycl_kq_mask_bits = ggml_sycl_get_env("GGML_SYCL_KQ_MASK_BITS", GGML_SYCL_KQ_MASK_DEFAULT);
         g_ggml_sycl_wide_loads = ggml_sycl_get_env("GGML_SYCL_WIDE_LOADS", GGML_SYCL_WIDE_LOADS_DEFAULT);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
@@ -548,7 +550,9 @@ static void ggml_check_sycl() try {
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_FLAT_BATCH)  != 0);
         GGML_LOG_INFO("  GGML_SYCL_FLOAT_COMMUTATIVE: %d\n", g_ggml_sycl_float_commutative);
         GGML_LOG_INFO("  GGML_SYCL_KV_SOA: %d\n", g_ggml_sycl_kv_soa);
-        GGML_LOG_INFO("  GGML_SYCL_KQ_MASK_BITS: %d\n", g_ggml_sycl_kq_mask_bits);
+        GGML_LOG_INFO("  GGML_SYCL_KQ_MASK_BITS: %d (pack=%d tail=%d compact=%d)\n", g_ggml_sycl_kq_mask_bits,
+                      g_ggml_sycl_kq_mask_bits ? 1 : 0, (g_ggml_sycl_kq_mask_bits & 2) ? 1 : 0,
+                      (g_ggml_sycl_kq_mask_bits & 4) ? 1 : 0);
         GGML_LOG_INFO("  GGML_SYCL_WIDE_LOADS: 0x%x (hc=%d gdn=%d convert=%d)\n", g_ggml_sycl_wide_loads,
                       (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_HC) != 0,
                       (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_GDN) != 0,
@@ -916,9 +920,20 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     "a packed mask must be written whole; see kq-mask-bits.hpp");
         const int64_t nrows = ggml_nelements(tensor) / tensor->ne[0];
         mask_buf.resize(ggml_sycl_kq_mask_row_bytes(tensor->ne[0]) * nrows);
-        ggml_sycl_kq_mask_pack(mask_buf.data(), data, tensor->ne[0], nrows);
-        data = mask_buf.data();
-        size = mask_buf.size();
+        if (ggml_sycl_kq_mask_pack(mask_buf.data(), data, tensor->ne[0], nrows)) {
+            data = mask_buf.data();
+            size = mask_buf.size();
+        } else {
+            // a value one bit cannot hold: this upload stays dense, and its readers see that.
+            // Later allocations stay dense too, but one already compacted has no room for it
+            ggml_sycl_kq_mask_compact_veto("an upload holds values other than 0 and -inf", tensor->name);
+            if (ggml_sycl_kq_mask_is_compact(tensor)) {
+                GGML_ABORT("compact KQ mask %s was handed values other than 0 and -inf; "
+                           "run without GGML_SYCL_KQ_MASK_BITS bit 2", tensor->name);
+            }
+            static_cast<ggml_tensor_extra_gpu *>(tensor->extra)->optimized_feature.layout.kind =
+                GGML_SYCL_LAYOUT_CANONICAL;
+        }
     }
 
     std::vector<char> soa_buf;
@@ -995,9 +1010,10 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
 
-    SYCL_CHECK(CHECK_TRY_ERROR(
-        stream.memcpy(data, (const char *)tensor->data + offset, size)
-            .wait()));
+    // a packed mask holds fewer bytes than size, and a compact one has no more allocated
+    if (!bits) {
+        SYCL_CHECK(CHECK_TRY_ERROR(stream.memcpy(data, (const char *) tensor->data + offset, size).wait()));
+    }
 
     if (soa) {
         // spans keep their byte range, so this unpermutes in place
@@ -1187,6 +1203,16 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         queue_ptr stream_dst = dst_ctx->stream;
         queue_ptr stream_src = src_ctx->stream;
         size_t size = ggml_nbytes(src);
+        // a packed mask copies as its bits when both sides are packed; a mixed pair falls back
+        // to the host path, which unpacks on the way out and packs on the way in
+        const bool src_bits = ggml_sycl_kq_mask_is_bits(src);
+        if (src_bits != ggml_sycl_kq_mask_is_bits(dst)) {
+            return false;
+        }
+        if (src_bits) {
+            size = ggml_sycl_kq_mask_row_bytes(src->ne[0]) * (size_t) (ggml_nelements(src) / src->ne[0]);
+            GGML_ASSERT(size <= ggml_compacted_nbytes(src) && size <= ggml_compacted_nbytes(dst));
+        }
 
         // This entry point is synchronous by contract, so the copy is still waited out below.
         // Reaching it does not need both devices drained on the host: a barrier on the source
@@ -1444,9 +1470,8 @@ static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_t
         }
     }
 
-    return size;
-
-    GGML_UNUSED(buft);
+    const auto * buft_ctx = (const ggml_backend_sycl_buffer_type_context *) buft->context;
+    return ggml_sycl_kq_mask_alloc_size(buft_ctx->device, tensor, size);
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface = {
@@ -2141,6 +2166,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                             *actual_size = b.size;
                             b.ptr = nullptr;
                             b.size = 0;
+                            ggml_sycl_census_pool_alloc(device, false, size, *actual_size, false, pool_size);
                             return ptr;
                         }
                     }
@@ -2153,6 +2179,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             *actual_size = b.size;
             b.ptr = nullptr;
             b.size = 0;
+            ggml_sycl_census_pool_alloc(device, false, size, *actual_size, false, pool_size);
             return ptr;
         }
         void * ptr;
@@ -2170,6 +2197,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
 
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
+        ggml_sycl_census_pool_alloc(device, false, size, look_ahead_size, true, pool_size);
 
 #ifdef DEBUG_SYCL_MALLOC
         GGML_LOG_DEBUG("%s[%d]: %d buffers, max_size = %u MB, pool_size = %u MB, requested %u MB\n", __func__, id, nnz,
@@ -2206,6 +2234,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
     void free(void * ptr, size_t size) override {
+        ggml_sycl_census_pool_free(device, false, size);
         for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
             ggml_sycl_buffer& b = buffer_pool[i];
             if (b.ptr == nullptr) {
@@ -2395,10 +2424,12 @@ struct ggml_sycl_pool_host : public ggml_sycl_pool {
             pool_size += size;
             *actual_size = size;
             counter      = counter + 1;
+            ggml_sycl_census_pool_alloc(device, true, size, size, true, pool_size);
             return ptr;
         } else {
             ++counter;
             b.size = size;
+            ggml_sycl_census_pool_alloc(device, true, size, size, false, pool_size);
             return b.ptr;
         }
     }
@@ -2406,6 +2437,7 @@ struct ggml_sycl_pool_host : public ggml_sycl_pool {
     void free(void * ptr, size_t size) override {
         // if the pool is not completed add the pointer to it in place of the first nullptr found.
         // Otherwise do nothing, pointers will be freed once the pool is deallocated.
+        ggml_sycl_census_pool_free(device, true, size);
         for (int i = 0; i < MAX_POOL_SIZE; ++i) {
             ggml_sycl_buffer & b = buffer_pool[i];
             if (b.ptr == nullptr) {
@@ -6786,7 +6818,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             ggml_sycl_clamp(ctx, dst);
             break;
         case GGML_OP_CPY:
-            ggml_sycl_cpy(ctx, dst->src[0], dst->src[1]);
+            if (!ggml_sycl_kq_mask_try_cpy(ctx, dst)) {
+                ggml_sycl_cpy(ctx, dst->src[0], dst->src[1]);
+            }
             break;
         case GGML_OP_CONT:
             ggml_sycl_dup(ctx, dst);
@@ -6984,6 +7018,11 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (ggml_sycl_kq_mask_is_bits(tensor)) {
+        // packing works on a host copy, so this one copy has to be synchronous
+        ggml_backend_sycl_buffer_set_tensor(buf, tensor, data, offset, size);
+        return;
+    }
     if (ggml_sycl_kv_is_soa(tensor)) {
         // the permuted copy is a local, so this one copy has to be synchronous
         GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
@@ -7015,6 +7054,10 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (ggml_sycl_kq_mask_is_bits(tensor)) {
+        ggml_backend_sycl_buffer_get_tensor(buf, tensor, data, offset, size);
+        return;
+    }
     if (ggml_sycl_kv_is_soa(tensor)) {
         // unpermuting needs the bytes in hand, so this one copy has to be synchronous
         GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
@@ -7127,9 +7170,11 @@ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src, ggml_
     if (dst->buffer->buft != ggml_backend_sycl_buffer_type(dst_ctx->device)) {
         return false;
     }
-    // the copy is a flat byte move, so only identically laid out tensors qualify
+    // the copy is a flat byte move, so only identically laid out tensors qualify; a packed mask
+    // goes through the synchronous path, which packs and unpacks
     const size_t nbytes = ggml_nbytes(dst);
-    if (ggml_nbytes(src) != nbytes || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst)) {
+    if (ggml_nbytes(src) != nbytes || !ggml_is_contiguous(src) || !ggml_is_contiguous(dst) ||
+        ggml_sycl_kq_mask_is_bits(src) || ggml_sycl_kq_mask_is_bits(dst)) {
         return false;
     }
 
@@ -7650,16 +7695,45 @@ static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx
     return last - node_idx;
 }
 
+static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx);
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     // returns anything a previous graph left behind between a QSA mask chain and its reader
     sycl_ctx->qsa_sel_reset();
 
+    ggml_sycl_kq_mask_graph kq_mask;
+    ggml_sycl_kq_mask_graph_begin(*sycl_ctx, cgraph, kq_mask);
+
+    ggml_sycl_census_graph * census = nullptr;
+    if (g_ggml_sycl_census) {
+        std::vector<int> absorbed_by(cgraph->n_nodes, -1);
+        for (int j = 0; j < cgraph->n_nodes; ++j) {
+            const int n = ggml_backend_sycl_fusion_absorbs(nullptr, cgraph, j);
+            for (int k = 0; k < n; ++k) {
+                absorbed_by[j + k] = j;
+            }
+        }
+        census = ggml_sycl_census_begin(*sycl_ctx, cgraph, absorbed_by);
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (census) {
+            ggml_sycl_census_visit(census, i);
+        }
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (kq_mask.tail) {
+            ggml_sycl_kq_mask_graph_at(kq_mask, node);
+        }
+
+        // before any ADD fusion can take it: an ADD of the packed mask runs from the bits
+        if (node->op == GGML_OP_ADD && kq_mask.readers.size() && ggml_sycl_kq_mask_try_add(*sycl_ctx, node)) {
             continue;
         }
 
@@ -7848,6 +7922,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+    ggml_sycl_kq_mask_graph_end(kq_mask);
+    if (census) {
+        ggml_sycl_census_end(census);
     }
 }
 
@@ -8345,6 +8423,15 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
 static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
                                              ggml_backend_graph_optimize_params * params) {
     GGML_UNUSED(backend);
+    // before ggml-alloc sizes anything: a compact KQ mask is only allowed when every reader is taught
+    ggml_sycl_kq_mask_compact_check(cgraph);
+    // the tail of a packed KQ mask is lent as scratch for the whole split, so the mask must stay
+    // allocated to the end of it; see kq-mask-bits.hpp
+    if (cgraph->n_nodes > 0) {
+        if (ggml_tensor * mask = ggml_sycl_kq_mask_read_by(cgraph)) {
+            params->add_alloc_dep(params->user_data, mask, cgraph->nodes[cgraph->n_nodes - 1]);
+        }
+    }
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         if (cgraph->nodes[i]->op != GGML_OP_MUL) {
             continue;

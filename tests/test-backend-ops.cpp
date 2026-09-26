@@ -6746,12 +6746,16 @@ struct test_topk_qsa : public test_case {
         return "TOPK_QSA";
     }
 
+    // causal: the mask holds only 0 and -inf, as llama builds it, so a backend may pack it
+    const bool    causal;
+
     std::string vars() override {
-        return VARS_TO_STR5(n_blocks, n_kv, n_tps, n_stream, width);
+        return VARS_TO_STR5(n_blocks, n_kv, n_tps, n_stream, width) + (causal ? ",causal=1" : "");
     }
 
-    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500)
-        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width) {}
+    test_topk_qsa(int64_t n_blocks = 512, int64_t n_kv = 2048, int64_t n_tps = 2, int64_t n_stream = 1, int width = 1500,
+                  bool causal = false)
+        : n_blocks(n_blocks), n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width), causal(causal) {}
 
     double max_err() override { return 0.0; }
     bool run_whole_graph() override { return true; }
@@ -6778,6 +6782,10 @@ struct test_topk_qsa : public test_case {
 
     // distinct mask ramp + small scores keep every cell value unique, so no top-k ties
     void initialize_tensors(ggml_context * ctx) override {
+        if (causal) {
+            initialize_causal(ctx);
+            return;
+        }
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->op != GGML_OP_NONE) {
                 continue;
@@ -6800,6 +6808,43 @@ struct test_topk_qsa : public test_case {
         }
     }
 
+    // A 0/-inf mask, one block per cell and distinct scores, so the visible cells have distinct
+    // values. Every row sees at least half the cells, more than width, so no -inf is picked.
+    void initialize_causal(ggml_context * ctx) {
+        GGML_ASSERT(n_blocks == n_kv && 2*width <= n_kv && (n_kv & (n_kv - 1)) == 0);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int64_t i = 0; i < ggml_nelements(t); i++) {
+                    data[i] = (int32_t) (((i % n_kv) * 7919) % n_kv);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    const int64_t n_vis = n_kv/2 + (r * 37) % (n_kv/2);
+                    for (int64_t i = 0; i < n_kv; i++) {
+                        data[r * n_kv + i] = ggml_fp32_to_fp16(i < n_vis ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "score") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    for (int64_t b = 0; b < n_blocks; b++) {
+                        data[r * n_blocks + b] = (float) ((b * 37 + r * 11) % n_blocks) / (float) n_blocks;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+            } else {
+                init_tensor_uniform(t);  // tensors the framework adds, whatever their shape
+            }
+        }
+    }
+
     // top-k output order is unspecified; compare as a set of indices
     double err(const float * a, const float * b, size_t n) override {
         std::vector<int32_t> ia(n), ib(n);
@@ -6810,6 +6855,95 @@ struct test_topk_qsa : public test_case {
             diff += std::fabs(a[i] - ia[i]) + std::fabs(b[i] - ib[i]);
         }
         return diff + jdst(ia.data(), ib.data(), n);
+    }
+};
+
+// qwen4exp QSA mask chain up to the ADD that reads the causal mask:
+//   FILL(kq_mask, -inf) -> VIEW -> SET_ROWS(zeros at top_k) -> VIEW -> ADD(kq_mask)
+// The mask holds only 0 and -inf, so a backend may pack it. The result must match exactly.
+struct test_qsa_mask_add : public test_case {
+    const int64_t n_kv;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int64_t width;
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_MASK_ADD";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_kv, n_tps, n_stream, width);
+    }
+
+    test_qsa_mask_add(int64_t n_kv = 4096, int64_t n_tps = 4, int64_t n_stream = 1, int64_t width = 300)
+        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(width) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(kq_mask, "kq_mask");
+        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, width, n_tps, 1, n_stream);
+        ggml_set_name(top_k, "top_k");
+
+        ggml_tensor * all = ggml_fill(ctx, kq_mask, -INFINITY);
+        all = ggml_view_4d(ctx, all, 1, all->ne[0], all->ne[1], all->ne[3], all->nb[0], all->nb[1], all->nb[2], 0);
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
+                                              top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx, zeros, 0.0f);
+        ggml_tensor * m = ggml_set_rows(ctx, all, zeros, top_k_3d);
+        m = ggml_view_4d(ctx, m, m->ne[1], m->ne[2], 1, m->ne[3], m->nb[2], m->nb[3], m->nb[3], 0);
+        out = ggml_add(ctx, m, kq_mask);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "kq_mask") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    const int64_t n_vis = n_kv/2 + (r * 131) % (n_kv/2);
+                    for (int64_t c = 0; c < n_kv; c++) {
+                        data[r*n_kv + c] = ggml_fp32_to_fp16(c < n_vis ? 0.0f : -INFINITY);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "top_k") == 0) {
+                // distinct cells per row, visible and hidden alike
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::vector<int32_t> cells(n_kv);
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    for (int64_t c = 0; c < n_kv; c++) {
+                        cells[c] = (int32_t) c;
+                    }
+                    std::shuffle(cells.begin(), cells.end(), rng);
+                    std::copy(cells.begin(), cells.begin() + width, data.begin() + r*width);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+
+    // bit-exact: 0 and -inf only, and the framework has already matched the infinities
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            if (!(a[i] == b[i]) && !(std::isinf(a[i]) && std::isinf(b[i]) && std::signbit(a[i]) == std::signbit(b[i]))) {
+                diff += 1.0;
+            }
+        }
+        return diff;
     }
 };
 
@@ -10815,6 +10949,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    // a 0/-inf mask, which a backend may pack: the fused top-k and the small-k unfused path
+    test_cases.emplace_back(new test_topk_qsa(2048, 2048,  2, 1, 1000, true));
+    test_cases.emplace_back(new test_topk_qsa(2048, 2048,  4, 2, 900,  true));
+    test_cases.emplace_back(new test_topk_qsa(256,  256,   3, 1, 8,    true));
+    test_cases.emplace_back(new test_qsa_mask_add(4096, 4, 1, 300));
+    test_cases.emplace_back(new test_qsa_mask_add(1024, 7, 2, 1024));
+    test_cases.emplace_back(new test_qsa_mask_add(40,   1, 1, 5));
 
     // qwen4exp QSA attention chain: 24/2 heads, head size 256, width 2051
     for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {

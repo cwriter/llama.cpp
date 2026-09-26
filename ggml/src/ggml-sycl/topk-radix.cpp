@@ -5,6 +5,7 @@
 #include "binbcast.hpp"
 #include "common.hpp"
 #include "getrows.hpp"
+#include "kq-mask-bits.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -569,7 +570,13 @@ int ggml_sycl_fuse_qsa_topk(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
 
     const size_t nb_mask_row = (size_t) ncols * ggml_type_size(mask->type);
 
-    if (mask->type == GGML_TYPE_F16) {
+    if (c.i_cast >= 0 && ggml_sycl_kq_mask_is_bits(mask)) {
+        // the packed causal mask; the shape test above already ties its ne0 to the ADD's
+        top_k_radix_rows(ctx, top_k_rows_qsa_bits{ score_dd, idx_dd, mask_dd, src->nb[1], src->nb[0],
+                                                   ggml_sycl_kq_mask_row_bytes(mask->ne[0]) },
+                         dst_dd, ncols, nrows, k, ctx.stream());
+        ggml_sycl_kq_mask_taught(ctx, cgraph->nodes[c.i_cast]);
+    } else if (mask->type == GGML_TYPE_F16) {
         top_k_radix_rows(ctx, top_k_rows_qsa<sycl::half>{ score_dd, idx_dd, mask_dd, src->nb[1], src->nb[0], nb_mask_row },
                          dst_dd, ncols, nrows, k, ctx.stream());
     } else {
