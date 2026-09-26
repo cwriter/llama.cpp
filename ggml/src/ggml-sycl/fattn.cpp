@@ -109,7 +109,7 @@ enum best_fattn_kernel {
 // The shape envelope the oneMKL kernel is validated for. Split out of the dispatcher so the
 // staging budget below can ask the same question before it declines oneDNN.
 static bool ggml_sycl_fattn_mkl_supported(const ggml_tensor * dst) {
-    if (g_ggml_sycl_enable_mkl_fa != 1) {
+    if (g_ggml_sycl_enable_mkl_fa <= 0) {
         return false;
     }
     const ggml_tensor * Q     = dst->src[0];

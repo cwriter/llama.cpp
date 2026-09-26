@@ -284,6 +284,30 @@ static void mkl_fa_normalize_head(
     });
 }
 
+// Normalize all GQA heads of one KV head and scatter them to dst in one launch. Work-items walk
+// DV in float4 steps, so loads and stores are contiguous across a sub-group.
+static void mkl_fa_normalize_group(
+    dpct::queue_ptr stream, float * __restrict dst_batch, const float * __restrict VKQ_accum,
+    const float * __restrict KQ_sum, int kvh_base_head, int n_query_rows, int n_queries, int DV, int n_q_heads) {
+
+    const int dv4 = DV / 4;
+    const int rpg = MKL_FA_WG_SIZE / dv4;
+    stream->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>((n_query_rows + rpg - 1) / rpg * rpg, dv4), sycl::range<2>(rpg, dv4)),
+        [=](sycl::nd_item<2> it) {
+            const int row = (int) it.get_global_id(0);
+            if (row >= n_query_rows) {
+                return;
+            }
+            const int   v       = (int) it.get_local_id(1) * 4;
+            const int   iqg     = row / n_queries;
+            const int   jc      = row - iqg * n_queries;
+            const float inv_sum = KQ_sum[row] > 0.0f ? 1.0f / KQ_sum[row] : 0.0f;  // a fully masked row gives 0, not NaN
+            const sycl::float4 x = *(const sycl::float4 *) (VKQ_accum + (int64_t) row * DV + v);
+            *(sycl::float4 *) (dst_batch + ((int64_t) jc * n_q_heads + kvh_base_head + iqg) * DV + v) = x * inv_sum;
+        });
+}
+
 // ---------------------------------------------------------------------------
 // Per-chunk dequant
 //
@@ -617,6 +641,12 @@ static void mkl_fa_dequant_chunk(
     sycl::half * out, int ikvh, int chunk_start, int this_chunk) {
 
     const int64_t D = d.D;
+    if (d.soa) {
+        // the canonical converters below would read the permuted span bytes as garbage
+        const char * base = d.data + (int64_t)ikvh * d.nb2 + (int64_t)chunk_start * d.nb1;
+        ggml_sycl_kv_soa_to_fp16(base, out, D, this_chunk, 1, d.nb1, d.nb2, stream);
+        return;
+    }
     switch (d.mode) {
         case MKL_FA_KV_MODE_F16_DENSE: {
             const char * base = d.data + (int64_t)ikvh * d.nb2
@@ -801,6 +831,11 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     <std::chrono::microseconds>(std::chrono::steady_clock::now() - (t0)).count(); \
 } } while(0)
 
+    // Drain the work queued before this node, or the first stage below absorbs it.
+    if (mkl_fa_drain) {
+        stream->wait();
+    }
+
     MKL_TAKE_TIME(t_all);
 
     int64_t gemm_kq_time_us  = 0;
@@ -824,6 +859,10 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
         ? K_desc : mkl_fa_make_desc(V, v_interleaved);
 
     MKL_ACCUM(dequant_time_us, t_deq);
+
+    // GGML_SYCL_ENABLE_MKL_FA=2 keeps the per-head normalize
+    const bool fast_norm = g_ggml_sycl_enable_mkl_fa != 2 && DV % 4 == 0 && MKL_FA_WG_SIZE % (DV / 4) == 0 &&
+                           (uintptr_t) KQV->data % 16 == 0;
 
     // --- Resolve mask pointers ---
     int64_t mask_head_stride = 0;
@@ -1032,13 +1071,18 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
             }
 
             // 4. Normalize and scatter each GQA head to dst
-            for (int iqg = 0; iqg < gqa_ratio; iqg++) {
-                int     iqh        = kvh_base_head + iqg;
-                int64_t src_offset = (int64_t)iqg * n_queries * DV;
-                mkl_fa_normalize_head(stream,
-                    dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
-                    iqh, n_queries, DV, n_q_heads,
-                    src_offset, wg_size);
+            if (fast_norm) {
+                mkl_fa_normalize_group(stream, dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
+                    kvh_base_head, n_query_rows, n_queries, DV, n_q_heads);
+            } else {
+                for (int iqg = 0; iqg < gqa_ratio; iqg++) {
+                    int     iqh        = kvh_base_head + iqg;
+                    int64_t src_offset = (int64_t)iqg * n_queries * DV;
+                    mkl_fa_normalize_head(stream,
+                        dst_batch, VKQ_accum_ptr, KQ_sum_ptr,
+                        iqh, n_queries, DV, n_q_heads,
+                        src_offset, wg_size);
+                }
             }
         }
     }
