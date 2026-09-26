@@ -64,7 +64,9 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
     // get_alloc_size is optional, defaults to ggml_nbytes
     if (buft->iface.get_alloc_size) {
         size_t size = buft->iface.get_alloc_size(buft, tensor);
-        assert(size >= ggml_nbytes(tensor));
+        // a buffer type may report less than ggml_nbytes for a tensor it stores in a compact
+        // layout; its set_tensor/get_tensor/cpy_tensor then own the conversion, and every
+        // allocation decision goes through this size, so ggml-alloc stays consistent
 
         // [TAG_ALLOC_SIZE_EXPAND]
         // if you hit this assert, update ggml_backend_op_alloc_size_may_expand() accordingly
@@ -178,6 +180,15 @@ size_t ggml_backend_buffer_get_max_size(ggml_backend_buffer_t buffer) {
 
 size_t ggml_backend_buffer_get_alloc_size(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor) {
     return ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(buffer), tensor);
+}
+
+size_t ggml_compacted_nbytes(const struct ggml_tensor * tensor) {
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (tensor->view_src != NULL || tensor->buffer == NULL) {
+        return nbytes;
+    }
+    const size_t size = ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor);
+    return size < nbytes ? size : nbytes;
 }
 
 bool ggml_backend_buffer_is_host(ggml_backend_buffer_t buffer) {
