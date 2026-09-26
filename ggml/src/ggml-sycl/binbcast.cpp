@@ -1,4 +1,5 @@
 #include "binbcast.hpp"
+#include "kq-mask-bits.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -428,6 +429,13 @@ int ggml_sycl_fuse_cast_add(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
     ggml_tensor * acc  = add->src[0];
     ggml_tensor * rhs  = add->src[1];
 
+    // a packed causal mask: add it from the bits, which is what the cast would have produced
+    if (ggml_sycl_kq_mask_is_bits(cast->src[0])) {
+        ggml_sycl_kq_mask_add_bits(ctx, acc, cast->src[0], add);
+        ggml_sycl_kq_mask_taught(ctx, cast);
+        return n - 1;
+    }
+
     ggml_tensor rhs_f16 = ggml_sycl_cast_add_rhs_f16(cast, rhs);
 
     // GGML_SYCL_CAST_ADD_TRACE gives the number of firings to report
@@ -587,6 +595,9 @@ inline void ggml_sycl_op_repeat(ggml_backend_sycl_context & ctx, ggml_tensor *ds
 
 void ggml_sycl_add(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+    if (ggml_sycl_kq_mask_try_add(ctx, dst)) {
+        return;
+    }
     ggml_sycl_op_add(ctx, dst);
 }
 

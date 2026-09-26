@@ -437,6 +437,7 @@ struct ggml_sycl_layout {
     ggml_sycl_layout_kind kind = GGML_SYCL_LAYOUT_CANONICAL;
     ggml_type             type = GGML_TYPE_COUNT;  // the block type the permutation applies to
     int32_t               span = 0;                // elements per self-contained unit
+    size_t                nbytes = 0;              // bytes held when below ggml_nbytes, else 0
 
     bool is_canonical() const { return kind == GGML_SYCL_LAYOUT_CANONICAL; }
 };
@@ -704,9 +705,17 @@ struct ggml_backend_sycl_context {
 
     static std::unique_ptr<ggml_sycl_fattn_kv_buffers> new_fattn_kv_buffers(queue_ptr qptr, int device);
 
+    // scratch lent from the dead tail of a packed KQ mask, set only while a graph runs; see kq-mask-bits.hpp
+    std::unique_ptr<ggml_sycl_pool>  kq_mask_tail;
+    ggml_sycl_pool *                 pool_override = nullptr;
+    std::vector<const ggml_tensor *> kq_mask_taught;
+
     ggml_sycl_pool & pool(int device) {
         if (pools[device] == nullptr) {
             pools[device] = new_pool_for_device(stream(device,0), device);
+        }
+        if (pool_override && device == this->device) {
+            return *pool_override;
         }
         return *pools[device];
     }
