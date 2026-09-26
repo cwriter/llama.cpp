@@ -5,6 +5,7 @@
 
 #include "common.hpp"
 #include "fattn.hpp"
+#include "fattn-qsa.hpp"
 
 #include <atomic>
 #include <algorithm>
@@ -27,13 +28,22 @@
 // reserve and cuts what the softmax reads per cell from 16 bits to 1.
 //   mode 1: the bit is selection only, the kernel still adds the causal mask
 //   mode 2: the bit is selection AND the causal mask, which the kernel then never reads
+//   mode 3: no bitmap and no dense mask. Flash attention reads the top-k list and the causal mask
+//           and attends to the listed cells only (fattn-qsa.cpp).
 // The bitmap is built HERE, at the chain, and not at the reader: ggml-alloc releases the top-k
 // list at the SET_ROWS node, so by the time the reader runs the list may already be gone.
 //
-// The set_rows payload is a separate FILL of zeros that the graph emits far from the chain,
-// so it is reached through src[] and left alone; the fusion never reads it.
+// The set_rows payload is a FILL of zeros (one row, then REPEAT), which none of the fusions
+// read, so it is reached through src[] and left alone.
 
 static constexpr int SYCL_QSA_MASK_SPAN = 4;
+
+// GGML_SYCL_FUSE_QSA_FA_MASK value of the gather mode
+static constexpr int SYCL_QSA_FA_SPARSE = 3;
+
+static bool qsa_fa_sparse_mode() {
+    return g_ggml_sycl_fuse_qsa_fa_mask == SYCL_QSA_FA_SPARSE;
+}
 
 struct qsa_mask_chain {
     const ggml_tensor * fill;  // FILL -inf, the copy of the mask that the fusion never writes
@@ -104,7 +114,9 @@ static bool qsa_mask_chain_from_add(const ggml_cgraph * cgraph, ggml_tensor * ad
     if (!std::isinf(v_fill) || v_fill > 0.0f) {
         return false;
     }
-    if (fz->op != GGML_OP_FILL || ggml_get_op_params_f32(fz, 0) != 0.0f) {
+    // the model fills one row of zeros and repeats it
+    const ggml_tensor * fz0 = fz->op == GGML_OP_REPEAT ? fz->src[0] : fz;
+    if (!fz0 || fz0->op != GGML_OP_FILL || ggml_get_op_params_f32(fz0, 0) != 0.0f) {
         return false;
     }
 
@@ -187,13 +199,20 @@ static bool qsa_fa_mask_core(const ggml_cgraph * cgraph, ggml_tensor * fa, qsa_m
     if (!ad || ad->type != GGML_TYPE_F16 || qsa_use_count(cgraph, ad) != 1) {
         return false;
     }
-    if (!qsa_mask_chain_from_add(cgraph, ad, out)) {
+    qsa_mask_chain c;
+    if (!qsa_mask_chain_from_add(cgraph, ad, &c)) {
         return false;
     }
-    // A packed causal mask is itself a bitmap, and this fusion would hand oneMKL a second one
-    // with different semantics, so the two features must not combine.
-    if (ggml_sycl_kq_mask_is_bits(ad) || ggml_sycl_kq_mask_is_bits(fa->src[3])) {
+    // A packed causal mask is itself a bitmap: this fusion would hand oneMKL a second one with
+    // different semantics, and the gather kernels read the mask as f16, so the features must not combine.
+    if (ggml_sycl_kq_mask_is_bits(ad) || ggml_sycl_kq_mask_is_bits(c.mask)) {
         return false;
+    }
+    if (out) {
+        *out = c;
+    }
+    if (qsa_fa_sparse_mode()) {
+        return ggml_sycl_qsa_sparse_fa_supported(fa);
     }
     // only the chunked oneMKL kernel can take a bitmap; every other kernel must keep the dense mask
     return ggml_sycl_fattn_picks_mkl(fa);
@@ -243,7 +262,7 @@ int ggml_sycl_qsa_mask_absorbs(const ggml_cgraph * cgraph, int node_idx) {
     }
     if (g_ggml_sycl_fuse_qsa_fa_mask) {
         if (qsa_fa_mask_reader(cgraph, node_idx) >= 0) {
-            return SYCL_QSA_MASK_SPAN + 1;  // fill, three views, add
+            return SYCL_QSA_MASK_SPAN + 1;  // fill, view, set_rows, view, add
         }
     }
     if (!g_ggml_sycl_fuse_qsa_mask) {
@@ -377,7 +396,7 @@ static void qsa_sel_stats(ggml_backend_sycl_context & ctx, const qsa_mask_chain 
             (long) n_kv, (long) n_tps, (long) n_rows, (int) oddballs);
 
     std::vector<uint32_t> u((size_t) words);
-    for (int64_t B : { (int64_t) 1, (int64_t) 8, (int64_t) 32, (int64_t) 64, (int64_t) 160, n_tps }) {
+    for (int64_t B : { (int64_t) 1, (int64_t) 8, (int64_t) 16, (int64_t) 32, (int64_t) 64, (int64_t) 128, (int64_t) 256, n_tps }) {
         if (B > n_rows) {
             continue;
         }
@@ -448,13 +467,15 @@ static void qsa_sel_bits_build(ggml_backend_sycl_context & ctx, const ggml_tenso
         });
 
     // GGML_SYCL_QSA_SEL_STATS is the smallest n_kv worth reporting on, because the answer only
-    // matters at a long context. It answers two questions off the live data: how much of the
-    // context a block of neighbouring tokens selects between them (which is what decides whether
-    // a tile of the flash attention loop could ever be skipped), and whether the causal mask
-    // really only ever holds 0 or -inf (which is what mode 2 relies on).
+    // matters at a long context; each distinct n_kv above it is reported once, six at most. It
+    // answers two questions off the live data: how much of the context a block of neighbouring
+    // tokens selects between them (which sizes the union tiles of fattn-qsa.cpp), and whether the
+    // causal mask really only ever holds 0 or -inf (which is what mode 2 relies on).
     static const int    stats_min  = ggml_sycl_get_env("GGML_SYCL_QSA_SEL_STATS", 0);
-    static std::atomic<int> stats_left{ 4 };
-    if (stats_min > 0 && n_kv >= stats_min && stats_left.fetch_sub(1) > 0) {
+    static std::atomic<int> stats_left{ 6 };
+    static std::atomic<int64_t> stats_last{ -1 };
+    if (stats_min > 0 && n_kv >= stats_min && n_kv != stats_last.load() && stats_left.fetch_sub(1) > 0) {
+        stats_last.store(n_kv);
         qsa_sel_stats(ctx, c, bits, n_kv, n_tps, n_rows, words);
     }
 }
@@ -469,6 +490,9 @@ int ggml_sycl_fuse_qsa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
     // the dense mask is never built when flash attention takes the bitmap; leave it the bits
     if (g_ggml_sycl_fuse_qsa_fa_mask) {
         const int i_fa = qsa_fa_mask_reader(cgraph, i);
+        if (i_fa >= 0 && qsa_fa_sparse_mode()) {
+            return SYCL_QSA_MASK_SPAN;  // nothing to build: the reader takes the list itself
+        }
         if (i_fa >= 0) {
             ggml_sycl_qsa_mask_shape(cgraph, i, &c);
             qsa_sel_bits_build(ctx, cgraph->nodes[i_fa], c);
@@ -528,6 +552,11 @@ bool ggml_sycl_qsa_fa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph
     qsa_mask_chain c;
     if (!qsa_fa_mask_located(cgraph, i, &c)) {
         return false;
+    }
+
+    if (qsa_fa_sparse_mode()) {
+        ggml_sycl_qsa_sparse_fa(ctx, cgraph->nodes[i], c.mask, c.idx);
+        return true;
     }
 
     // the same matcher decided the dense mask was never built, so a miss here means the absorb
