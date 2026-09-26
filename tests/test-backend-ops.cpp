@@ -6764,6 +6764,160 @@ struct test_topk_qsa : public test_case {
     }
 };
 
+// qwen4exp QSA attention: the dense mask chain of build_attn_qsa feeding flash attention.
+//   FILL(kq_mask, -inf) -> VIEW -> SET_ROWS(zeros at top_k) -> VIEW -> ADD(kq_mask) -> FLASH_ATTN_EXT
+// Backends may run it as a gather over the listed cells (SYCL: GGML_SYCL_FUSE_QSA_FA_MASK=3).
+// n_dead rows list only hidden cells; the CPU reference gives 0 there.
+struct test_qsa_sparse_fa : public test_case {
+    const int64_t   n_kv;
+    const int64_t   n_tps;
+    const int64_t   n_stream;
+    const int64_t   width;
+    const ggml_type type_KV;
+    const int64_t   hs;
+    const int64_t   n_head;
+    const int64_t   n_head_kv;
+    const bool      sinks;
+    const float     softcap;
+    const int64_t   n_dead;
+    const bool      plain;  // the mask holds 0 and -inf only, as the model's causal mask does
+    ggml_tensor *   out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_SPARSE_FA";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR10(n_kv, n_tps, n_stream, width, type_KV, hs, n_head, n_head_kv, sinks, softcap) + "," +
+               VARS_TO_STR2(n_dead, plain);
+    }
+
+    test_qsa_sparse_fa(int64_t n_kv = 4096, int64_t n_tps = 1, int64_t n_stream = 1, int64_t width = 2051,
+                       ggml_type type_KV = GGML_TYPE_Q8_0, int64_t hs = 256, int64_t n_head = 24, int64_t n_head_kv = 2,
+                       bool sinks = false, float softcap = 0.0f, int64_t n_dead = 0, bool plain = false)
+        : n_kv(n_kv), n_tps(n_tps), n_stream(n_stream), width(std::min(width, n_kv)), type_KV(type_KV), hs(hs),
+          n_head(n_head), n_head_kv(n_head_kv), sinks(sinks), softcap(softcap), n_dead(n_dead), plain(plain) {}
+
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    // the model's cells used: the rest of the cache is empty and hidden from every token
+    int64_t n_used() const { return n_kv - n_kv / 16; }
+    int64_t pos(int64_t t) const { return n_used() - n_tps + t; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * kq_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+        ggml_set_name(kq_mask, "kq_mask");
+        ggml_tensor * top_k = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, width, n_tps, 1, n_stream);
+        ggml_set_name(top_k, "top_k");
+
+        // cache_ names make a SYCL build with GGML_SYCL_KV_SOA=1 store these in its SoA layout,
+        // which is only defined for head sizes that are whole 256-element spans
+        const bool soa_ok = hs % 256 == 0;
+        ggml_tensor * k_cache = ggml_new_tensor_3d(ctx, type_KV, hs*n_head_kv, n_kv, n_stream);
+        ggml_set_name(k_cache, soa_ok ? "cache_k_l0" : "k_l0");
+        ggml_tensor * v_cache = ggml_new_tensor_3d(ctx, type_KV, hs*n_head_kv, n_kv, n_stream);
+        ggml_set_name(v_cache, soa_ok ? "cache_v_l0" : "v_l0");
+
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, n_head, n_tps*n_stream);
+        ggml_set_name(q, "q");
+
+        // the chain exactly as build_attn_qsa emits it
+        ggml_tensor * kq_mask_all = ggml_fill(ctx, kq_mask, -INFINITY);
+        kq_mask_all = ggml_view_4d(ctx, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
+                                   kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1,
+                                              top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, top_k_3d->ne[0]), 0.0f);
+        zeros = ggml_repeat_4d(ctx, zeros, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        ggml_tensor * m = ggml_set_rows(ctx, kq_mask_all, zeros, top_k_3d);
+        m = ggml_view_4d(ctx, m, m->ne[1], m->ne[2], 1, m->ne[3], m->nb[2], m->nb[3], m->nb[3], 0);
+        m = ggml_add(ctx, m, kq_mask);
+
+        // as llama_kv_cache::get_k and build_attn_mha lay them out
+        ggml_tensor * k = ggml_view_4d(ctx, k_cache, hs, n_head_kv, n_kv, n_stream,
+                                       ggml_row_size(type_KV, hs), k_cache->nb[1], k_cache->nb[2], 0);
+        ggml_tensor * v = ggml_view_4d(ctx, v_cache, hs, n_head_kv, n_kv, n_stream,
+                                       ggml_row_size(type_KV, hs), v_cache->nb[1], v_cache->nb[2], 0);
+        ggml_tensor * qv = ggml_view_4d(ctx, q, hs, n_head, n_tps, n_stream, q->nb[1], q->nb[2], q->nb[2]*n_tps, 0);
+        qv = ggml_permute(ctx, qv, 0, 2, 1, 3);
+        k  = ggml_permute(ctx, k, 0, 2, 1, 3);
+        v  = ggml_permute(ctx, v, 0, 2, 1, 3);
+
+        ggml_tensor * s = nullptr;
+        if (sinks) {
+            s = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_head);
+            ggml_set_name(s, "sinks");
+        }
+
+        out = ggml_flash_attn_ext(ctx, qv, k, v, m, 1.0f/sqrtf((float) hs), 0.0f, softcap);
+        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_flash_attn_ext_set_n_kv_max(out, (int32_t) width);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "kq_mask") == 0) {
+                // causal: cell c is visible from token t iff c <= pos(t). A few visible cells carry a
+                // finite non-zero value, so a kernel that assumes {0, -inf} is caught.
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t s = 0; s < n_stream; s++) {
+                    for (int64_t it = 0; it < n_tps; it++) {
+                        ggml_fp16_t * row = data.data() + (s*n_tps + it)*n_kv;
+                        for (int64_t c = 0; c < n_kv; c++) {
+                            float v = -INFINITY;
+                            if (c <= pos(it)) {
+                                v = (!plain && c % 7 == 3) ? -0.5f*(float) (c % 5) : 0.0f;
+                            }
+                            row[c] = ggml_fp32_to_fp16(v);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "top_k") == 0) {
+                // distinct cells per row. Mostly visible ones, like the indexer picks, plus some
+                // hidden ones; the first n_dead rows list hidden cells only.
+                std::vector<int32_t> data(ggml_nelements(t));
+                std::vector<int32_t> vis, hid;
+                for (int64_t s = 0; s < n_stream; s++) {
+                    for (int64_t it = 0; it < n_tps; it++) {
+                        vis.clear();
+                        hid.clear();
+                        for (int64_t c = 0; c < n_kv; c++) {
+                            (c <= pos(it) ? vis : hid).push_back((int32_t) c);
+                        }
+                        std::shuffle(vis.begin(), vis.end(), rng);
+                        std::shuffle(hid.begin(), hid.end(), rng);
+                        int64_t n_vis = std::min<int64_t>((int64_t) vis.size(), width - width/20);
+                        if (it < n_dead) {
+                            n_vis = 0;
+                        }
+                        n_vis = std::max<int64_t>(n_vis, width - (int64_t) hid.size());
+                        std::vector<int32_t> row(vis.begin(), vis.begin() + n_vis);
+                        row.insert(row.end(), hid.begin(), hid.begin() + (width - n_vis));
+                        std::shuffle(row.begin(), row.end(), rng);
+                        std::copy(row.begin(), row.end(), data.begin() + (s*n_tps + it)*width);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "sinks") == 0) {
+                init_tensor_uniform(t, -10.0f, 10.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -10603,6 +10757,38 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
 
+    // qwen4exp QSA attention chain: 24/2 heads, head size 256, width 2051
+    for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+        // decode
+        test_cases.emplace_back(new test_qsa_sparse_fa(4096,   1, 1, 2051, type_KV));
+        test_cases.emplace_back(new test_qsa_sparse_fa(32768,  1, 1, 2051, type_KV));
+        test_cases.emplace_back(new test_qsa_sparse_fa(131072, 1, 1, 2051, type_KV));
+        // prefill
+        test_cases.emplace_back(new test_qsa_sparse_fa(1024,   1024, 1, 2051, type_KV));  // empty context: width = n_kv
+        test_cases.emplace_back(new test_qsa_sparse_fa(8192,   1024, 1, 2051, type_KV));
+        test_cases.emplace_back(new test_qsa_sparse_fa(4096,   7,    2, 2051, type_KV));  // two streams
+    }
+    test_cases.emplace_back(new test_qsa_sparse_fa(32768,  1024, 1, 2051, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_qsa_sparse_fa(131072, 1024, 1, 2051, GGML_TYPE_Q8_0));
+    // partial query tiles, a context no wider than the list, and a batch that ends a prompt
+    test_cases.emplace_back(new test_qsa_sparse_fa(4096,   100,  1, 2051, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_qsa_sparse_fa(2048,   1024, 1, 2051, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_qsa_sparse_fa(16384,  256,  1, 2051, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_qsa_sparse_fa(131072, 37,   1, 2051, GGML_TYPE_F16));
+    // the model's mask: 0 or -inf only, so a kernel may fold it into its selection
+    test_cases.emplace_back(new test_qsa_sparse_fa(8192,   1024, 1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 0, true));
+    test_cases.emplace_back(new test_qsa_sparse_fa(131072, 1024, 1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 0, true));
+    test_cases.emplace_back(new test_qsa_sparse_fa(4096,   100,  1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 2, true));
+    test_cases.emplace_back(new test_qsa_sparse_fa(4096,   1,    1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 0, true));
+    test_cases.emplace_back(new test_qsa_sparse_fa(3000,   33,   1, 2051, GGML_TYPE_Q8_0, 128, 8, 2));
+    test_cases.emplace_back(new test_qsa_sparse_fa(4096,   5,    1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, true));
+    test_cases.emplace_back(new test_qsa_sparse_fa(4096,   5,    1, 2051, GGML_TYPE_F16,  256, 24, 2, false, 30.0f));
+    test_cases.emplace_back(new test_qsa_sparse_fa(4096,   1,    1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, true, 30.0f));
+    // rows that list hidden cells only
+    test_cases.emplace_back(new test_qsa_sparse_fa(4096,   33,   1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 4));
+    test_cases.emplace_back(new test_qsa_sparse_fa(4096,   33,   1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, true,  0.0f, 4));
+    test_cases.emplace_back(new test_qsa_sparse_fa(8192,   1,    1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 1));
+
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
@@ -11118,6 +11304,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // qwen4exp QSA attention chain: dense mask + flash attention, or the SYCL gather mode
+    for (int64_t n_kv : { 8192, 32768, 131072 }) {
+        for (int64_t n_tps : { 1, 1024 }) {
+            test_cases.emplace_back(new test_qsa_sparse_fa(n_kv, n_tps, 1, 2051, GGML_TYPE_Q8_0));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
