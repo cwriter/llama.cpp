@@ -106,6 +106,32 @@ template <typename mask_t> struct top_k_rows_qsa {
     }
 };
 
+// the same with the causal mask packed to one bit per cell (kq-mask-bits.hpp): +0 or -inf
+struct top_k_src_qsa_bits {
+    const char *     score;
+    const int32_t *  idx;
+    const uint32_t * bits;
+    size_t           nb_blk;
+
+    float operator()(int col) const {
+        const float s = *(const float *) (score + (int64_t) idx[col]*nb_blk);
+        return s + (((bits[col >> 5] >> (col & 31)) & 1u) ? 0.0f : -INFINITY);
+    }
+};
+
+struct top_k_rows_qsa_bits {
+    const char *    score;
+    const int32_t * idx;
+    const char *    mask;
+    size_t          nb_blk;
+    size_t          nb_score_row;
+    size_t          nb_mask_row;
+
+    top_k_src_qsa_bits row(int64_t r) const {
+        return { score + r*nb_score_row, idx, (const uint32_t *) (mask + r*nb_mask_row), nb_blk };
+    }
+};
+
 // The selection step lives here because the fused topk-moe kernel reuses it: softmax and
 // sigmoid are monotonic, so the routing top-k can be taken on the raw logits.
 template <typename Src>
