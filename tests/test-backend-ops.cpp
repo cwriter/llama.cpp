@@ -5126,6 +5126,42 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
     init_mul_mat_id_ids(ctx, n_mats);
 }
 
+// GGML_OP_MUL_MAT on a weight that an earlier mat-vec used: a backend that reorders the weight on
+// its first mat-vec must compute the wider product from the reordered layout. The second input
+// depends on the first product, so the mat-vec runs first.
+struct test_mul_mat_reused_weight : public test_case {
+    const ggml_type type_a;
+    const int64_t   k;
+    const int64_t   n;
+
+    std::string vars() override {
+        return VARS_TO_STR3(type_a, k, n);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_reused_weight(ggml_type type_a = GGML_TYPE_Q8_0, int64_t k = 256, int64_t n = 128)
+        : type_a(type_a), k(k), n(n) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type_a, k, k);
+        ggml_set_name(w, "w");
+        ggml_tensor * x1 = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(x1, "x1");
+        ggml_tensor * y1 = ggml_mul_mat(ctx, w, x1);
+        ggml_set_name(y1, "y1");
+        ggml_tensor * xn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(xn, "xn");
+        ggml_tensor * xb = ggml_add(ctx, xn, y1);
+        ggml_set_name(xb, "xb");
+        ggml_tensor * out = ggml_mul_mat(ctx, w, xb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -5137,9 +5173,14 @@ struct test_mul_mat_id : public test_case {
     const int64_t n;
     const int64_t k;
     const float amax; // magnitude of src1
+    const int64_t b_off; // if > 0, b is a view that starts this many floats into a bigger tensor
 
     std::string vars() override {
-        return VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, amax);
+        std::string s = VARS_TO_STR9(type_a, type_b, n_mats, n_used, b, m, n, k, amax);
+        if (b_off > 0) {
+            s += ",b_off=" + std::to_string(b_off);
+        }
+        return s;
     }
 
     double max_nmse_err() override {
@@ -5162,9 +5203,9 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            float amax = 1.0f)
+            float amax = 1.0f, int64_t b_off = 0)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), amax(amax) {
+            m(m), n(n), k(k), amax(amax), b_off(b_off) {
             GGML_ASSERT(n_used <= n_mats);
         }
 
@@ -5180,7 +5221,15 @@ struct test_mul_mat_id : public test_case {
             ggml_set_name(ids, "view_of_ids");
         }
 
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        const int64_t nb_used = this->b ? 1 : n_used;
+        ggml_tensor * b;
+        if (b_off > 0) {
+            ggml_tensor * b_all = ggml_new_tensor_1d(ctx, type_b, k * nb_used * n + b_off);
+            const size_t  esz   = ggml_type_size(type_b);
+            b = ggml_view_3d(ctx, b_all, k, nb_used, n, k * esz, k * nb_used * esz, b_off * esz);
+        } else {
+            b = ggml_new_tensor_3d(ctx, type_b, k, nb_used, n);
+        }
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
@@ -10348,6 +10397,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+    for (int64_t n : {77, 128}) {
+        test_cases.emplace_back(new test_mul_mat_reused_weight(GGML_TYPE_Q8_0, 256, n));
+        test_cases.emplace_back(new test_mul_mat_reused_weight(GGML_TYPE_Q8_0, 2560, n));
+    }
+    // src1 rows at 4, 16 and 32 byte offsets: the grouped GEMM packs B with wide loads only when every row is aligned
+    for (int64_t b_off : {1, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false, 128, 300, 512, 1.0f, b_off));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 256, 300, 160, 1.0f, b_off));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 256, 300, 160));
 
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
@@ -11544,6 +11603,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+
+    // qwen4exp (Qwen3.8-Flash-Next): 48 recurrent heads of 128, 4 hyper-connection streams of 2560
+    for (int n : {1, 1024}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, n, 1));
+        test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n, true));
+        test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true));
+    }
+
+    // qwen4exp (Qwen3.8-Flash-Next): 512 experts, 10 used; gate/up 2560 -> 640, down 640 -> 2560
+    for (int bs : {1, 1024}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false, 640,  bs, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,   GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+    }
 
     // gpt-oss-20b
     for (int bs : {1, 4, 8, 512}) {

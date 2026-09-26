@@ -170,8 +170,8 @@ static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int
 
 }
 
-template <typename dst_t>
-static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
+template <bool WIDE, typename dst_t>
+static void dequantize_row_q8_0_sycl_reorder_impl(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
 
     dpct::has_capability_or_fail(stream->get_device(),
@@ -187,9 +187,24 @@ static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int
         sycl::range<3>(1, 1, wg_size),
         sycl::range<3>(1, 1, wg_size)),
         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]]{
-            dequantize_block_q8_0_reorder(vx, y, k, item_ct1);
+            if constexpr (WIDE) {
+                dequantize_block_q8_0_reorder_wide(vx, y, k, item_ct1);
+            } else {
+                dequantize_block_q8_0_reorder(vx, y, k, item_ct1);
+            }
         });
 
+}
+
+template <typename dst_t>
+static void dequantize_row_q8_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
+                                     dpct::queue_ptr stream) {
+    // the quant stream starts at vx and the blocks are 32 B, so vx and y decide the alignment
+    if ((g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_CONVERT) && ((uintptr_t) vx | (uintptr_t) y) % 16 == 0) {
+        dequantize_row_q8_0_sycl_reorder_impl<true>(vx, y, k, stream);
+    } else {
+        dequantize_row_q8_0_sycl_reorder_impl<false>(vx, y, k, stream);
+    }
 }
 
 template <typename dst_t>
@@ -709,6 +724,29 @@ static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restri
 
 template <typename src_t, typename dst_t>
 static void convert_unary_sycl(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr queue) {
+    // f32 -> f16 of a contiguous, aligned run: a work-item converts 8 values with one 32 B load and
+    // one 16 B store, instead of one value behind 64-bit index math. Same conversion per value.
+    if constexpr (std::is_same_v<src_t, float> && std::is_same_v<dst_t, sycl::half>) {
+        if ((g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_CONVERT) && k % 8 == 0 && (uintptr_t) vx % 32 == 0 &&
+            (uintptr_t) y % 16 == 0) {
+            const int64_t n = k / 8;
+            const float * x = (const float *) vx;
+            queue->parallel_for(sycl::nd_range<1>(ceil_div(n, (int64_t) 256) * 256, 256), [=](sycl::nd_item<1> it) {
+                const int64_t i = it.get_global_id(0);
+                if (i >= n) {
+                    return;
+                }
+                const sycl::vec<float, 8> v = *(const sycl::vec<float, 8> *) (x + 8 * i);
+                sycl::vec<sycl::half, 8>  o;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    o[j] = static_cast<sycl::half>(v[j]);
+                }
+                *(sycl::vec<sycl::half, 8> *) (y + 8 * i) = o;
+            });
+            return;
+        }
+    }
     convert_unary_nc_sycl<src_t>(vx, y, k, 1, 1, 1, k, k, k, queue);
 }
 

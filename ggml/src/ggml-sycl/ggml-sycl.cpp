@@ -125,6 +125,7 @@ int g_ggml_sycl_mmid_sched = 0;
 // Fallback for q8_0 mat-vec when the ESIMD kernel is unavailable or disabled: ESIMD claims
 // q8_0 first, so this only runs otherwise. Bit-identical results, ~5% decode on its own.
 int g_ggml_sycl_mmvq_wide = 1;
+int g_ggml_sycl_wide_loads = GGML_SYCL_WIDE_LOADS_DEFAULT;
 int g_ggml_sycl_fuse_cast_add = 1;
 int g_ggml_sycl_fuse_cont_add = 0;
 int g_ggml_sycl_fuse_qsa_gather = 1;
@@ -456,6 +457,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_float_commutative = ggml_sycl_get_env("GGML_SYCL_FLOAT_COMMUTATIVE", 1);
         g_ggml_sycl_kv_soa = ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0);
         g_ggml_sycl_kq_mask_bits = ggml_sycl_get_env("GGML_SYCL_KQ_MASK_BITS", 0);
+        g_ggml_sycl_wide_loads = ggml_sycl_get_env("GGML_SYCL_WIDE_LOADS", GGML_SYCL_WIDE_LOADS_DEFAULT);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
@@ -547,6 +549,10 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FLOAT_COMMUTATIVE: %d\n", g_ggml_sycl_float_commutative);
         GGML_LOG_INFO("  GGML_SYCL_KV_SOA: %d\n", g_ggml_sycl_kv_soa);
         GGML_LOG_INFO("  GGML_SYCL_KQ_MASK_BITS: %d\n", g_ggml_sycl_kq_mask_bits);
+        GGML_LOG_INFO("  GGML_SYCL_WIDE_LOADS: 0x%x (hc=%d gdn=%d convert=%d)\n", g_ggml_sycl_wide_loads,
+                      (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_HC) != 0,
+                      (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_GDN) != 0,
+                      (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_CONVERT) != 0);
         GGML_LOG_INFO("  GGML_SYCL_GET_MEM_API: %d (%s)\n", g_ggml_sycl_get_mem_api, mem_api_int2str(g_ggml_sycl_get_mem_api));
 #else
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s), enable to SYCL API since missing GGML_SYCL_SUPPORT_LEVEL_ZERO_API\n",
