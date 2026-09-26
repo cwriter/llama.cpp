@@ -104,9 +104,10 @@ enum ggml_sycl_reorder_type {
     GGML_SYCL_REORDER_Q8_0   = 1 << 2,
 };
 
-// Everything except Q8_0: its MoE mat-vec is about 4% of decode and its quants are already
-// contiguous within a block, so the reorder measured flat. A new bit is on by default.
-static constexpr int GGML_SYCL_REORDER_DEFAULT = ~GGML_SYCL_REORDER_Q8_0;
+// Every type; a new bit is on by default. Q8_0 was left out after an early A/B measured flat, but
+// the reordered q8_0 MoE mat-vec is 5.1x faster and an interleaved llama-bench A/B on qwen4exp
+// measured tg128 +2.5% and pp2048 +1.0%.
+static constexpr int GGML_SYCL_REORDER_DEFAULT = ~0;
 
 extern int g_ggml_sycl_reorder_types;
 
