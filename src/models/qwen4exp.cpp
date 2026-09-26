@@ -743,10 +743,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
     ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
+    // emit the indexer here, so that the zeros below are built next to the set_rows that reads them
+    ggml_build_forward_expand(gf, top_k_3d);
+
+    // zero-filled rows of size 1: [1, n_top_k, n_batch, n_stream], the values set_rows writes.
+    // fill one row and repeat it: a graph input of the full size is allocated before the graph
+    // runs and stays live until the set_rows, while the repeat only exists next to its reader
+    ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0]), 0.0f);
+    zeros = ggml_repeat_4d(ctx0, zeros, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
 
     // modify KQ mask by unmasking elements that are in top_k indices
     // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
