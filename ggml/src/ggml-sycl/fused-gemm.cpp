@@ -2354,7 +2354,10 @@ bool ggml_sycl_grouped_dequant_gemm_f16_dev(ggml_type src0_type, const void * sr
     const bool    tight    = (g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_PACKB_TIGHT) != 0;
     const int     Npad     = (int) (tight ? ggml_sycl_grouped_gemm_tight_npad(total_rows) : n_tiles_max * FG_BN);
 
-    ggml_sycl_pool_alloc<sycl::half> packed_b(pool, grouped_gemm_packed_capacity((size_t) K * Npad));
+    // Npad depends only on the routed row count here, so the exact size is as stable as the rounded one
+    const size_t packed_b_size = (g_ggml_sycl_mem_save & GGML_SYCL_MEM_SAVE_PACKB_EXACT) ?
+                                     (size_t) K * Npad : grouped_gemm_packed_capacity((size_t) K * Npad);
+    ggml_sycl_pool_alloc<sycl::half> packed_b(pool, packed_b_size);
     grouped_gemm_pack_b_rows(src1, packed_b.get(), tiles_dev, Npad, (int) K, (int) total_rows, tight, stream);
 
     const bool slm_a       = fg_slm_a(mrows);

@@ -175,6 +175,19 @@ enum ggml_sycl_usm_system_bit {
 };
 extern int g_ggml_sycl_usm_system;
 
+// Ways to lower the peak device memory of a process. All on by default (7); GGML_SYCL_MEM_SAVE=0
+// turns them off. POOL_RELEASE does nothing while SYCL graphs are enabled.
+enum ggml_sycl_mem_save_bit {
+    GGML_SYCL_MEM_SAVE_REORDER_CHUNK = 1 << 0, // reorder large weights in chunks, with a small temp buffer
+    GGML_SYCL_MEM_SAVE_POOL_RELEASE  = 1 << 1, // before the pool grows, it frees cached buffers smaller than the request
+    GGML_SYCL_MEM_SAVE_PACKB_EXACT   = 1 << 2, // device-scheduled grouped GEMM: packed B at its size, not the next power of 2
+};
+static constexpr int GGML_SYCL_MEM_SAVE_DEFAULT =
+    GGML_SYCL_MEM_SAVE_REORDER_CHUNK | GGML_SYCL_MEM_SAVE_POOL_RELEASE | GGML_SYCL_MEM_SAVE_PACKB_EXACT;
+extern int g_ggml_sycl_mem_save;
+// the most a chunked reorder copies into its temp buffer at once; GGML_SYCL_REORDER_CHUNK_KIB, for tests
+extern size_t g_ggml_sycl_reorder_chunk_bytes;
+
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 // Wait for a cross-split event by enqueuing a barrier instead of blocking the host on it.
