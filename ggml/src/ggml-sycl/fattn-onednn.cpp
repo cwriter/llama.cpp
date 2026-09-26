@@ -432,14 +432,11 @@ void ggml_sycl_flash_attn_ext_onednn(ggml_backend_sycl_context & ctx, ggml_tenso
     E.cp.execute(strm, ti, {to});
 
     permute_sdpa_out_sycl(outf_ptr, (float *) dst->data, mb, H, q, d, stream);
-    // Single device needs no sync: the dnnl stream wraps this same in-order queue, so the SDPA
-    // serializes with the staging kernels before it and the permute/pool reuse after it. The
-    // garbage output formerly blamed on the missing sync here was the scale use-after-return
-    // fixed above. Keep the conservative wait for multi-GPU, where other devices' streams can
-    // race the pool:
-    if (ggml_sycl_info().device_count > 1) {
-        stream->wait_and_throw();
-    }
+    // No sync: the dnnl stream wraps this same in-order queue, so the SDPA serializes with the
+    // staging kernels before it and the permute/pool reuse after it. The garbage output formerly
+    // blamed on a missing sync here was the scale use-after-return fixed above. Other devices
+    // cannot race this: each device has its own queue and its own pool. A host wait here used to
+    // be kept for multi-GPU; it drained every card's pipeline once per attention node.
 }
 catch (const std::exception & e) {
     // any oneDNN/SYCL failure is non-fatal: fall back to the existing kernel (strictly additive).

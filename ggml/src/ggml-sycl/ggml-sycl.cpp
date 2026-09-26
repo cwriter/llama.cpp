@@ -145,6 +145,7 @@ int g_ggml_sycl_enable_flash_attention = 1;
 int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
 int g_ggml_sycl_device_event_wait = 1;
 int g_ggml_sycl_async_copy = GGML_SYCL_ASYNC_COPY_DEFAULT;
+int g_ggml_sycl_copy_ring_depth = GGML_SYCL_COPY_RING_DEPTH_DEFAULT;
 int g_ggml_sycl_fuse_types = GGML_SYCL_FUSE_DEFAULT;
 int g_ggml_sycl_float_commutative = 1;
 int g_ggml_sycl_kv_soa = 0;
@@ -448,6 +449,9 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_dev2dev_memcpy = ggml_sycl_get_env("GGML_SYCL_DEV2DEV_MEMCPY", DEV2DEV_MEMCPY_SYCL);
         g_ggml_sycl_device_event_wait = ggml_sycl_get_env("GGML_SYCL_DEVICE_EVENT_WAIT", 1);
         g_ggml_sycl_async_copy = ggml_sycl_get_env("GGML_SYCL_ASYNC_COPY", GGML_SYCL_ASYNC_COPY_DEFAULT);
+        g_ggml_sycl_copy_ring_depth = std::clamp(
+            ggml_sycl_get_env("GGML_SYCL_COPY_RING_DEPTH", GGML_SYCL_COPY_RING_DEPTH_DEFAULT), 1,
+            GGML_SYCL_COPY_RING_MAX_DEPTH);
         g_ggml_sycl_fuse_types = ggml_sycl_get_env("GGML_SYCL_FUSE_TYPES", GGML_SYCL_FUSE_DEFAULT);
         g_ggml_sycl_float_commutative = ggml_sycl_get_env("GGML_SYCL_FLOAT_COMMUTATIVE", 1);
         g_ggml_sycl_kv_soa = ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0);
@@ -525,9 +529,11 @@ static void ggml_check_sycl() try {
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         GGML_LOG_INFO("  GGML_SYCL_DEV2DEV_MEMCPY: %d (%s)\n", g_ggml_sycl_dev2dev_memcpy, dev2dev_int2str(g_ggml_sycl_dev2dev_memcpy));
         GGML_LOG_INFO("  GGML_SYCL_DEVICE_EVENT_WAIT: %d\n", g_ggml_sycl_device_event_wait);
-        GGML_LOG_INFO("  GGML_SYCL_ASYNC_COPY: %d (peer=%d l0_async=%d)\n", g_ggml_sycl_async_copy,
+        GGML_LOG_INFO("  GGML_SYCL_ASYNC_COPY: %d (peer=%d l0_async=%d src_ring=%d)\n", g_ggml_sycl_async_copy,
                       (g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_PEER) ? 1 : 0,
-                      (g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_L0) ? 1 : 0);
+                      (g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_L0) ? 1 : 0,
+                      (g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_SRC_RING) ? 1 : 0);
+        GGML_LOG_INFO("  GGML_SYCL_COPY_RING_DEPTH: %d\n", g_ggml_sycl_copy_ring_depth);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_TYPES: 0x%x (elementwise=%d mul_add=%d moe_reduce=%d moe_glu_id=%d unary_mul_b=%d norm_scale=%d glu_ncols=%d flat_batch=%d)\n",
                       g_ggml_sycl_fuse_types,
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_ELEMENTWISE) != 0,
@@ -7054,12 +7060,55 @@ static bool sycl_queue_wait_for_queue(const queue_ptr & q_dst, const queue_ptr &
     return true;
 }
 
+// Ring of staging buffers on each source device for cross-device copies (ASYNC_COPY_SRC_RING).
+// Slots grow to the largest tensor seen and are never freed; they hold split-boundary
+// activations, a few MiB each.
+struct sycl_copy_ring_slot {
+    void *      ptr  = nullptr;
+    size_t      size = 0;
+    sycl::event read_done;  // the destination's read of this slot
+};
+
+// Copy src (on q_src's device) to dst through the next ring slot. Returns false, having queued
+// nothing, when the slot cannot be allocated.
+static bool sycl_copy_via_src_ring(int device_src, sycl::queue & q_src, sycl::queue & q_dst, void * dst,
+                                   const void * src, size_t nbytes) {
+    static std::mutex          mtx;
+    static sycl_copy_ring_slot ring[GGML_SYCL_MAX_DEVICES][GGML_SYCL_COPY_RING_MAX_DEPTH];
+    static int                 next[GGML_SYCL_MAX_DEVICES] = {};
+
+    std::lock_guard<std::mutex> lock(mtx);
+    sycl_copy_ring_slot &       slot = ring[device_src][next[device_src]];
+    if (slot.size < nbytes) {
+        slot.read_done.wait();  // growth is rare: once per new largest tensor
+        if (slot.ptr != nullptr) {
+            sycl::free(slot.ptr, q_src);
+        }
+        const size_t size = GGML_PAD(nbytes, 1u << 20);
+        slot.ptr          = sycl::malloc_device(size, q_src);
+        slot.size         = slot.ptr != nullptr ? size : 0;
+        if (slot.ptr == nullptr) {
+            return false;
+        }
+    }
+    next[device_src] = (next[device_src] + 1) % g_ggml_sycl_copy_ring_depth;
+
+    sycl::event staged;
+    SYCL_CHECK(CHECK_TRY_ERROR(staged = q_src.memcpy(slot.ptr, src, nbytes, slot.read_done)));
+    SYCL_CHECK(CHECK_TRY_ERROR(slot.read_done = q_dst.memcpy(dst, slot.ptr, nbytes, staged)));
+    return true;
+}
+
 // Copy into this backend without draining anything on the host. Returning true tells the
 // scheduler it no longer has to synchronize the destination backend around the copy, so every
 // ordering this replaces has to be re-established on the device:
 //   - the destination queue is in-order, which covers the write-after-read on dst;
 //   - a cross-device read is placed behind a barrier on the source queue, which covers the
 //     read-after-write on src;
+//   - the source queue may not overwrite src until the destination has read it (write-after-read
+//     on src, which pipeline mode hits: the source runs its next ubatch into the same compute
+//     buffer). SRC_RING copies src into a ring slot on its own queue, so the source only waits
+//     when that slot comes round again; without it the source queue waits for the read itself;
 //   - a host source is staged through pinned memory by set_tensor, which copies it out
 //     synchronously, so the caller may reuse the source buffer as soon as this returns.
 static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
@@ -7097,10 +7146,23 @@ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src, ggml_
             return false;
         }
     }
-    if (!sycl_queue_wait_for_queue(q_dst, q_src)) {
-        return false;
+    if (q_dst == q_src) {
+        // one in-order queue orders the copy behind the writer and ahead of later writers
+        SYCL_CHECK(CHECK_TRY_ERROR(q_dst->memcpy(dst->data, src->data, nbytes)));
+        return true;
     }
-    SYCL_CHECK(CHECK_TRY_ERROR(q_dst->memcpy(dst->data, src->data, nbytes)));
+    if (q_src->get_context() != q_dst->get_context()) {
+        return false;  // a SYCL wait list needs a shared context
+    }
+    if ((g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_SRC_RING) &&
+        sycl_copy_via_src_ring(src_bctx->device, *q_src, *q_dst, dst->data, src->data, nbytes)) {
+        return true;
+    }
+    sycl::event src_done;
+    sycl::event read_done;
+    SYCL_CHECK(CHECK_TRY_ERROR(src_done = q_src->ext_oneapi_submit_barrier()));
+    SYCL_CHECK(CHECK_TRY_ERROR(read_done = q_dst->memcpy(dst->data, src->data, nbytes, src_done)));
+    SYCL_CHECK(CHECK_TRY_ERROR(q_src->ext_oneapi_submit_barrier({ read_done })));
     return true;
 
     GGML_UNUSED(backend_src);

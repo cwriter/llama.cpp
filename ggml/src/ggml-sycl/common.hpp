@@ -194,6 +194,7 @@ extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_device_event_wait;
 // Copy into a SYCL backend by enqueuing, instead of draining both devices on the host.
 extern int g_ggml_sycl_async_copy;
+extern int g_ggml_sycl_copy_ring_depth;
 // Which of the graph-level fusions may fire. One bit per fusion so a new one is a bit rather
 // than another environment variable, and so a bisect over them is a single value.
 enum ggml_sycl_fuse_type {
@@ -292,8 +293,20 @@ enum ggml_sycl_async_copy_bits {
     // unproven, and measures as noise in layer-split mode where cross-device traffic is ~10 KB
     // per token. Enable with GGML_SYCL_ASYNC_COPY=3 together with GGML_SYCL_DEV2DEV_MEMCPY=1.
     GGML_SYCL_ASYNC_COPY_L0 = 1 << 1,
+    // SRC_RING: stage a cross-device copy through a small ring of buffers on the SOURCE device.
+    // The source queue copies into the ring locally and moves on; the destination pulls from the
+    // ring. Without it the source queue must wait until the destination has read the tensor,
+    // because in pipeline mode the source's next ubatch overwrites that same compute buffer. Clear
+    // the bit to trade that overlap for memory: the ring holds DEPTH copies of the largest tensor
+    // crossing from each device (~86 MiB per card measured for qwen4exp at ubatch 1024).
+    GGML_SYCL_ASYNC_COPY_SRC_RING = 1 << 2,
 };
-static constexpr int GGML_SYCL_ASYNC_COPY_DEFAULT = GGML_SYCL_ASYNC_COPY_PEER;
+static constexpr int GGML_SYCL_ASYNC_COPY_DEFAULT = GGML_SYCL_ASYNC_COPY_PEER | GGML_SYCL_ASYNC_COPY_SRC_RING;
+// Ring slots per source device (GGML_SYCL_COPY_RING_DEPTH, clamped to 1..MAX). Slot k is reused
+// DEPTH copies later, and only then does the source queue wait, device-side, for the destination
+// to have finished reading it. Each slot costs the largest tensor copied from that device.
+static constexpr int GGML_SYCL_COPY_RING_DEPTH_DEFAULT = 2;
+static constexpr int GGML_SYCL_COPY_RING_MAX_DEPTH     = 8;
 
 // intel/compute-runtime issue #995: a peer-to-peer copy hangs the GPU engine (10 s timeout,
 // "Fault response: Unsuccessful -ENOENT", "exec queue reset detected") when the remote range
