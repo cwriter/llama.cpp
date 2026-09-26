@@ -267,7 +267,8 @@ static void mkl_fa_normalize_head(
                 if (jc >= n_queries) return;
 
                 int     ksum_idx = (int)(src_offset / DV) + jc;
-                float   inv_sum  = 1.0f / KQ_sum[ksum_idx];
+                // a row that saw no cell gives 0, as the CPU reference does
+                float   inv_sum  = KQ_sum[ksum_idx] > 0.0f ? 1.0f / KQ_sum[ksum_idx] : 0.0f;
                 const float * __restrict src = VKQ_accum
                     + src_offset + jc * (int64_t)DV;
                 // Interleaved dst layout (matching TILE):
