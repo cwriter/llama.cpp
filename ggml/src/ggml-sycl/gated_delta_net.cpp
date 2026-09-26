@@ -4,9 +4,53 @@
 #include "ggml.h"
 #include "gated_delta_net.hpp"
 #include <cmath>
+#include <type_traits>
+
+// The operands of one token for the WIDE kernel: this lane's shard of the k and q rows (and of the
+// KDA g row), and the scalars. The rows come from one sub-group block load each, whose lane/element
+// layout is exactly the shard's: element r of lane l is row element r * warp_size + l.
+template <int rows_per_lane, bool KDA> struct gdn_step {
+    float k[rows_per_lane];
+    float q[rows_per_lane];
+    float g[KDA ? rows_per_lane : 1];
+    float v;
+    float beta;
+};
+
+// one sub-group block load of N floats per lane: element r of lane l is p[r * sub-group size + l]
+template <int N> static __dpct_inline__ void gdn_block_load(const sycl::sub_group & sg, const float * p, float * out) {
+    const auto mp = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::yes>(
+        const_cast<float *>(p));
+    if constexpr (N == 1) {
+        out[0] = sg.load(mp);
+    } else {
+        const sycl::vec<float, N> v = sg.load<N>(mp);
+#pragma unroll
+        for (int r = 0; r < N; r++) {
+            out[r] = v[r];
+        }
+    }
+}
+
+template <int rows_per_lane, bool KDA>
+static __dpct_inline__ gdn_step<rows_per_lane, KDA> gdn_load_step(const float * q_t, const float * k_t, const float * v_t,
+                                                                  const float * g_t, const float * beta_t, int col,
+                                                                  const sycl::sub_group & sg) {
+    gdn_step<rows_per_lane, KDA> st;
+    gdn_block_load<rows_per_lane>(sg, k_t, st.k);
+    gdn_block_load<rows_per_lane>(sg, q_t, st.q);
+    if constexpr (KDA) {
+        gdn_block_load<rows_per_lane>(sg, g_t, st.g);
+    } else {
+        st.g[0] = *g_t;
+    }
+    st.v    = v_t[col];
+    st.beta = *beta_t;
+    return st;
+}
 
 
-template <int S_v, bool KDA, bool keep_rs_t>
+template <int S_v, bool KDA, bool keep_rs_t, bool WIDE = false>
 void gated_delta_net_sycl(const float *     q,
                           const float *     k,
                           const float *     v,
@@ -63,6 +107,115 @@ void gated_delta_net_sycl(const float *     q,
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+
+    if constexpr (WIDE) {
+        // The operands of token t + 1 are loaded before the dependent chain of token t runs, so their
+        // latency hides behind it. Two named operand sets take turns, so nothing is copied between
+        // tokens. Every token does the same operations in the same order as the loop below.
+        const auto sg = item_ct1.get_sub_group();
+        auto load_step = [&](int t) {
+            const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+            const float * beta_t = beta + gb_offset;
+            const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
+            return gdn_load_step<rows_per_lane, KDA>(q_t, k_t, v_t, g_t, beta_t, col, sg);
+        };
+        auto step = [&](const gdn_step<rows_per_lane, KDA> & cur, int t) {
+            const float beta_val = cur.beta;
+
+            if constexpr (!KDA) {
+                const float g_val = sycl::native::exp(cur.g[0]);
+
+                float kv_shard = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard += s_shard[r] * cur.k[r];
+                }
+                float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+                float delta_col = (cur.v - g_val * kv_col) * beta_val;
+
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[r]  = g_val * s_shard[r] + cur.k[r] * delta_col;
+                    attn_partial += s_shard[r] * cur.q[r];
+                }
+
+                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+                if (lane == 0) {
+                    attn_data[col] = attn_col * scale;
+                }
+            } else {
+                float kv_shard = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard += sycl::native::exp(cur.g[r]) * s_shard[r] * cur.k[r];
+                }
+
+                float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+                float delta_col = (cur.v - kv_col) * beta_val;
+
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[r]  = sycl::native::exp(cur.g[r]) * s_shard[r] + cur.k[r] * delta_col;
+                    attn_partial += s_shard[r] * cur.q[r];
+                }
+
+                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+
+                if (lane == 0) {
+                    attn_data[col] = attn_col * scale;
+                }
+            }
+
+            attn_data += S_v * H;
+
+            if constexpr (keep_rs_t) {
+                const int target_slot = (int) n_tokens - 1 - t;
+                if (target_slot >= 0 && target_slot < K) {
+                    float * curr_state = state + target_slot * state_slot_stride;
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        const int i = r * warp_size + lane;
+                        curr_state[col * S_v + i] = s_shard[r];
+                    }
+                }
+            }
+        };
+
+        if (n_tokens > 0) {
+            gdn_step<rows_per_lane, KDA> a = load_step(0);
+            gdn_step<rows_per_lane, KDA> b;
+            int t = 0;
+            for (; t + 1 < n_tokens; t += 2) {
+                b = load_step(t + 1);
+                step(a, t);
+                if (t + 2 < n_tokens) {
+                    a = load_step(t + 2);
+                }
+                step(b, t + 1);
+            }
+            if (t < n_tokens) {
+                step(a, t);
+            }
+        }
+
+        if constexpr (!keep_rs_t) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i          = r * warp_size + lane;
+                state[col * S_v + i] = s_shard[r];
+            }
+        }
+        return;
+    }
 
     for (int t = 0; t < n_tokens; t++) {
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
@@ -162,7 +315,7 @@ void gated_delta_net_sycl(const float *     q,
     }
 }
 
-template <bool KDA, bool keep_rs_t>
+template <bool KDA, bool keep_rs_t, bool WIDE>
 static void launch_gated_delta_net(const float *   q_d,
                                    const float *   k_d,
                                    const float *   v_d,
@@ -206,7 +359,7 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 16;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                                         gated_delta_net_sycl<sv, KDA, keep_rs_t, WIDE>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                                                                        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
                                                                        sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
                                      });
@@ -217,7 +370,7 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 32;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                      [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                         gated_delta_net_sycl<sv, KDA, keep_rs_t>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
+                                         gated_delta_net_sycl<sv, KDA, keep_rs_t, WIDE>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens,
                                                                        sq1, sq2, sq3, sv1, sv2, sv3, sb1, sb2,
                                                                        sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
                                      });
@@ -228,7 +381,7 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 64;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                            gated_delta_net_sycl<sv, KDA, keep_rs_t>(
+                                            gated_delta_net_sycl<sv, KDA, keep_rs_t, WIDE>(
                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2,
                                                 sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
                                         });
@@ -240,7 +393,7 @@ static void launch_gated_delta_net(const float *   q_d,
                 constexpr int sv = 128;
                 stream->parallel_for(sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                                         [=](sycl::nd_item<3> /*item_ct1*/) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                                            gated_delta_net_sycl<sv, KDA, keep_rs_t>(
+                                            gated_delta_net_sycl<sv, KDA, keep_rs_t, WIDE>(
                                                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2,
                                                 sq3, sv1, sv2, sv3, sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
                                         });
@@ -327,26 +480,33 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
         state_slot_stride = cache->slot_stride;
     }
 
+    // block loads of the k, q (and KDA g) rows want every row 16 B aligned; rows are whole shards
+    // only when the sub-group spans them (S_v >= warp size)
+    const int  warp_size = ggml_sycl_info().devices[ggml_sycl_get_device()].warp_size;
+    const bool wide      = (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_GDN) && S_v >= warp_size &&
+                      ((uintptr_t) q_d | (uintptr_t) k_d | (sq1 | sq2 | sq3) * sizeof(float)) % 16 == 0 &&
+                      (!kda || ((uintptr_t) g_d | S_v * sizeof(float) | nbb1 * S_v | nbb2 * S_v | nbb3 * S_v) % 16 == 0);
+
+    const auto launch = [&](auto kda_c, auto keep_c, auto wide_c) {
+        launch_gated_delta_net<decltype(kda_c)::value, decltype(keep_c)::value, decltype(wide_c)::value>(
+            q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
+            S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+            sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+    };
+    const auto launch_w = [&](auto kda_c, auto keep_c) {
+        if (wide) {
+            launch(kda_c, keep_c, std::true_type{});
+        } else {
+            launch(kda_c, keep_c, std::false_type{});
+        }
+    };
+
     if (kda) {
-        if (keep_rs) {
-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-        } else {
-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-        }
+        if (keep_rs) { launch_w(std::true_type{}, std::true_type{}); }
+        else         { launch_w(std::true_type{}, std::false_type{}); }
     } else {
-        if (keep_rs) {
-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-        } else {
-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
-                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
-        }
+        if (keep_rs) { launch_w(std::false_type{}, std::true_type{}); }
+        else         { launch_w(std::false_type{}, std::false_type{}); }
     }
 }
 

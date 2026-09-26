@@ -1720,6 +1720,73 @@ static void grouped_gemm_pack_b_rows(const ggml_sycl_gg_rows & y, sycl::half * p
     });
 }
 
+// k pairs one work-item of the wide B pack moves: 16 floats of one row, one 64 B line
+static constexpr int FG_PACK_KP = 8;
+
+// The wide pack reads a row as two 32 B vectors, so every row must start 32 B aligned.
+static bool grouped_gemm_pack_b_wide_ok(const char * base, size_t nb1, size_t nb2, int K) {
+    if (g_ggml_sycl_mmid_sched & GGML_SYCL_MMID_SCHED_PACKB_NARROW) {
+        return false;
+    }
+    return K % (2 * FG_PACK_KP) == 0 && ((uintptr_t) base | nb1 | nb2) % (8 * sizeof(float)) == 0;
+}
+
+// Same packed values as grouped_gemm_pack_b() and grouped_gemm_pack_b_rows(), but one work-item
+// moves FG_PACK_KP k pairs of one row: the tile and route lookups and the index math run once per
+// 64 B instead of once per 8 B, and the row is read with two aligned 32 B loads instead of eight
+// 8 B ones. The stores stay one half2 per k pair, consecutive lanes on consecutive columns.
+// y.map == nullptr means row r of B is at y.base + r * y.nb1 (the gathered copy).
+// Slotted layout: the columns of an empty tile are not written. The GEMM returns before it reads
+// them, and only the device schedule has empty tiles (its launch bound).
+static void grouped_gemm_pack_b_wide(const ggml_sycl_gg_rows & y, sycl::half * packed, const ggml_sycl_gg_tile * tiles,
+                                     int Npad, int K, int total_rows, bool tight, dpct::queue_ptr stream) {
+    const int                kgroups = K / (2 * FG_PACK_KP);
+    const int                wg_k    = kgroups % 4 == 0 ? 4 : (kgroups % 2 == 0 ? 2 : 1);
+    const char *             base    = y.base;
+    const mmid_row_mapping * map     = y.map;
+    const int64_t            ne1     = y.ne1;
+    const size_t             nb1     = y.nb1;
+    const size_t             nb2     = y.nb2;
+    GGML_ASSERT(Npad % FG_BN == 0);
+    using vec8 = sycl::vec<float, 8>;
+    stream->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>(kgroups, Npad), sycl::range<2>(wg_k, FG_BN)), [=](sycl::nd_item<2> it) {
+            const int kg  = it.get_global_id(0);
+            const int n   = it.get_global_id(1);
+            int       row = n;
+            bool      in  = n < total_rows;
+            if (!tight) {
+                const ggml_sycl_gg_tile tile = tiles[n / FG_BN];
+                if (tile.n1 <= tile.n0) {
+                    return;
+                }
+                row = tile.n0 + n % FG_BN;
+                in  = row < tile.n1;
+            }
+            vec8 lo(0.0f);
+            vec8 hi(0.0f);
+            if (in) {
+                const char * rp;
+                if (map) {
+                    const mmid_row_mapping rm = map[row];
+                    rp = base + (rm.i1 % ne1) * nb1 + rm.i2 * nb2;
+                } else {
+                    rp = base + (size_t) row * nb1;
+                }
+                const vec8 * src = (const vec8 *) ((const float *) rp + kg * 2 * FG_PACK_KP);
+                lo = src[0];
+                hi = src[1];
+            }
+            sycl::half2 * out = (sycl::half2 *) packed + (size_t) kg * FG_PACK_KP * Npad + n;
+#pragma unroll
+            for (int j = 0; j < FG_PACK_KP / 2; ++j) {
+                out[(size_t) j * Npad] = sycl::half2((sycl::half) lo[2 * j], (sycl::half) lo[2 * j + 1]);
+                out[(size_t) (j + FG_PACK_KP / 2) * Npad] =
+                    sycl::half2((sycl::half) hi[2 * j], (sycl::half) hi[2 * j + 1]);
+            }
+        });
+}
+
 bool ggml_sycl_fused_dequant_gemm_f16_device_ok(dpct::queue_ptr stream) {
     // Cached per device, not once: on a mixed box the first caller's verdict is not the others'.
     static std::mutex                            mtx;
@@ -2175,7 +2242,12 @@ bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_b
     SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tiles_dev.get(), tiles.data(), n_tiles * sizeof(ggml_sycl_gg_tile))));
 
     ggml_sycl_pool_alloc<sycl::half> packed_b(pool, grouped_gemm_packed_capacity((size_t) K * Npad));
-    grouped_gemm_pack_b(src1, packed_b.get(), tiles_dev.get(), Npad, (int) K, (int) total_rows, tight, stream);
+    if (grouped_gemm_pack_b_wide_ok((const char *) src1, K * sizeof(float), 0, (int) K)) {
+        const ggml_sycl_gg_rows rows = { (char *) src1, nullptr, 0, (size_t) K * sizeof(float), 0 };
+        grouped_gemm_pack_b_wide(rows, packed_b.get(), tiles_dev.get(), Npad, (int) K, (int) total_rows, tight, stream);
+    } else {
+        grouped_gemm_pack_b(src1, packed_b.get(), tiles_dev.get(), Npad, (int) K, (int) total_rows, tight, stream);
+    }
 
     const bool slm_a       = fg_slm_a(mrows);
     const bool regs_a      = fg_regs_a(mrows, slm_a, reordered);
@@ -2358,7 +2430,11 @@ bool ggml_sycl_grouped_dequant_gemm_f16_dev(ggml_type src0_type, const void * sr
     const size_t packed_b_size = (g_ggml_sycl_mem_save & GGML_SYCL_MEM_SAVE_PACKB_EXACT) ?
                                      (size_t) K * Npad : grouped_gemm_packed_capacity((size_t) K * Npad);
     ggml_sycl_pool_alloc<sycl::half> packed_b(pool, packed_b_size);
-    grouped_gemm_pack_b_rows(src1, packed_b.get(), tiles_dev, Npad, (int) K, (int) total_rows, tight, stream);
+    if (grouped_gemm_pack_b_wide_ok(src1.base, src1.nb1, src1.nb2, (int) K)) {
+        grouped_gemm_pack_b_wide(src1, packed_b.get(), tiles_dev, Npad, (int) K, (int) total_rows, tight, stream);
+    } else {
+        grouped_gemm_pack_b_rows(src1, packed_b.get(), tiles_dev, Npad, (int) K, (int) total_rows, tight, stream);
+    }
 
     const bool slm_a       = fg_slm_a(mrows);
     const bool regs_a      = fg_regs_a(mrows, slm_a, reordered);

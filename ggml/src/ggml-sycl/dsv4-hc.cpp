@@ -207,6 +207,134 @@ static void dsv4_hc_post_f32_sycl(
         });
 }
 
+// dsv4_hc_post_f32_sycl() for rows that are contiguous and 16 B aligned: a work-item takes 4
+// consecutive i0, so x and residual are read and dst written as one float4 each, and the 3D range
+// replaces the three 64-bit divisions per element. Every element gets the same operations in the
+// same order, so the result is bit for bit the same.
+template <bool has_comb, bool fused_gate>
+static void dsv4_hc_post_f32_vec4_sycl(
+        const float * x, const float * residual, const float * post, const float * comb, float * dst,
+        int64_t n_embd, int64_t hc, int64_t n_tokens, int wg,
+        int64_t sx1,
+        int64_t sr1, int64_t sr2,
+        int64_t sp0, int64_t sp1,
+        int64_t sc0, int64_t sc1, int64_t sc2,
+        int64_t sd1, int64_t sd2,
+        sycl::float2 g0, sycl::float2 g1,
+        queue_ptr stream) {
+    const int64_t nv = n_embd / 4;
+    stream->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(n_tokens, hc, nv), sycl::range<3>(1, 1, wg)),
+        [=](sycl::nd_item<3> item) {
+            const int64_t it   = item.get_global_id(0);
+            const int64_t idst = item.get_global_id(1);
+            const int64_t i0   = item.get_global_id(2) * 4;
+
+            float gate = post[idst*sp0 + it*sp1];
+            if constexpr (fused_gate) {
+                gate = g0[0] * gate + g0[1];
+                gate = 1.0f / (1.0f + op_exp(-gate));  // exactly op_sigmoid()
+                gate = g1[0] * gate + g1[1];
+            }
+
+            const sycl::float4 xv = *(const sycl::float4 *) (x + i0 + it*sx1);
+            sycl::float4 sum;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sum[j] = xv[j] * gate;
+            }
+            if constexpr (has_comb) {
+                for (int64_t isrc = 0; isrc < hc; ++isrc) {
+                    const sycl::float4 rv = *(const sycl::float4 *) (residual + i0 + isrc*sr1 + it*sr2);
+                    const float        c  = comb[idst*sc0 + isrc*sc1 + it*sc2];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        sum[j] += rv[j] * c;
+                    }
+                }
+            } else {
+                const sycl::float4 rv = *(const sycl::float4 *) (residual + i0 + idst*sr1 + it*sr2);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    sum[j] += rv[j];
+                }
+            }
+
+            *(sycl::float4 *) (dst + i0 + idst*sd1 + it*sd2) = sum;
+        });
+}
+
+// dsv4_hc_pre_f32_sycl() for contiguous, 16 B aligned rows: 4 consecutive i0 per work-item and a
+// 2D range, so x (and a gated weight) are read as float4 and no 64-bit division is left. Same
+// operations per element in the same order, so the result is bit for bit the same.
+template <bool gated>
+static void dsv4_hc_pre_f32_vec4_sycl(
+        const float * x, const float * weights, float * dst,
+        int64_t n_embd, int64_t hc, int64_t n_tokens, int wg,
+        int64_t sx1, int64_t sx2,
+        int64_t sw0, int64_t sw1, int64_t sw2,
+        int64_t sd1,
+        float scale,
+        queue_ptr stream) {
+    const int64_t nv = n_embd / 4;
+    stream->parallel_for(
+        sycl::nd_range<2>(sycl::range<2>(n_tokens, nv), sycl::range<2>(1, wg)),
+        [=](sycl::nd_item<2> item) {
+            const int64_t it = item.get_global_id(0);
+            const int64_t i0 = item.get_global_id(1) * 4;
+
+            sycl::float4 sum(0.0f);
+            for (int64_t ih = 0; ih < hc; ++ih) {
+                const sycl::float4 xv = *(const sycl::float4 *) (x + i0 + ih*sx1 + it*sx2);
+                if constexpr (gated) {
+                    const sycl::float4 gv = *(const sycl::float4 *) (weights + i0 + ih*sw1 + it*sw2);
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const float wv = 1.0f / (1.0f + sycl::exp(-gv[j]));
+                        sum[j] += xv[j] * wv;
+                    }
+                } else {
+                    const float wv = weights[ih*sw0 + it*sw1];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        sum[j] += xv[j] * wv;
+                    }
+                }
+            }
+
+            sycl::float4 out;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                out[j] = scale * sum[j];
+            }
+            *(sycl::float4 *) (dst + i0 + it*sd1) = out;
+        });
+}
+
+// work-group size for the float4 path, or 0 when a row is not contiguous and 16 B aligned
+static int dsv4_hc_vec4_wg(const ggml_tensor * const * ts, int n, int64_t n_embd) {
+    if (!(g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_HC) || n_embd % 4 != 0) {
+        return 0;
+    }
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * t = ts[k];
+        if (t->nb[0] != sizeof(float) || (uintptr_t) t->data % 16 != 0) {
+            return 0;
+        }
+        for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return 0;
+            }
+        }
+    }
+    for (int wg : { 256, 128, 64, 32, 16 }) {
+        if ((n_embd / 4) % wg == 0) {
+            return wg;
+        }
+    }
+    return 0;
+}
+
 void ggml_sycl_op_dsv4_hc_pre(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
     const ggml_tensor * x       = dst->src[0];
@@ -229,7 +357,31 @@ void ggml_sycl_op_dsv4_hc_pre(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 
     queue_ptr stream = ctx.stream();
 
-    if (gated) {
+    const ggml_tensor * vec_ts[3] = { x, dst, weights };
+    const int           wg        = dsv4_hc_vec4_wg(vec_ts, gated ? 3 : 2, n_embd);
+
+    if (gated && wg > 0) {
+        GGML_ASSERT(weights->ne[0] == n_embd);
+        GGML_ASSERT(weights->ne[1] == hc);
+        GGML_ASSERT(weights->ne[2] == n_tokens);
+        dsv4_hc_pre_f32_vec4_sycl<true>(
+                (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+                n_embd, hc, n_tokens, wg,
+                nbx1 / sizeof(float), nbx2 / sizeof(float),
+                nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
+                nbd1 / sizeof(float),
+                scale, stream);
+    } else if (!gated && wg > 0) {
+        GGML_ASSERT(weights->ne[0] == hc);
+        GGML_ASSERT(weights->ne[1] == n_tokens);
+        dsv4_hc_pre_f32_vec4_sycl<false>(
+                (const float *) x->data, (const float *) weights->data, (float *) dst->data,
+                n_embd, hc, n_tokens, wg,
+                nbx1 / sizeof(float), nbx2 / sizeof(float),
+                nbw0 / sizeof(float), nbw1 / sizeof(float), /*sw2=*/ 0,
+                nbd1 / sizeof(float),
+                scale, stream);
+    } else if (gated) {
         GGML_ASSERT(weights->ne[0] == n_embd);
         GGML_ASSERT(weights->ne[1] == hc);
         GGML_ASSERT(weights->ne[2] == n_tokens);
@@ -340,7 +492,23 @@ static void dsv4_hc_post_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 
     queue_ptr stream = ctx.stream();
 
+    const ggml_tensor * vec_ts[3] = { x, residual, dst };
+    const int           wg        = dsv4_hc_vec4_wg(vec_ts, 3, n_embd);
+
     const auto launch = [&](auto has_comb, auto fused_gate) {
+        if (wg > 0) {
+            dsv4_hc_post_f32_vec4_sycl<decltype(has_comb)::value, decltype(fused_gate)::value>(
+                (const float *) x->data, (const float *) residual->data,
+                (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
+                n_embd, hc, n_tokens, wg,
+                nbx1 / sizeof(float),
+                nbr1 / sizeof(float), nbr2 / sizeof(float),
+                nbp0 / sizeof(float), nbp1 / sizeof(float),
+                nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+                nbd1 / sizeof(float), nbd2 / sizeof(float),
+                g0, g1, stream);
+            return;
+        }
         dsv4_hc_post_f32_sycl<decltype(has_comb)::value, decltype(fused_gate)::value>(
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
