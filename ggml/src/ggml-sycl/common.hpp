@@ -156,6 +156,7 @@ enum ggml_sycl_mmid_sched_bit {
     GGML_SYCL_MMID_SCHED_BLK_A       = 1 << 15, // lay the staged A tile out as whole 8x16 matrix tiles, not row major
     GGML_SYCL_MMID_SCHED_GRID_SLM    = 1 << 16, // hold the iq3_s lookup table in SLM, one copy per work-group
     GGML_SYCL_MMID_SCHED_SPLIT_C     = 1 << 17, // reduce the K-split partials 8 rows at a time: half the tile_c
+    GGML_SYCL_MMID_SCHED_PACKB_NARROW = 1 << 18, // turn OFF the wide B pack: one k pair per work-item, as before
     // DIAGNOSTIC ONLY - these produce WRONG OUTPUT. They exist to time half the kernel: with the
     // execution units idle ~92% and no traffic, spill, instruction-count or barrier explanation
     // left, the question is whether the time is in the A dequant or in the XMX MADs.
@@ -224,6 +225,16 @@ extern int g_ggml_sycl_kv_soa;
 // shape, so ggml and supports_op never see a difference; only the bytes change, and only the
 // backend reads them. Cuts what a flash-attention kernel re-reads per cell from 16 bits to 1.
 extern int g_ggml_sycl_kq_mask_bits;
+// Wide loads that a kernel takes only after a runtime check of its pointers and strides; the
+// narrow path stays for everything else. One bit per site, all on by default: clear a bit to get
+// the narrow path back. (The grouped GEMM B pack is GGML_SYCL_MMID_SCHED_PACKB_NARROW instead.)
+enum ggml_sycl_wide_load_bit {
+    GGML_SYCL_WIDE_HC      = 1 << 0,  // dsv4_hc_pre / dsv4_hc_post: float4 rows, no 64-bit index division
+    GGML_SYCL_WIDE_GDN     = 1 << 1,  // gated_delta_net: block loads of the k/q rows, next token loaded ahead
+    GGML_SYCL_WIDE_CONVERT = 1 << 2,  // f32 -> f16 rows and reordered q8_0 -> f16/f32 dequant: 16/32 B loads and stores
+};
+static constexpr int GGML_SYCL_WIDE_LOADS_DEFAULT = ~0;
+extern int g_ggml_sycl_wide_loads;
 // ggml_can_fuse_subgraph() takes at most 31 nodes, and the span is 2*n_expert_used.
 static constexpr int GGML_SYCL_MOE_REDUCE_MAX_EXPERTS = 15;
 extern int g_ggml_sycl_fa_onednn;

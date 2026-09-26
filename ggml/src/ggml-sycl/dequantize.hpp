@@ -881,6 +881,42 @@ static void dequantize_block_q8_0_reorder(const void * __restrict__ vx, dst_t * 
     }
 }
 
+// dequantize_block_q8_0_reorder() for 16 B aligned quants and y: the 32 quants of a block come in
+// as two 16 B loads instead of byte and short loads, and y goes out 16 B at a time. Same values.
+template <typename dst_t>
+static void dequantize_block_q8_0_reorder_wide(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
+                                               const sycl::nd_item<3> & item_ct1) {
+    const int64_t i        = item_ct1.get_group(2);
+    const int64_t tid      = item_ct1.get_local_id(2);
+    const int     lane_ib  = i * item_ct1.get_local_range(2) + tid;
+
+    if (lane_ib >= k / QK8_0) {
+        return;
+    }
+
+    dst_t * y_ptr = yy + lane_ib * QK8_0;
+
+    const int8_t *     qs    = (const int8_t *) vx + lane_ib * QK8_0;
+    const sycl::half * s_ptr = (const sycl::half *) ((const uint8_t *) vx + k) + lane_ib;
+
+    const float d = float(*s_ptr);
+
+    const sycl::vec<int8_t, 16> q0 = *(const sycl::vec<int8_t, 16> *) qs;
+    const sycl::vec<int8_t, 16> q1 = *(const sycl::vec<int8_t, 16> *) (qs + 16);
+
+    constexpr int vec = 16 / sizeof(dst_t);
+#pragma unroll
+    for (int l = 0; l < QK8_0; l += vec) {
+        sycl::vec<dst_t, vec> out;
+#pragma unroll
+        for (int j = 0; j < vec; ++j) {
+            const int8_t q = l + j < 16 ? q0[l + j] : q1[l + j - 16];
+            out[j] = d * q;
+        }
+        *(sycl::vec<dst_t, vec> *) (y_ptr + l) = out;
+    }
+}
+
 template<typename dst_t>
 static void dequantize_block_q4_1(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t nb32,
                                   const sycl::nd_item<3> &item_ct1) {
