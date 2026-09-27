@@ -197,6 +197,11 @@ extern int g_ggml_sycl_device_event_wait;
 // Copy into a SYCL backend by enqueuing, instead of draining both devices on the host.
 extern int g_ggml_sycl_async_copy;
 extern int g_ggml_sycl_copy_ring_depth;
+// Host upload staging: a pinned byte ring. For a compute buffer it starts at 64 MiB and doubles,
+// up to GGML_SYCL_STAGING_MIB, when an upload would otherwise wait. With GGML_SYCL_STAGING_RING=0
+// every upload takes a whole 8 MiB slot of a 32 MiB block, as before.
+extern int g_ggml_sycl_staging_ring;
+extern int g_ggml_sycl_staging_mib;
 // Which of the graph-level fusions may fire. One bit per fusion so a new one is a bit rather
 // than another environment variable, and so a bisect over them is a single value.
 enum ggml_sycl_fuse_type {
