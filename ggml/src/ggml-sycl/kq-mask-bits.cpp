@@ -9,6 +9,8 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
+#include <vector>
 
 extern int g_ggml_sycl_enable_graph;
 
@@ -64,23 +66,63 @@ void ggml_sycl_kq_mask_mark(ggml_tensor * t) {
     extra->optimized_feature.layout.nbytes = kq_mask_compact_applies(t) ? kq_mask_packed_bytes(t) : 0;
 }
 
-bool ggml_sycl_kq_mask_pack(void * vdst, const void * vsrc, int64_t ne0, int64_t nrows) {
-    const uint16_t * src   = (const uint16_t *) vsrc;
-    char *           dst   = (char *) vdst;
-    const size_t     rbyte = ggml_sycl_kq_mask_row_bytes(ne0);
-    for (int64_t r = 0; r < nrows; ++r) {
+// Branch-free over 32 columns so the compiler vectorizes it: the scalar loop cost ~120 ms per
+// card per ubatch at 100k cells, on the one host thread that feeds every device.
+static bool kq_mask_pack_rows(char * dst, const uint16_t * src, int64_t ne0, int64_t r0, int64_t r1) {
+    const size_t rbyte = ggml_sycl_kq_mask_row_bytes(ne0);
+    uint32_t     bad   = 0;
+    for (int64_t r = r0; r < r1; ++r) {
         uint32_t *       out = (uint32_t *) (dst + (size_t) r * rbyte);
         const uint16_t * in  = src + (size_t) r * ne0;
         memset(out, 0, rbyte);
-        for (int64_t c = 0; c < ne0; ++c) {
-            if (in[c] == 0x0000u) {
-                out[c >> 5] |= 1u << (c & 31);
-            } else if (in[c] != 0xFC00u) {  // f16 -inf
-                return false;
+        int64_t c0 = 0;
+        for (; c0 + 32 <= ne0; c0 += 32) {
+            uint32_t word = 0;
+            for (int k = 0; k < 32; ++k) {
+                const uint16_t v = in[c0 + k];
+                word |= (uint32_t) (v == 0x0000u) << k;
+                bad  |= (uint32_t) (v != 0x0000u && v != 0xFC00u);  // f16 -inf
             }
+            out[c0 >> 5] = word;
+        }
+        for (int64_t c = c0; c < ne0; ++c) {
+            const uint16_t v = in[c];
+            out[c >> 5] |= (uint32_t) (v == 0x0000u) << (c & 31);
+            bad |= (uint32_t) (v != 0x0000u && v != 0xFC00u);
+        }
+        if (bad) {
+            return false;
         }
     }
     return true;
+}
+
+bool ggml_sycl_kq_mask_pack(void * vdst, const void * vsrc, int64_t ne0, int64_t nrows) {
+    const uint16_t * src = (const uint16_t *) vsrc;
+    char *           dst = (char *) vdst;
+    const int        nt  = ne0 * nrows < (1 << 20) ? 1 : (int) std::clamp<int64_t>(std::min<int64_t>(std::thread::hardware_concurrency() / 2, nrows), 1, 8);
+    if (nt == 1) {
+        return kq_mask_pack_rows(dst, src, ne0, 0, nrows);
+    }
+    std::atomic<bool>        ok{ true };
+    std::vector<std::thread> workers;
+    const int64_t            per = (nrows + nt - 1) / nt;
+    for (int t = 0; t < nt; ++t) {
+        const int64_t r0 = t * per;
+        const int64_t r1 = std::min(nrows, r0 + per);
+        if (r0 >= r1) {
+            break;
+        }
+        workers.emplace_back([&, r0, r1] {
+            if (!kq_mask_pack_rows(dst, src, ne0, r0, r1)) {
+                ok = false;
+            }
+        });
+    }
+    for (auto & w : workers) {
+        w.join();
+    }
+    return ok;
 }
 
 void ggml_sycl_kq_mask_unpack(void * vdst, const void * vsrc, int64_t ne0, int64_t nrows) {
