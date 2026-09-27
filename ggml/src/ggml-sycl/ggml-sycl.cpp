@@ -97,6 +97,9 @@
 #include "ggml-sycl/gated_delta_net.hpp"
 #include "ggml-sycl/pool.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
+#include "ggml-sycl/pipe-trace.hpp"
+#include <deque>
+#include <functional>
 
 #define MEM_SIZE_2M	0x00200000
 #define MEM_SIZE_1G	0x40000000
@@ -148,6 +151,8 @@ int g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
 int g_ggml_sycl_device_event_wait = 1;
 int g_ggml_sycl_async_copy = GGML_SYCL_ASYNC_COPY_DEFAULT;
 int g_ggml_sycl_copy_ring_depth = GGML_SYCL_COPY_RING_DEPTH_DEFAULT;
+int g_ggml_sycl_staging_ring = 1;
+int g_ggml_sycl_staging_mib = 512;
 int g_ggml_sycl_fuse_types = GGML_SYCL_FUSE_DEFAULT;
 int g_ggml_sycl_float_commutative = 1;
 int g_ggml_sycl_kv_soa = 0;
@@ -455,6 +460,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_copy_ring_depth = std::clamp(
             ggml_sycl_get_env("GGML_SYCL_COPY_RING_DEPTH", GGML_SYCL_COPY_RING_DEPTH_DEFAULT), 1,
             GGML_SYCL_COPY_RING_MAX_DEPTH);
+        g_ggml_sycl_staging_ring = ggml_sycl_get_env("GGML_SYCL_STAGING_RING", 1);
+        g_ggml_sycl_staging_mib = std::clamp(ggml_sycl_get_env("GGML_SYCL_STAGING_MIB", 512), 8, 4096);
         g_ggml_sycl_fuse_types = ggml_sycl_get_env("GGML_SYCL_FUSE_TYPES", GGML_SYCL_FUSE_DEFAULT);
         g_ggml_sycl_float_commutative = ggml_sycl_get_env("GGML_SYCL_FLOAT_COMMUTATIVE", 1);
         g_ggml_sycl_kv_soa = ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0);
@@ -538,6 +545,7 @@ static void ggml_check_sycl() try {
                       (g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_L0) ? 1 : 0,
                       (g_ggml_sycl_async_copy & GGML_SYCL_ASYNC_COPY_SRC_RING) ? 1 : 0);
         GGML_LOG_INFO("  GGML_SYCL_COPY_RING_DEPTH: %d\n", g_ggml_sycl_copy_ring_depth);
+        GGML_LOG_INFO("  GGML_SYCL_STAGING_RING: %d (%d MiB)\n", g_ggml_sycl_staging_ring, g_ggml_sycl_staging_mib);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_TYPES: 0x%x (elementwise=%d mul_add=%d moe_reduce=%d moe_glu_id=%d unary_mul_b=%d norm_scale=%d glu_ncols=%d flat_batch=%d)\n",
                       g_ggml_sycl_fuse_types,
                       (g_ggml_sycl_fuse_types & GGML_SYCL_FUSE_ELEMENTWISE) != 0,
@@ -743,16 +751,41 @@ inline void free_aligned_mem_host(void * memblock) {
 // sycl buffer
 
 struct ggml_backend_sycl_buffer_context {
-    // Pinned staging for bulk uploads (model load). Chunked into slots so the host copy of
-    // one chunk runs while the previous chunk is still on the wire.
-    static constexpr int    staging_slots     = 4;
-    static constexpr size_t staging_slot_size = 8*1024*1024;
+    // Pinned staging for host uploads. Chunked so the host copy of one chunk runs while the
+    // previous chunk is still on the wire.
+    static constexpr size_t staging_chunk_max = 8*1024*1024;
+    static constexpr size_t staging_first_cap = 64*1024*1024;
 
+    // A byte ring. An upload waits only for the oldest uploads whose bytes it reuses. Each
+    // copy is queued behind all earlier work on the device, and in pipeline mode that includes
+    // a wait on another device, so a small ring stalls the host thread that feeds every device.
     struct host_staging {
-        void * data = nullptr;
-        std::array<sycl::event, staging_slots> events;
-        std::array<bool, staging_slots> submitted = {};
-        int next = 0;
+        struct entry {
+            size_t      off;
+            size_t      size;
+            sycl::event ev;
+        };
+        char *            data = nullptr;
+        size_t            cap  = 0;
+        size_t            head = 0;
+        std::deque<entry> used;  // oldest first
+        // blocks left behind by a growth, each freed once its last upload is done
+        std::vector<std::pair<char *, sycl::event>> retired;
+
+        void free_retired(sycl::queue & q, bool wait) {
+            for (size_t i = 0; i < retired.size();) {
+                auto & r = retired[i];
+                if (wait) {
+                    r.second.wait_and_throw();
+                } else if (r.second.get_info<sycl::info::event::command_execution_status>() !=
+                           sycl::info::event_command_status::complete) {
+                    ++i;
+                    continue;
+                }
+                sycl::free(r.first, q);
+                retired.erase(retired.begin() + i);
+            }
+        }
     };
 
     int device;
@@ -773,12 +806,11 @@ struct ggml_backend_sycl_buffer_context {
 
     // waits for every queued upload, then releases the pinned block
     void drop_host_staging() {
-        for (int i = 0; i < staging_slots; ++i) {
-            if (staging.submitted[i]) {
-                staging.events[i].wait_and_throw();
-                staging.submitted[i] = false;
-            }
+        for (auto & e : staging.used) {
+            e.ev.wait_and_throw();
         }
+        staging.used.clear();
+        staging.free_retired(*stream, true);
         if (staging.data != nullptr) {
             sycl::free(staging.data, *stream);
             staging.data = nullptr;
@@ -920,7 +952,12 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                     "a packed mask must be written whole; see kq-mask-bits.hpp");
         const int64_t nrows = ggml_nelements(tensor) / tensor->ne[0];
         mask_buf.resize(ggml_sycl_kq_mask_row_bytes(tensor->ne[0]) * nrows);
-        if (ggml_sycl_kq_mask_pack(mask_buf.data(), data, tensor->ne[0], nrows)) {
+        bool packed;
+        {
+            ggml_sycl_pipe_trace_scope pack_scope("PACK", ((ggml_backend_sycl_buffer_context *) buffer->context)->device, tensor->name, size);
+            packed = ggml_sycl_kq_mask_pack(mask_buf.data(), data, tensor->ne[0], nrows);
+        }
+        if (packed) {
             data = mask_buf.data();
             size = mask_buf.size();
         } else {
@@ -945,6 +982,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         data = soa_buf.data();
     }
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+    ggml_sycl_pipe_trace_scope trace_scope("SET", ctx->device, tensor->name, size);
     ggml_sycl_set_device(ctx->device);
     queue_ptr stream = ctx->stream;
 
@@ -952,25 +990,78 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // mmap()ed pages - the reason the old path bounced through a malloc'd buffer. The block is
     // pinned and reused, and the chunks pipeline instead of draining the queue once per tensor.
     // Ordering holds because this is the same in-order queue the device computes on.
-    if (ctx->staging.data == nullptr) {
-        ctx->staging.data = sycl::malloc_host(
-            ctx->staging_slots * ctx->staging_slot_size, *stream);
+    auto & stg = ctx->staging;
+    // graph inputs are uploaded every ubatch, and in pipeline mode several ubatches are in flight
+    const bool   ring    = g_ggml_sycl_staging_ring != 0;
+    const bool   compute = ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
+    const size_t max_cap = ring && compute ? (size_t) g_ggml_sycl_staging_mib << 20 : 4 * ctx->staging_chunk_max;
+    if (stg.data == nullptr) {
+        const size_t cap = std::min(max_cap, ctx->staging_first_cap);
+        stg.data = (char *) sycl::malloc_host(cap, *stream);
+        stg.cap  = stg.data != nullptr ? cap : 0;
     }
-    if (ctx->staging.data != nullptr) {
+    if (stg.data != nullptr) {
+        stg.free_retired(*stream, false);
+        auto done = [](const sycl::event & ev) {
+            return ev.get_info<sycl::info::event::command_execution_status>() ==
+                   sycl::info::event_command_status::complete;
+        };
+        // forget finished uploads, so the list stays as short as what is in flight
+        while (!stg.used.empty() && done(stg.used.front().ev)) {
+            stg.used.pop_front();
+        }
+        // whether reusing [lo, hi) would have to wait for an upload
+        auto busy = [&](size_t lo, size_t hi) {
+            for (const auto & e : stg.used) {
+                if (e.off < hi && e.off + e.size > lo && !done(e.ev)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        // wait for, and forget, the oldest uploads that overlap [lo, hi)
+        auto claim = [&](size_t lo, size_t hi) {
+            while (!stg.used.empty() && stg.used.front().off < hi && stg.used.front().off + stg.used.front().size > lo) {
+                if (!done(stg.used.front().ev)) {
+                    ggml_sycl_pipe_trace_scope slot_scope("SLOTW", ctx->device, tensor->name, hi - lo);
+                    stg.used.front().ev.wait_and_throw();
+                }
+                stg.used.pop_front();
+            }
+        };
         char *       dst       = (char *) tensor->data + offset;
         const char * src       = (const char *) data;
         size_t       remaining = size;
         while (remaining > 0) {
-            const size_t chunk = std::min(remaining, ctx->staging_slot_size);
-            const int    slot  = ctx->staging.next;
-            ctx->staging.next = (ctx->staging.next + 1) % ctx->staging_slots;
-            if (ctx->staging.submitted[slot]) {
-                ctx->staging.events[slot].wait_and_throw();
+            const size_t chunk_max = std::min(ctx->staging_chunk_max, stg.cap / 4);
+            const size_t chunk     = std::min(remaining, chunk_max);
+            // the legacy mode spends a whole slot on every chunk
+            const size_t span      = ring ? GGML_PAD(chunk, 256) : chunk_max;
+            const bool   wrap      = stg.head + span > stg.cap;
+            const bool   blocks    = wrap ? busy(stg.head, stg.cap) || busy(0, span) : busy(stg.head, stg.head + span);
+            // a wait here holds up every device this thread feeds, so grow the ring instead
+            if (blocks && ring && stg.cap < max_cap) {
+                const size_t cap  = std::min(max_cap, 2 * stg.cap);
+                char *       grown = (char *) sycl::malloc_host(cap, *stream);
+                if (grown != nullptr) {
+                    // the queue is in order, so the newest upload finishing means the old block is unused
+                    stg.retired.push_back({ stg.data, stg.used.back().ev });
+                    stg.used.clear();
+                    stg.data = grown;
+                    stg.cap  = cap;
+                    stg.head = 0;
+                    continue;
+                }
             }
-            void * stage = (char *) ctx->staging.data + slot * ctx->staging_slot_size;
+            if (wrap) {
+                claim(stg.head, stg.cap);  // the skipped tail holds the oldest uploads
+                stg.head = 0;
+            }
+            claim(stg.head, stg.head + span);
+            char * stage = stg.data + stg.head;
             memcpy(stage, src, chunk);
-            ctx->staging.events[slot] = stream->memcpy(dst, stage, chunk);
-            ctx->staging.submitted[slot] = true;
+            stg.used.push_back({ stg.head, span, stream->memcpy(dst, stage, chunk) });
+            stg.head  += span;
             src       += chunk;
             dst       += chunk;
             remaining -= chunk;
@@ -1006,6 +1097,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     GGML_ASSERT((!soa || ggml_sycl_kv_soa_range_ok(offset, size)) &&
                 "a SoA KV read must cover whole spans; see kv-soa.hpp");
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
+    ggml_sycl_pipe_trace_scope trace_scope("GET", ctx->device, tensor->name, size);
 
     ggml_sycl_set_device(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
@@ -7167,6 +7259,7 @@ static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         return false;
     }
     ggml_backend_sycl_context * dst_ctx = (ggml_backend_sycl_context *) backend_dst->context;
+    ggml_sycl_pipe_trace_scope trace_scope("CPY", dst_ctx->device, dst->name, ggml_nbytes(dst));
     if (dst->buffer->buft != ggml_backend_sycl_buffer_type(dst_ctx->device)) {
         return false;
     }
@@ -7227,6 +7320,9 @@ catch (sycl::exception const &exc) {
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+    static const bool trace_bt = getenv("GGML_SYCL_PIPE_TRACE_BT") != nullptr;
+    const std::string trace_where = trace_bt && ggml_sycl_pipe_trace_on() ? ggml_sycl_pipe_trace_bt(1) : std::string();
+    ggml_sycl_pipe_trace_scope trace_scope("SYNC", sycl_ctx->device, trace_where.c_str());
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
 
@@ -7716,8 +7812,34 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         census = ggml_sycl_census_begin(*sycl_ctx, cgraph, absorbed_by);
     }
 
+    const bool    trace      = ggml_sycl_pipe_trace_on();
+    double        trace_t    = trace ? ggml_sycl_pipe_trace_now() : 0.0;
+    ggml_tensor * trace_prev = nullptr;
+    auto trace_node = [&](ggml_tensor * next) {
+        const double t = ggml_sycl_pipe_trace_now();
+        if (trace_prev && t - trace_t > 300.0) {
+            char d[160];
+            snprintf(d, sizeof(d), "%s:%s", ggml_op_desc(trace_prev), trace_prev->name);
+            for (char * c = d; *c; ++c) {
+                if (*c == ' ') {
+                    *c = '_';
+                }
+            }
+            ggml_sycl_pipe_trace_host("NODE", sycl_ctx->device, trace_t, d, ggml_nbytes(trace_prev));
+        }
+        trace_t    = ggml_sycl_pipe_trace_now();
+        trace_prev = next;
+    };
+    struct trace_last {
+        bool on; std::function<void()> f;
+        ~trace_last() { if (on) f(); }
+    } trace_flush{ trace, [&] { trace_node(nullptr); } };
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        if (trace) {
+            trace_node(node);
+        }
         if (census) {
             ggml_sycl_census_visit(census, i);
         }
@@ -8231,6 +8353,25 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    static int trace_seq[GGML_SYCL_MAX_DEVICES] = {};
+    const bool trace = ggml_sycl_pipe_trace_on();
+    const int  seq   = trace ? trace_seq[sycl_ctx->device]++ : 0;
+    char       trace_detail[160];
+    if (trace) {
+        snprintf(trace_detail, sizeof(trace_detail), "#%d:n=%d:%s..%s", seq, cgraph->n_nodes,
+                 cgraph->n_nodes ? cgraph->nodes[0]->name : "", cgraph->n_nodes ? cgraph->nodes[cgraph->n_nodes - 1]->name : "");
+        for (char * c = trace_detail; *c; ++c) {
+            if (*c == ' ') {
+                *c = '_';
+            }
+        }
+        ggml_sycl_pipe_trace_mark(*sycl_ctx->stream(sycl_ctx->device, 0), sycl_ctx->device, "B", seq);
+    }
+    ggml_sycl_pipe_trace_scope trace_scope("GC", sycl_ctx->device, trace ? trace_detail : "");
+    struct trace_end_mark {
+        bool on; ggml_backend_sycl_context * ctx; int seq;
+        ~trace_end_mark() { if (on) ggml_sycl_pipe_trace_mark(*ctx->stream(ctx->device, 0), ctx->device, "E", seq); }
+    } trace_end{ trace, sycl_ctx, seq };
 
     // set the device on every call: a graph replay does not go through
     // ggml_backend_sycl_graph_compute_impl()
@@ -8337,6 +8478,7 @@ try
     sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
 
     const queue_ptr &stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    ggml_sycl_pipe_trace_scope trace_scope("EVREC", sycl_ctx->device);
     // Record the current state of the queue
     SYCL_CHECK(CHECK_TRY_ERROR(*sycl_event = stream->ext_oneapi_submit_barrier()));
 }
@@ -8354,6 +8496,8 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
     if (!ggml_backend_is_sycl(backend)) {
         GGML_ABORT("fatal error");
     }
+    ggml_sycl_pipe_trace_scope trace_scope("EVWAIT", ((ggml_backend_sycl_context *) backend->context)->device, "",
+        ((const ggml_backend_sycl_device_context *) event->device->context)->device);
 
     // Order the queues on the device rather than stalling the host, the SYCL equivalent of
     // cudaStreamWaitEvent. event_record leaves a barrier on the producing queue, so a barrier
@@ -9129,6 +9273,7 @@ static void ggml_backend_sycl_device_event_synchronize(ggml_backend_dev_t dev, g
   GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
 
   sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
+  ggml_sycl_pipe_trace_scope trace_scope("EVSYNC", ((const ggml_backend_sycl_device_context *) event->device->context)->device);
   SYCL_CHECK(CHECK_TRY_ERROR(sycl_event->wait()));
 } catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
