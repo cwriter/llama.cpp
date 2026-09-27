@@ -1,5 +1,6 @@
 #include "fattn-qsa.hpp"
 #include "fattn.hpp"
+#include "kq-mask-bits.hpp"
 #include "kv-soa.hpp"
 
 #include <oneapi/mkl.hpp>
@@ -24,11 +25,16 @@
 // Everything else (decode, short batches, sinks, softcap, ALiBi): the mask the graph wanted is
 // written into pool scratch at its real size and the dense kernels run unchanged, so the output
 // is bit for bit what the unfused graph gives, and no mask is reserved at the worst case.
+//
+// The causal mask may be packed (kq-mask-bits.hpp): one bit per cell, row stride
+// ggml_sycl_kq_mask_row_bytes(n_kv), rows of every stream back to back. A bit is 0 or -inf, so
+// the selection bits below fold it exactly and no kernel ever reads it as f16.
 
 static constexpr int QSA_UNION_T      = 64;    // query tokens per tile
 static constexpr int QSA_UNION_CHUNK  = 8192;  // union cells per GEMM
-// up to this many cells a tile's union is about the whole cache, so the dense oneMKL kernel
-// takes the selection bits directly (fattn.hpp), with far fewer launches
+// up to this many cells a tile's union is about the whole cache, so the dense kernel runs
+// instead: the chunked oneMKL kernel takes the selection bits directly (fattn.hpp) with far
+// fewer launches, and any other kernel takes the mask written into scratch
 static constexpr int QSA_UNION_MIN_KV = 8192;
 static constexpr int QSA_WG          = 256;
 static constexpr int QSA_PAD         = 8;     // a union chunk is padded to this, so rows load 16 bytes at a time
@@ -58,7 +64,9 @@ static void qsa_dense_scratch_fa(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
     ggml_sycl_pool_alloc<sycl::half> scratch(ctx.pool(), (size_t) n_all);
     sycl::half *       dst   = scratch.get();
-    const sycl::half * src   = (const sycl::half *) mask->data;
+    const char *       src   = (const char *) mask->data;
+    const bool         mbits = ggml_sycl_kq_mask_is_bits(mask);
+    const size_t       m_row = ggml_sycl_kq_mask_row_bytes(n_kv);
     const char *       idx_d = (const char *) idx->data;
     const size_t       i_nb1 = idx->nb[1];
     const size_t       i_nb2 = idx->nb[2];
@@ -81,8 +89,16 @@ static void qsa_dense_scratch_fa(ggml_backend_sycl_context & ctx, ggml_tensor * 
         const int64_t t = r % n_tps;
         const int64_t s = r / n_tps;
         const int64_t c = *(const int32_t *) (idx_d + w * sizeof(int32_t) + t * i_nb1 + s * i_nb2);
-        if (c >= 0 && c < n_kv) {
-            dst[r * n_kv + c] = src[r * n_kv + c];
+        if (c < 0 || c >= n_kv) {
+            return;
+        }
+        if (mbits) {
+            const uint32_t word = ((const uint32_t *) (src + r * m_row))[c >> 5];
+            if ((word >> (c & 31)) & 1u) {
+                dst[r * n_kv + c] = sycl::half(0.0f);
+            }
+        } else {
+            dst[r * n_kv + c] = ((const sycl::half *) src)[r * n_kv + c];
         }
     });
 
@@ -101,7 +117,8 @@ static void qsa_dense_scratch_fa(ggml_backend_sycl_context & ctx, ggml_tensor * 
 
 // One bit per (query row, cell): the cell is in the row's list and the causal mask lets the row
 // see it. odd is set when a visible listed cell carries a finite mask value that is not zero;
-// only then does the softmax read the mask.
+// only then does the softmax read the mask. A packed mask (MBITS) is 0 or -inf by construction.
+template <bool MBITS>
 static void k_qsa_bits(const char * idx, const char * mask, uint32_t * bits, int32_t * odd, int64_t n_kv,
                        int64_t n_tps, int64_t width, int64_t words, size_t i_nb1, size_t i_nb2, size_t m_nb1,
                        size_t m_nb3, const sycl::nd_item<2> & it) {
@@ -116,12 +133,19 @@ static void k_qsa_bits(const char * idx, const char * mask, uint32_t * bits, int
     if (c < 0 || c >= n_kv) {
         return;
     }
-    const float m = (float) ((const sycl::half *) (mask + t * m_nb1 + s * m_nb3))[c];
-    if (!sycl::isfinite(m)) {
-        return;
-    }
-    if (m != 0.0f) {
-        *odd = 1;
+    if constexpr (MBITS) {
+        const uint32_t m = ((const uint32_t *) (mask + r * m_nb1))[c >> 5];
+        if (((m >> (c & 31)) & 1u) == 0) {
+            return;
+        }
+    } else {
+        const float m = (float) ((const sycl::half *) (mask + t * m_nb1 + s * m_nb3))[c];
+        if (!sycl::isfinite(m)) {
+            return;
+        }
+        if (m != 0.0f) {
+            *odd = 1;
+        }
     }
     sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device,
                      sycl::access::address_space::global_space> ref(bits[r * words + (c >> 5)]);
@@ -346,7 +370,8 @@ struct qsa_union_args {
     const char *  V;
     size_t        v_nb1, v_nb2, v_nb3;
     const char *  mask;
-    size_t        m_nb1, m_nb3;
+    size_t        m_nb1, m_nb3;  // for a packed mask: the packed row stride, and no stream stride
+    int           m_bits;
     const char *  idx;
     size_t        i_nb1, i_nb2;
     float *       dst;
@@ -364,10 +389,17 @@ static void qsa_build_bits(dpct::queue_ptr stream, const qsa_union_args & a, uin
     const char *  mask  = a.mask;
     const int64_t n_kv = a.n_kv, n_tps = a.n_tps, width = a.width;
     const size_t  i_nb1 = a.i_nb1, i_nb2 = a.i_nb2, m_nb1 = a.m_nb1, m_nb3 = a.m_nb3;
-    stream->parallel_for(sycl::nd_range<2>(sycl::range<2>(n_rows, ((width + QSA_WG - 1) / QSA_WG) * QSA_WG),
-                                           sycl::range<2>(1, QSA_WG)), [=](sycl::nd_item<2> it) {
-        k_qsa_bits(idx, mask, bits, odd, n_kv, n_tps, width, words, i_nb1, i_nb2, m_nb1, m_nb3, it);
-    });
+    const sycl::nd_range<2> range(sycl::range<2>(n_rows, ((width + QSA_WG - 1) / QSA_WG) * QSA_WG),
+                                  sycl::range<2>(1, QSA_WG));
+    if (a.m_bits) {
+        stream->parallel_for(range, [=](sycl::nd_item<2> it) {
+            k_qsa_bits<true>(idx, mask, bits, odd, n_kv, n_tps, width, words, i_nb1, i_nb2, m_nb1, m_nb3, it);
+        });
+    } else {
+        stream->parallel_for(range, [=](sycl::nd_item<2> it) {
+            k_qsa_bits<false>(idx, mask, bits, odd, n_kv, n_tps, width, words, i_nb1, i_nb2, m_nb1, m_nb3, it);
+        });
+    }
 }
 
 // the dense oneMKL kernel over the whole cache, keeping the cells the bits name and adding the mask
@@ -378,9 +410,10 @@ static void qsa_bits_mkl_fa(ggml_backend_sycl_context & ctx, ggml_tensor * fa, c
     ggml_sycl_pool_alloc<int32_t>  odd(ctx.pool(), 1);
     qsa_build_bits(ctx.stream(), a, bits.get(), odd.get());
 
+    // a packed mask is folded into the bits, so the kernel must not read it; a dense one is added
     ggml_tensor node = *fa;
     node.src[3]      = const_cast<ggml_tensor *>(mask);
-    ggml_sycl_flash_attn_ext_mkl(ctx, &node, bits.get(), words, 1);
+    ggml_sycl_flash_attn_ext_mkl(ctx, &node, bits.get(), words, a.m_bits ? 2 : 1);
 }
 
 template <int KIND>
@@ -545,13 +578,18 @@ bool ggml_sycl_qsa_sparse_fa_supported(const ggml_tensor * fa) {
     return ggml_nelements(mask) <= INT32_MAX;
 }
 
-// The union kernel takes what the chunked oneMKL kernel would take, so it and mode 0 reach the
-// same node with the same GEMMs; everything else keeps the dense kernels.
+// The union kernel takes what the chunked oneMKL kernel could take (its GEMMs are the same
+// calls) whenever the context is long enough for the union to be a fraction of the cache; at a
+// short context it defers to whichever dense kernel the dispatcher picks. Everything else keeps
+// the dense kernels.
 static bool qsa_union_applicable(const ggml_tensor * fa, int & kind) {
     const ggml_tensor * Q = fa->src[0];
     const ggml_tensor * K = fa->src[1];
     const ggml_tensor * V = fa->src[2];
-    if (!ggml_sycl_fattn_picks_mkl(fa) || fa->src[4]) {
+    if (!ggml_sycl_fattn_mkl_shape_ok(fa) || fa->src[4]) {
+        return false;
+    }
+    if (K->ne[1] <= QSA_UNION_MIN_KV && !ggml_sycl_fattn_picks_mkl(fa)) {
         return false;
     }
     const int64_t D = Q->ne[0];
@@ -601,6 +639,7 @@ void ggml_sycl_qsa_sparse_fa(ggml_backend_sycl_context & ctx, ggml_tensor * fa, 
         fprintf(stderr, "[QSASPARSE] n_kv=%ld n_tps=%ld heads=%ld/%ld width=%ld path=%s kind=%d\n",
                 (long) mask->ne[0], (long) mask->ne[1], (long) fa->src[0]->ne[2], (long) fa->src[1]->ne[2],
                 (long) idx->ne[0], !take ? "dense" : small ? "bits" : "union", kind);
+        fprintf(stderr, "[QSASPARSE] causal mask %s\n", ggml_sycl_kq_mask_is_bits(mask) ? "packed" : "f16");
     }
 
     if (!take) {
@@ -625,9 +664,10 @@ void ggml_sycl_qsa_sparse_fa(ggml_backend_sycl_context & ctx, ggml_tensor * fa, 
     a.v_nb1 = V->nb[1];
     a.v_nb2 = V->nb[2];
     a.v_nb3 = V->nb[3];
-    a.mask  = (const char *) mask->data;
-    a.m_nb1 = mask->nb[1];
-    a.m_nb3 = mask->nb[3];
+    a.mask   = (const char *) mask->data;
+    a.m_bits = ggml_sycl_kq_mask_is_bits(mask) ? 1 : 0;
+    a.m_nb1  = a.m_bits ? ggml_sycl_kq_mask_row_bytes(mask->ne[0]) : mask->nb[1];
+    a.m_nb3  = mask->nb[3];
     a.idx   = (const char *) idx->data;
     a.i_nb1 = idx->nb[1];
     a.i_nb2 = idx->nb[2];
