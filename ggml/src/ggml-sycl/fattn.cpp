@@ -514,6 +514,11 @@ bool ggml_sycl_fattn_picks_mkl(const ggml_tensor * dst) {
     return ggml_sycl_fattn_mkl_supported(dst);
 }
 
+bool ggml_sycl_fattn_mkl_shape_ok(const ggml_tensor * dst) {
+    return g_ggml_sycl_enable_flash_attention && dst->op == GGML_OP_FLASH_ATTN_EXT && dst->src[0] &&
+           ggml_sycl_fattn_mkl_supported(dst);
+}
+
 bool ggml_sycl_flash_attn_ext_uses_library(int device, const ggml_tensor * dst) {
     const best_fattn_kernel kernel = ggml_sycl_get_best_fattn_kernel(device, dst);
     return kernel == BEST_FATTN_KERNEL_ONEDNN || kernel == BEST_FATTN_KERNEL_MKL;
