@@ -203,11 +203,6 @@ static bool qsa_fa_mask_core(const ggml_cgraph * cgraph, ggml_tensor * fa, qsa_m
     if (!qsa_mask_chain_from_add(cgraph, ad, &c)) {
         return false;
     }
-    // A packed causal mask is itself a bitmap: this fusion would hand oneMKL a second one with
-    // different semantics, and the gather kernels read the mask as f16, so the features must not combine.
-    if (ggml_sycl_kq_mask_is_bits(ad) || ggml_sycl_kq_mask_is_bits(c.mask)) {
-        return false;
-    }
     if (out) {
         *out = c;
     }
@@ -279,10 +274,12 @@ static void k_qsa_mask_drop(T * dst, int64_t n, T value, const sycl::nd_item<1> 
     }
 }
 
-// keep the cells that row (t, s) of the index list names; rows are contiguous in both tensors
-template <typename T>
-static void k_qsa_mask_keep(const T * mask, T * dst, const char * idx, int64_t n_kv, int64_t n_tps,
-                            int64_t width, size_t nb1, size_t nb2, const sycl::nd_item<2> & item) {
+// keep the cells that row (t, s) of the index list names; rows are contiguous in both tensors.
+// A packed mask (kq-mask-bits.hpp) holds one bit per cell: set means 0, clear means -inf, which
+// the drop already wrote.
+template <typename T, bool BITS>
+static void k_qsa_mask_keep(const void * mask, T * dst, const char * idx, int64_t n_kv, int64_t n_tps,
+                            int64_t width, size_t nb1, size_t nb2, size_t m_row, const sycl::nd_item<2> & item) {
     const int64_t w = (int64_t) item.get_global_id(1);
     if (w >= width) {
         return;
@@ -297,32 +294,47 @@ static void k_qsa_mask_keep(const T * mask, T * dst, const char * idx, int64_t n
         return;
     }
 
-    dst[r*n_kv + c] = mask[r*n_kv + c];
+    if constexpr (BITS) {
+        const uint32_t word = ((const uint32_t *) ((const char *) mask + r*m_row))[c >> 5];
+        if ((word >> (c & 31)) & 1u) {
+            dst[r*n_kv + c] = static_cast<T>(0.0f);
+        }
+    } else {
+        dst[r*n_kv + c] = ((const T *) mask)[r*n_kv + c];
+    }
 }
 
 template <typename T>
-static void qsa_mask_launch(dpct::queue_ptr stream, const void * mask_v, void * dst_v, const char * idx,
+static void qsa_mask_launch(dpct::queue_ptr stream, const void * mask, bool bits, void * dst_v, const char * idx,
                             int64_t n_all, int64_t n_kv, int64_t n_tps, int64_t n_rows, int64_t width,
                             size_t nb1, size_t nb2, float value) {
     constexpr int block = 256;
 
-    const T * mask = (const T *) mask_v;
-    T *       dst  = (T *) dst_v;
-    const T   val  = static_cast<T>(value);
+    T *          dst   = (T *) dst_v;
+    const T      val   = static_cast<T>(value);
+    const size_t m_row = ggml_sycl_kq_mask_row_bytes(n_kv);
 
     stream->parallel_for(
         sycl::nd_range<1>(((n_all + block - 1) / block) * block, block),
         [=](sycl::nd_item<1> item) { k_qsa_mask_drop(dst, n_all, val, item); });
 
-    stream->parallel_for(
-        sycl::nd_range<2>(sycl::range<2>(n_rows, ((width + block - 1) / block) * block), sycl::range<2>(1, block)),
-        [=](sycl::nd_item<2> item) { k_qsa_mask_keep(mask, dst, idx, n_kv, n_tps, width, nb1, nb2, item); });
+    const sycl::nd_range<2> range(sycl::range<2>(n_rows, ((width + block - 1) / block) * block), sycl::range<2>(1, block));
+    if (bits) {
+        stream->parallel_for(range, [=](sycl::nd_item<2> item) {
+            k_qsa_mask_keep<T, true>(mask, dst, idx, n_kv, n_tps, width, nb1, nb2, m_row, item);
+        });
+    } else {
+        stream->parallel_for(range, [=](sycl::nd_item<2> item) {
+            k_qsa_mask_keep<T, false>(mask, dst, idx, n_kv, n_tps, width, nb1, nb2, m_row, item);
+        });
+    }
 }
 
 // One bit per (row, kv cell), 1 keeps the cell. Built from the top-k list, so it touches width
-// cells per row and not n_kv. fold also requires the causal mask to be finite, which is what
-// lets the reader skip the dense mask entirely.
-static void k_qsa_sel_bits(const char * mask, const char * idx, uint32_t * bits,
+// cells per row and not n_kv. fold also requires the causal mask to let the row see the cell,
+// which is what lets the reader skip the dense mask entirely. A packed causal mask is read as
+// bits, in which case fold is always on: its row stride is then m_nb1 and it has no stream stride.
+static void k_qsa_sel_bits(const char * mask, int mbits, const char * idx, uint32_t * bits,
                            int64_t n_kv, int64_t n_tps, int64_t width, int64_t words,
                            size_t m_nb1, size_t m_nb3, size_t i_nb1, size_t i_nb2,
                            int fold, const sycl::nd_item<2> & item) {
@@ -339,7 +351,12 @@ static void k_qsa_sel_bits(const char * mask, const char * idx, uint32_t * bits,
     if (c < 0 || c >= n_kv) {
         return;
     }
-    if (fold) {
+    if (mbits) {
+        const uint32_t m = ((const uint32_t *) (mask + r*m_nb1))[c >> 5];
+        if (((m >> (c & 31)) & 1u) == 0) {
+            return;
+        }
+    } else if (fold) {
         const sycl::half m = ((const sycl::half *) (mask + t*m_nb1 + s*m_nb3))[c];
         if (!sycl::isfinite((float) m)) {
             return;
@@ -450,12 +467,13 @@ static void qsa_sel_bits_build(ggml_backend_sycl_context & ctx, const ggml_tenso
     const char * idx_dd  = (const char *) c.idx->data;
     GGML_ASSERT(mask_dd && idx_dd);
 
-    const int fold = g_ggml_sycl_fuse_qsa_fa_mask >= 2;
+    const int mbits = ggml_sycl_kq_mask_is_bits(c.mask) ? 1 : 0;
+    const int fold  = g_ggml_sycl_fuse_qsa_fa_mask >= 2 || mbits;
 
     stream->memset(bits, 0, (size_t) n_rows * words * sizeof(uint32_t));
 
     constexpr int block = 256;
-    const size_t  m_nb1 = c.mask->nb[1];
+    const size_t  m_nb1 = mbits ? ggml_sycl_kq_mask_row_bytes(c.mask->ne[0]) : c.mask->nb[1];
     const size_t  m_nb3 = c.mask->nb[3];
     const size_t  i_nb1 = c.idx->nb[1];
     const size_t  i_nb2 = c.idx->nb[2];
@@ -463,7 +481,7 @@ static void qsa_sel_bits_build(ggml_backend_sycl_context & ctx, const ggml_tenso
     stream->parallel_for(
         sycl::nd_range<2>(sycl::range<2>(n_rows, ((width + block - 1) / block) * block), sycl::range<2>(1, block)),
         [=](sycl::nd_item<2> item) {
-            k_qsa_sel_bits(mask_dd, idx_dd, bits, n_kv, n_tps, width, words, m_nb1, m_nb3, i_nb1, i_nb2, fold, item);
+            k_qsa_sel_bits(mask_dd, mbits, idx_dd, bits, n_kv, n_tps, width, words, m_nb1, m_nb3, i_nb1, i_nb2, fold, item);
         });
 
     // GGML_SYCL_QSA_SEL_STATS is the smallest n_kv worth reporting on, because the answer only
@@ -480,6 +498,14 @@ static void qsa_sel_bits_build(ggml_backend_sycl_context & ctx, const ggml_tenso
     }
 }
 
+// Every fusion here reads a packed causal mask as bits, and reports that on the FILL, which is
+// the node kq_mask_untaught_reader() lists as the chain's reader.
+static void qsa_mask_bits_taught(ggml_backend_sycl_context & ctx, const qsa_mask_chain & c) {
+    if (ggml_sycl_kq_mask_is_bits(c.mask)) {
+        ggml_sycl_kq_mask_taught(ctx, c.fill);
+    }
+}
+
 // Runs the chain matched by ggml_sycl_qsa_mask_shape(); returns the extra nodes consumed.
 int ggml_sycl_fuse_qsa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
     qsa_mask_chain c;
@@ -490,19 +516,20 @@ int ggml_sycl_fuse_qsa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
     // the dense mask is never built when flash attention takes the bitmap; leave it the bits
     if (g_ggml_sycl_fuse_qsa_fa_mask) {
         const int i_fa = qsa_fa_mask_reader(cgraph, i);
-        if (i_fa >= 0 && qsa_fa_sparse_mode()) {
-            return SYCL_QSA_MASK_SPAN;  // nothing to build: the reader takes the list itself
-        }
         if (i_fa >= 0) {
             ggml_sycl_qsa_mask_shape(cgraph, i, &c);
-            qsa_sel_bits_build(ctx, cgraph->nodes[i_fa], c);
-            return SYCL_QSA_MASK_SPAN;
+            qsa_mask_bits_taught(ctx, c);
+            if (!qsa_fa_sparse_mode()) {
+                qsa_sel_bits_build(ctx, cgraph->nodes[i_fa], c);
+            }
+            return SYCL_QSA_MASK_SPAN;  // in the sparse mode nothing is built: the reader takes the list itself
         }
     }
 
     if (!g_ggml_sycl_fuse_qsa_mask || !ggml_sycl_qsa_mask_shape(cgraph, i, &c)) {
         return 0;
     }
+    qsa_mask_bits_taught(ctx, c);
 
     const ggml_tensor * fm   = c.fill;
     const ggml_tensor * mask = c.mask;
@@ -520,6 +547,7 @@ int ggml_sycl_fuse_qsa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
     const char * idx_dd  = (const char *) idx->data;
     const void * mask_dd = mask->data;
     void *       dst_dd  = dst->data;
+    const bool   mbits   = ggml_sycl_kq_mask_is_bits(mask);
 
     // GGML_SYCL_QSA_MASK_TRACE gives the number of firings to report
     static std::atomic<int> trace_left{ getenv("GGML_SYCL_QSA_MASK_TRACE") ?
@@ -537,10 +565,10 @@ int ggml_sycl_fuse_qsa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgrap
     const float   value  = ggml_get_op_params_f32(fm, 0);
 
     if (dst->type == GGML_TYPE_F16) {
-        qsa_mask_launch<sycl::half>(stream, mask_dd, dst_dd, idx_dd, n_all, n_kv, n_tps, n_rows, width,
+        qsa_mask_launch<sycl::half>(stream, mask_dd, mbits, dst_dd, idx_dd, n_all, n_kv, n_tps, n_rows, width,
                                     idx->nb[1], idx->nb[2], value);
     } else {
-        qsa_mask_launch<float>(stream, mask_dd, dst_dd, idx_dd, n_all, n_kv, n_tps, n_rows, width,
+        qsa_mask_launch<float>(stream, mask_dd, mbits, dst_dd, idx_dd, n_all, n_kv, n_tps, n_rows, width,
                                idx->nb[1], idx->nb[2], value);
     }
 
@@ -580,7 +608,9 @@ bool ggml_sycl_qsa_fa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph
                 g_ggml_sycl_fuse_qsa_fa_mask, ctx.qsa_sel.size(), ctx.qsa_sel_high_water);
     }
 
-    ggml_sycl_flash_attn_ext_mkl(ctx, &fa, bits, words, g_ggml_sycl_fuse_qsa_fa_mask >= 2 ? 2 : 1);
+    // a packed causal mask was folded into the bits at the chain, so the kernel must not read it
+    const int sel_mode = (g_ggml_sycl_fuse_qsa_fa_mask >= 2 || ggml_sycl_kq_mask_is_bits(c.mask)) ? 2 : 1;
+    ggml_sycl_flash_attn_ext_mkl(ctx, &fa, bits, words, sel_mode);
 
     ctx.qsa_sel_drop(c.add);
     return true;

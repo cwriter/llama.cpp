@@ -482,9 +482,10 @@ static bool kq_mask_reader_taught(const ggml_tensor * n, int j, const ggml_tenso
 static const char * kq_mask_untaught_reader(const ggml_cgraph * cgraph, const ggml_tensor * owner,
                                             std::vector<const ggml_tensor *> * readers, const ggml_tensor ** who) {
     bool has_cast = false;
+    int  fused_to = 0;  // nodes before it belong to a QSA chain the fusion runs from its FILL
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
-        if (kq_mask_is_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        if (i < fused_to || kq_mask_is_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
@@ -492,11 +493,17 @@ static const char * kq_mask_untaught_reader(const ggml_cgraph * cgraph, const gg
                 continue;
             }
             if (n->op == GGML_OP_FILL && j == 0) {
-                // only its shape is read; the QSA chain fusions that start here read the mask
-                if ((g_ggml_sycl_fuse_qsa_mask || g_ggml_sycl_fuse_qsa_fa_mask) &&
-                    ggml_sycl_qsa_mask_absorbs(cgraph, i) > 0) {
-                    *who = n;
-                    return "QSA mask fusion";
+                // only its shape is read, unless a QSA chain fusion starts here: it reads the mask
+                // as bits (qsa-mask.cpp, fattn-qsa.cpp) on behalf of the whole chain, and reports
+                // itself on this FILL; the chain's own ADD never runs
+                const int span = (g_ggml_sycl_fuse_qsa_mask || g_ggml_sycl_fuse_qsa_fa_mask) ?
+                                 ggml_sycl_qsa_mask_absorbs(cgraph, i) : 0;
+                if (span > 0) {
+                    fused_to = i + span;
+                    if (readers) {
+                        readers->push_back(n);
+                    }
+                    break;
                 }
                 continue;
             }
