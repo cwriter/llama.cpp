@@ -47,6 +47,8 @@ bool ggml_sycl_fattn_stage_capped(const ggml_tensor * dst);
 // True when the dispatcher gives this node to the chunked oneMKL kernel. Only that kernel can
 // take a selection bitmap, so the QSA mask fusion asks here before it declines.
 bool ggml_sycl_fattn_picks_mkl(const ggml_tensor * dst);
+// The shape envelope of that kernel alone, whichever kernel the dispatcher would pick.
+bool ggml_sycl_fattn_mkl_shape_ok(const ggml_tensor * dst);
 
 // sel_bits, when set, is one bit per (query row, kv cell): 1 keeps the cell. sel_mode 1 still
 // adds dst->src[3], sel_mode 2 says the bit already carries the causal mask, so it is not read.
