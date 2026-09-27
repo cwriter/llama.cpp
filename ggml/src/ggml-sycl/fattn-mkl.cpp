@@ -26,6 +26,10 @@
 // bounded. Override with GGML_SYCL_MKL_FA_Q_TILE.
 #define MKL_FA_Q_TILE 8192
 
+// Without GGML_SYCL_MKL_FA_Q_TILE, a tile's f32 scores are capped to this size, so the scores and
+// S mostly stay in L2 between the KQ GEMM, the softmax and the VKQ GEMM (256 rows at 8192 cells).
+#define MKL_FA_Q_TILE_L2_BYTES (8 << 20)
+
 #define MKL_FA_WG_SIZE 256
 
 using oneapi::mkl::transpose;
@@ -118,7 +122,7 @@ static void mkl_fa_init_softmax_state(
 
     const float    neg_inf   = -1e30f;
     const int64_t  n_maxsum  = n_query_rows;
-    const int64_t  n_vacc    = (int64_t)n_query_rows * DV;
+    const int64_t  n_vacc    = vacc ? (int64_t)n_query_rows * DV : 0;
     const int64_t  total     = (n_vacc > n_maxsum) ? n_vacc : n_maxsum;
     const int64_t  wg = ((total + wg_size - 1) / wg_size) * wg_size;
 
@@ -247,6 +251,88 @@ static void mkl_fa_online_softmax_chunk(
                 }
             });
     });
+}
+
+// One-pass variant of the kernel above: each item keeps its scores in registers, so KQ (and the
+// mask) are read once. Items take float4 steps; the row stride ld is a multiple of 4 and cells at
+// or past n are padding. first: the accumulator holds no data yet, so it is not rescaled.
+static constexpr int MKL_FA_SM_NV = 8;  // float4 per item: rows up to MKL_FA_WG_SIZE * 32 cells
+
+template <int SEL>
+static void mkl_fa_softmax_chunk_1p(
+    dpct::queue_ptr stream,
+    const float * __restrict KQ_f32, sycl::half * __restrict S_f16,
+    float * __restrict KQ_max, float * __restrict KQ_sum, float * __restrict VKQ_accum,
+    int q0, int q_rows, int n_queries, int DV, int n, int ld, int chunk_start, bool first, int kvh_head,
+    const sycl::half * mask_data, int64_t mask_head_stride, int64_t mask_row_stride, int mask_n_heads,
+    const uint32_t * sel_bits, int64_t sel_words) {
+
+    stream->parallel_for(sycl::nd_range<1>((size_t) q_rows * MKL_FA_WG_SIZE, MKL_FA_WG_SIZE),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int lid       = (int) item.get_local_id(0);
+            const int row       = (int) item.get_group(0);
+            const int jc_abs    = q0 + row;
+            const int gqa_group = jc_abs / n_queries;
+            const int q_row     = jc_abs - gqa_group * n_queries;
+            const int n4        = ld / 4;
+
+            const sycl::float4 * kq4 = (const sycl::float4 *) (KQ_f32 + (int64_t) row * ld);
+            sycl::half4 *        s4  = (sycl::half4 *) (S_f16 + (int64_t) row * ld);
+            const sycl::half4 *  m4  = nullptr;
+            if (SEL != 2 && mask_data) {
+                const int m_head = mask_n_heads > 1 ? kvh_head + gqa_group : 0;
+                m4 = (const sycl::half4 *) (mask_data + m_head * mask_head_stride + q_row * mask_row_stride + chunk_start);
+            }
+            const uint32_t * sel_row = SEL ? sel_bits + q_row * sel_words : nullptr;
+
+            sycl::float4 v[MKL_FA_SM_NV];
+            float lmax = -1e30f;
+#pragma unroll
+            for (int j = 0; j < MKL_FA_SM_NV; ++j) {
+                const int i = j * MKL_FA_WG_SIZE + lid;
+                v[j] = sycl::float4(-INFINITY);
+                if (i < n4) {
+                    sycl::float4 s = kq4[i];
+                    if (m4) {
+                        s += m4[i].convert<float>();
+                    }
+                    const int c = 4 * i;
+                    uint32_t keep = c + 4 <= n ? 0xFu : (1u << (n - c)) - 1;
+                    if (SEL) {
+                        keep &= sel_row[(chunk_start + c) >> 5] >> ((chunk_start + c) & 31);
+                    }
+                    v[j] = sycl::float4(keep & 1 ? s.x() : -INFINITY, keep & 2 ? s.y() : -INFINITY,
+                                        keep & 4 ? s.z() : -INFINITY, keep & 8 ? s.w() : -INFINITY);
+                    lmax = sycl::fmax(lmax, sycl::fmax(sycl::fmax(v[j].x(), v[j].y()), sycl::fmax(v[j].z(), v[j].w())));
+                }
+            }
+            const float cmax    = sycl::reduce_over_group(item.get_group(), lmax, sycl::maximum<float>());
+            const float old_max = KQ_max[jc_abs];
+            const float new_max = old_max > cmax ? old_max : cmax;
+            const float rescale = old_max < -1e29f ? 1.0f : sycl::native::exp(old_max - new_max);
+            if (!first) {
+                float * __restrict vkq = VKQ_accum + (int64_t) jc_abs * DV;
+                for (int d = lid; d < DV; d += MKL_FA_WG_SIZE) {
+                    vkq[d] *= rescale;
+                }
+            }
+            float lsum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < MKL_FA_SM_NV; ++j) {
+                const int i = j * MKL_FA_WG_SIZE + lid;
+                if (i < n4) {
+                    const sycl::float4 e(sycl::native::exp(v[j].x() - new_max), sycl::native::exp(v[j].y() - new_max),
+                                         sycl::native::exp(v[j].z() - new_max), sycl::native::exp(v[j].w() - new_max));
+                    s4[i] = e.convert<sycl::half>();
+                    lsum += (e.x() + e.y()) + (e.z() + e.w());
+                }
+            }
+            const float total = sycl::reduce_over_group(item.get_group(), lsum, sycl::plus<float>());
+            if (lid == 0) {
+                KQ_sum[jc_abs] = (first ? 0.0f : KQ_sum[jc_abs] * rescale) + total;
+                KQ_max[jc_abs] = new_max;
+            }
+        });
 }
 
 // Write one GQA group's normalized output to its destination head.
@@ -742,8 +828,12 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     // Query rows are processed in tiles of q_tile_rows so the score buffers
     // (KQ_f32/S_f16 = q_tile_rows * chunk_size) stay bounded regardless of
     // batch size. n_query_rows <= Q_TILE is a single tile (no extra work).
-    static int q_tile_env = ggml_sycl_get_env("GGML_SYCL_MKL_FA_Q_TILE", MKL_FA_Q_TILE);
-    int q_tile_rows = std::max(1, std::min(q_tile_env, n_query_rows));
+    static int q_tile_env = ggml_sycl_get_env("GGML_SYCL_MKL_FA_Q_TILE", 0);
+    int q_tile_rows = std::max(1, std::min(q_tile_env > 0 ? q_tile_env : MKL_FA_Q_TILE, n_query_rows));
+
+    // GGML_SYCL_ENABLE_MKL_FA bits: 2 keeps the per-head normalize, 4 keeps the two-pass softmax, the
+    // separate accumulate and the full-size query tile
+    const bool legacy = (g_ggml_sycl_enable_mkl_fa & 4) != 0;
 
     // GGML_SYCL_FA_MAX_MEM_MIB is a ceiling on the scratch this kernel holds at once, and it is
     // the only knob: the KV chunk and the query tile are both derived from it. The per-row
@@ -770,6 +860,10 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
             }
             chunk_size = std::max(256, chunk_size / 2);
         }
+    }
+    if (q_tile_env <= 0 && !legacy) {
+        const int l2_rows = MKL_FA_Q_TILE_L2_BYTES / (4 * ((chunk_size + 3) & ~3));
+        q_tile_rows = std::min(q_tile_rows, std::max(32, l2_rows / 32 * 32));
     }
     if (online_q8) {
         q_tile_rows = std::max(MKL_FA_XMX_COLS, (q_tile_rows / MKL_FA_XMX_COLS) * MKL_FA_XMX_COLS);
@@ -860,9 +954,10 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     MKL_ACCUM(dequant_time_us, t_deq);
 
-    // GGML_SYCL_ENABLE_MKL_FA=2 keeps the per-head normalize
-    const bool fast_norm = g_ggml_sycl_enable_mkl_fa != 2 && DV % 4 == 0 && MKL_FA_WG_SIZE % (DV / 4) == 0 &&
+    const bool fast_norm = (g_ggml_sycl_enable_mkl_fa & 2) == 0 && DV % 4 == 0 && MKL_FA_WG_SIZE % (DV / 4) == 0 &&
                            (uintptr_t) KQV->data % 16 == 0;
+    // the VKQ GEMM adds into the accumulator (beta 1, beta 0 on the first chunk), so it needs no zero fill
+    const bool gemm_acc  = !legacy && !online_q8;
 
     // --- Resolve mask pointers ---
     int64_t mask_head_stride = 0;
@@ -880,8 +975,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     // --- Allocate intermediates from pool ---
     ggml_sycl_pool & pool = ctx.pool();
 
-    ggml_sycl_pool_alloc<float>      KQ_f32(pool);      // [q_tile_rows x chunk]
-    ggml_sycl_pool_alloc<sycl::half> S_f16(pool);       // [q_tile_rows x chunk]
+    ggml_sycl_pool_alloc<float>      KQ_f32(pool);      // [q_tile_rows x chunk_ld]
+    ggml_sycl_pool_alloc<sycl::half> S_f16(pool);       // [q_tile_rows x chunk_ld]
     ggml_sycl_pool_alloc<float>      VKQ_chunk(pool);   // [q_tile_rows x DV]
     ggml_sycl_pool_alloc<float>      VKQ_accum(pool);   // [n_query_rows x DV] (full)
     ggml_sycl_pool_alloc<float>      KQ_max(pool);      // [n_query_rows] (full)
@@ -890,9 +985,21 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     ggml_sycl_pool_alloc<sycl::half> K_chunk_f16(pool); // [chunk x DKQ] (per-chunk dequant)
     ggml_sycl_pool_alloc<sycl::half> V_chunk_f16(pool); // [chunk x DV] (per-chunk dequant)
 
-    KQ_f32.alloc((size_t)q_tile_rows * chunk_size);
-    S_f16.alloc((size_t)q_tile_rows * chunk_size);
-    VKQ_chunk.alloc((size_t)q_tile_rows * DV);
+    // score rows padded to 4 cells, so the one-pass softmax moves them in float4 / half4 steps
+    const int chunk_ld = (chunk_size + 3) & ~3;
+    // one-pass softmax: scores fit in registers, no softcap, and the f16 mask rows allow half4 loads
+    // chunks must start on a 4-cell boundary, so a float4 never straddles a mask word
+    const bool sm_1p = !legacy && !online_q8 && logit_softcap == 0.0f && chunk_ld <= MKL_FA_WG_SIZE * 4 * MKL_FA_SM_NV &&
+                       (chunk_size % 4 == 0 || chunk_size >= n_kv) &&
+                       (!mask || sel_mode == 2 ||
+                        (mask_row_stride % 4 == 0 && mask_head_stride % 4 == 0 && (mask->nb[3] / 2) % 4 == 0 &&
+                         (uintptr_t) mask->data % 8 == 0));
+
+    KQ_f32.alloc((size_t)q_tile_rows * chunk_ld);
+    S_f16.alloc((size_t)q_tile_rows * chunk_ld);
+    if (!gemm_acc) {
+        VKQ_chunk.alloc((size_t)q_tile_rows * DV);
+    }
     VKQ_accum.alloc((size_t)n_query_rows * DV);
     KQ_max.alloc(n_query_rows);
     KQ_sum.alloc(n_query_rows);
@@ -960,7 +1067,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
 
             // 2. Initialize softmax state (full n_query_rows)
             mkl_fa_init_softmax_state(stream,
-                KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
+                KQ_max_ptr, KQ_sum_ptr, gemm_acc ? nullptr : VKQ_accum_ptr,
                 n_query_rows, DV, wg_size);
 
             if (mkl_fa_drain) { stream->wait(); }
@@ -968,6 +1075,9 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
             // 3. KV chunk loop (OUTER): dequant each chunk once, then tile queries.
             for (int chunk_start = 0; chunk_start < n_kv; chunk_start += chunk_size) {
                 int this_chunk = std::min(chunk_size, n_kv - chunk_start);
+                // the mask is read in half4 steps, so a row must not end inside one
+                const bool use_1p = sm_1p && (sel_mode == 2 || !mask || this_chunk % 4 == 0);
+                const int  ld     = use_1p ? (this_chunk + 3) & ~3 : this_chunk;
 
                 // 3a. Dequant this KV chunk to dense fp16 (once per chunk)
                 if (!online_q8) {
@@ -1001,7 +1111,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                                     K_chunk_f16_ptr, DKQ,
                                     Q_head_f16_ptr + (int64_t)q0 * DKQ, DKQ,
                                     beta,
-                                    KQ_f32_ptr, this_chunk);
+                                    KQ_f32_ptr, ld);
                             } catch (sycl::exception & e) {
                                 GGML_LOG_INFO("[MKL-FA] GEMM KQ: %s\n", e.what());
                                 GGML_ABORT("MKL GEMM KQ failed");
@@ -1012,19 +1122,30 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                     // Online softmax over this chunk for this query tile
                     {
                         MKL_TAKE_TIME(t0);
-                        auto softmax = sel_mode == 2 ? mkl_fa_online_softmax_chunk<2>
-                                     : sel_mode == 1 ? mkl_fa_online_softmax_chunk<1>
-                                                     : mkl_fa_online_softmax_chunk<0>;
-                        softmax(stream,
-                            KQ_f32_ptr, S_f16_ptr,
-                            KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
-                            q0, q_rows, n_queries, DV,
-                            this_chunk, chunk_start,
-                            kvh_base_head,
-                            mask_batch, mask_head_stride,
-                            mask_row_stride, mask_n_heads,
-                            sel_batch, sel_words,
-                            logit_softcap, wg_size);
+                        if (use_1p) {
+                            auto softmax = sel_mode == 2 ? mkl_fa_softmax_chunk_1p<2>
+                                         : sel_mode == 1 ? mkl_fa_softmax_chunk_1p<1>
+                                                         : mkl_fa_softmax_chunk_1p<0>;
+                            softmax(stream, KQ_f32_ptr, S_f16_ptr, KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
+                                    q0, q_rows, n_queries, DV, this_chunk, ld, chunk_start,
+                                    gemm_acc && chunk_start == 0, kvh_base_head,
+                                    mask_batch, mask_head_stride, mask_row_stride, mask_n_heads,
+                                    sel_batch, sel_words);
+                        } else {
+                            auto softmax = sel_mode == 2 ? mkl_fa_online_softmax_chunk<2>
+                                         : sel_mode == 1 ? mkl_fa_online_softmax_chunk<1>
+                                                         : mkl_fa_online_softmax_chunk<0>;
+                            softmax(stream,
+                                KQ_f32_ptr, S_f16_ptr,
+                                KQ_max_ptr, KQ_sum_ptr, VKQ_accum_ptr,
+                                q0, q_rows, n_queries, DV,
+                                this_chunk, chunk_start,
+                                kvh_base_head,
+                                mask_batch, mask_head_stride,
+                                mask_row_stride, mask_n_heads,
+                                sel_batch, sel_words,
+                                logit_softcap, wg_size);
+                        }
                         MKL_ACCUM(softmax_time_us, t0);
                     }
 
@@ -1036,14 +1157,16 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                                           ikvh, chunk_start, this_chunk, q_rows, DV, chunk_size);
                         } else {
                             try {
+                                // gemm_acc: the softmax already rescaled the accumulator rows
+                                const float acc_beta = gemm_acc && chunk_start > 0 ? 1.0f : 0.0f;
                                 gemm(*stream,
                                     transpose::nontrans, transpose::nontrans,
                                     DV, q_rows, this_chunk,
                                     alpha,
                                     V_chunk_f16_ptr, DV,
-                                    S_f16_ptr, this_chunk,
-                                    beta,
-                                    VKQ_chunk_ptr, DV);
+                                    S_f16_ptr, ld,
+                                    acc_beta,
+                                    gemm_acc ? VKQ_accum_ptr + (int64_t)q0 * DV : VKQ_chunk_ptr, DV);
                             } catch (sycl::exception & e) {
                                 GGML_LOG_INFO("[MKL-FA] GEMM VKQ: %s\n", e.what());
                                 GGML_ABORT("MKL GEMM VKQ failed");
@@ -1052,7 +1175,7 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
                         MKL_ACCUM(gemm_vkq_time_us, t0);
                     }
                     // VKQ_accum[q0..] += VKQ_chunk
-                    {
+                    if (!gemm_acc) {
                         const int64_t n_total = (int64_t)q_rows * DV;
                         const int64_t wg = ((n_total + wg_size - 1) / wg_size)
                             * wg_size;

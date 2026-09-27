@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 #include <vector>
 
 // Flash attention for the QSA layers without the dense [n_kv, n_tps] mask. The graph says
@@ -38,6 +39,7 @@ static constexpr int QSA_UNION_CHUNK  = 8192;  // union cells per GEMM
 static constexpr int QSA_UNION_MIN_KV = 8192;
 static constexpr int QSA_WG          = 256;
 static constexpr int QSA_PAD         = 8;     // a union chunk is padded to this, so rows load 16 bytes at a time
+static constexpr int QSA_SM_NV       = QSA_UNION_CHUNK / (4 * QSA_WG);  // float4 of scores per softmax item
 
 enum qsa_kv_kind {
     QSA_KV_F16,
@@ -281,7 +283,8 @@ static void k_qsa_gather(const char * K, const char * V, size_t k_nb1, size_t v_
 
 // Online softmax over one union chunk, one work-group per query row (as fattn-mkl.cpp does it).
 // Cells the row's own list does not name score -inf. ODD reads the causal mask value.
-template <bool ODD>
+// ONE_PASS keeps the scores in registers, so KQ and the cell list are read once, not twice.
+template <bool ODD, bool ONE_PASS>
 static void k_qsa_softmax(const float * KQ, sycl::half * S, float * kmax, float * ksum, float * acc,
                           const int32_t * cells, const uint32_t * bits, const char * mask, int n, int D, int Tt,
                           int t0, int s, int64_t n_tps, int64_t words, size_t m_nb1, size_t m_nb3,
@@ -312,12 +315,23 @@ static void k_qsa_softmax(const float * KQ, sycl::half * S, float * kmax, float 
         return v;
     };
 
-    float lmax = -INFINITY;
-    for (int i = lid; i < n4; i += QSA_WG) {
+    auto score4 = [&](int i) {
         const sycl::int4   c = c4[i];
         const sycl::float4 v = k4[i];
-        lmax = sycl::fmax(lmax, sycl::fmax(sycl::fmax(score(c.x(), v.x()), score(c.y(), v.y())),
-                                           sycl::fmax(score(c.z(), v.z()), score(c.w(), v.w()))));
+        return sycl::float4(score(c.x(), v.x()), score(c.y(), v.y()), score(c.z(), v.z()), score(c.w(), v.w()));
+    };
+
+    // n4 <= QSA_WG * QSA_SM_NV (QSA_UNION_CHUNK cells)
+    sycl::float4 sc[QSA_SM_NV];
+    float lmax = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < QSA_SM_NV; ++j) {
+        const int i = j * QSA_WG + lid;
+        sc[j] = sycl::float4(-INFINITY);
+        if (i < n4) {
+            sc[j] = score4(i);
+            lmax = sycl::fmax(lmax, sycl::fmax(sycl::fmax(sc[j].x(), sc[j].y()), sycl::fmax(sc[j].z(), sc[j].w())));
+        }
     }
     const float cmax    = sycl::reduce_over_group(it.get_group(), lmax, sycl::maximum<float>());
     const float old     = kmax[row];
@@ -326,17 +340,19 @@ static void k_qsa_softmax(const float * KQ, sycl::half * S, float * kmax, float 
     for (int v = lid; v < D; v += QSA_WG) {
         vkq[v] *= rescale;
     }
-    auto num = [&](int c, float v) {
-        const float sc = score(c, v);
-        return sc == -INFINITY ? 0.0f : sycl::native::exp(sc - nmax);
+    auto num = [&](float x) {
+        return x == -INFINITY ? 0.0f : sycl::native::exp(x - nmax);
     };
     float lsum = 0.0f;
-    for (int i = lid; i < n4; i += QSA_WG) {
-        const sycl::int4   c = c4[i];
-        const sycl::float4 v = k4[i];
-        const sycl::float4 e(num(c.x(), v.x()), num(c.y(), v.y()), num(c.z(), v.z()), num(c.w(), v.w()));
-        s4[i] = e.convert<sycl::half>();
-        lsum += (e.x() + e.y()) + (e.z() + e.w());
+#pragma unroll
+    for (int j = 0; j < QSA_SM_NV; ++j) {
+        const int i = j * QSA_WG + lid;
+        if (i < n4) {
+            const sycl::float4 x = ONE_PASS ? sc[j] : score4(i);
+            const sycl::float4 e(num(x.x()), num(x.y()), num(x.z()), num(x.w()));
+            s4[i] = e.convert<sycl::half>();
+            lsum += (e.x() + e.y()) + (e.z() + e.w());
+        }
     }
     const float csum = sycl::reduce_over_group(it.get_group(), lsum, sycl::plus<float>());
     if (lid == 0) {
@@ -429,6 +445,9 @@ static void qsa_union_fa(ggml_backend_sycl_context & ctx, const qsa_union_args &
 
     dpct::queue_ptr  stream = ctx.stream();
     ggml_sycl_pool & pool   = ctx.pool();
+    // union cells per GEMM: half a chunk keeps a tile's scores in L2 (768 x 4096 f32); GGML_SYCL_ENABLE_MKL_FA bit 4 keeps the full chunk
+    const bool legacy = (g_ggml_sycl_enable_mkl_fa & 4) != 0;
+    const int  uchunk = legacy ? QSA_UNION_CHUNK : QSA_UNION_CHUNK / 2;
 
     ggml_sycl_pool_alloc<uint32_t>   bits(pool, (size_t) n_rows * words);
     ggml_sycl_pool_alloc<int32_t>    ulist(pool, (size_t) tiles * cap);
@@ -502,8 +521,8 @@ static void qsa_union_fa(ggml_backend_sycl_context & ctx, const qsa_union_args &
                     });
                 }
 
-                for (int j0 = 0; j0 < u; j0 += QSA_UNION_CHUNK) {
-                    const int       n_used = std::min(QSA_UNION_CHUNK, u - j0);
+                for (int j0 = 0; j0 < u; j0 += uchunk) {
+                    const int       n_used = std::min(uchunk, u - j0);
                     const int       n      = (n_used + QSA_PAD - 1) / QSA_PAD * QSA_PAD;
                     const int32_t * cj     = cells + j0;
                     {
@@ -522,16 +541,18 @@ static void qsa_union_fa(ggml_backend_sycl_context & ctx, const qsa_union_args &
                         const int64_t n_tps = a.n_tps;
                         const size_t  m_nb1 = a.m_nb1, m_nb3 = a.m_nb3;
                         const sycl::nd_range<1> range((size_t) rows * QSA_WG, QSA_WG);
+                        // GGML_SYCL_ENABLE_MKL_FA bit 4 keeps the two-pass softmax, as in the dense kernel
+                        auto sm = [&](auto odd_c, auto one_pass_c) {
+                            stream->parallel_for(range, [=](sycl::nd_item<1> it) {
+                                k_qsa_softmax<decltype(odd_c)::value, decltype(one_pass_c)::value>(
+                                    KQ_p, S_p, kmax_p, ksum_p, acc_p, cj, bits_p, mask, n, D, Tt, t0, s, n_tps, words,
+                                    m_nb1, m_nb3, it);
+                            });
+                        };
                         if (odd) {
-                            stream->parallel_for(range, [=](sycl::nd_item<1> it) {
-                                k_qsa_softmax<true>(KQ_p, S_p, kmax_p, ksum_p, acc_p, cj, bits_p, mask, n, D, Tt, t0,
-                                                    s, n_tps, words, m_nb1, m_nb3, it);
-                            });
+                            legacy ? sm(std::true_type{}, std::false_type{}) : sm(std::true_type{}, std::true_type{});
                         } else {
-                            stream->parallel_for(range, [=](sycl::nd_item<1> it) {
-                                k_qsa_softmax<false>(KQ_p, S_p, kmax_p, ksum_p, acc_p, cj, bits_p, mask, n, D, Tt, t0,
-                                                     s, n_tps, words, m_nb1, m_nb3, it);
-                            });
+                            legacy ? sm(std::false_type{}, std::false_type{}) : sm(std::false_type{}, std::true_type{});
                         }
                     }
                     // acc[row, d] += sum_i Vf[i, d] * S[row, i]; the softmax rescaled acc first
