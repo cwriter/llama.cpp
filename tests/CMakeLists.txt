@@ -309,6 +309,10 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 
+# the SYCL graph reorder is pure graph inspection, so it is tested on the CPU backend
+llama_build_and_test(test-sycl-graph-reorder.cpp ${PROJECT_SOURCE_DIR}/ggml/src/ggml-sycl/graph-reorder.cpp)
+target_include_directories(test-sycl-graph-reorder PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

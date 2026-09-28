@@ -86,6 +86,7 @@
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/sycl_hw.hpp"
 #include "kq-mask-bits.hpp"
+#include "graph-reorder.hpp"
 #include "kv-soa.hpp"
 #include "moe-reduce.hpp"
 #include "ggml-sycl/ssm_scan.hpp"
@@ -139,6 +140,8 @@ int g_ggml_sycl_fuse_qsa_mask = 0;
 int g_ggml_sycl_fuse_qsa_fa_mask = 3;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
+// move mat-vec siblings next to each other in graph_optimize so GGML_SYCL_MV_FUSE can batch them
+int g_ggml_sycl_graph_reorder = 0;
 int g_ggml_sycl_topk_moe_radix = 1;
 // bitmask of ggml_sycl_reorder_type; see GGML_SYCL_REORDER_DEFAULT in common.hpp
 int g_ggml_sycl_reorder_types = GGML_SYCL_REORDER_DEFAULT;
@@ -445,6 +448,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 3);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
+        g_ggml_sycl_graph_reorder = ggml_sycl_get_env("GGML_SYCL_GRAPH_REORDER", 0);
         g_ggml_sycl_topk_moe_radix = ggml_sycl_get_env("GGML_SYCL_TOPK_MOE_RADIX", 1);
         g_ggml_sycl_reorder_types = ggml_sycl_get_env("GGML_SYCL_REORDER_TYPES", GGML_SYCL_REORDER_DEFAULT);
         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
@@ -613,6 +617,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
+        GGML_LOG_INFO("  GGML_SYCL_GRAPH_REORDER: %d\n", g_ggml_sycl_graph_reorder);
         GGML_LOG_INFO("  GGML_SYCL_TOPK_MOE_RADIX: %d\n", g_ggml_sycl_topk_moe_radix);
         GGML_LOG_INFO("  GGML_SYCL_REORDER_TYPES: 0x%x (iq3_s=%d iq4_nl=%d q8_0=%d)\n",
                       g_ggml_sycl_reorder_types,
@@ -7540,29 +7545,66 @@ static void ggml_sycl_mv_fuse_trace_miss(const ggml_cgraph * cgraph, int node_id
     }
 }
 
-// Group adjacent mat-vecs that read the same activation: one quantize and one launch serve
-// them all. Returns the number of extra graph nodes consumed, or 0 if it declined.
-static int ggml_sycl_mul_mat_multi_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+// Whether first can start a batched mat-vec group. Shape, type and flag checks only, so
+// graph_optimize can ask it before anything is allocated.
+static bool ggml_sycl_mv_fuse_leader(const ggml_tensor * first) {
     if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_mv_fuse || g_ggml_sycl_prioritize_dmmv) {
-        return 0;
+        return false;
+    }
+    if (first->op != GGML_OP_MUL_MAT) {
+        return false;
     }
 
-    ggml_tensor *        first = cgraph->nodes[node_idx];
     const ggml_tensor *  act   = first->src[1];
     const enum ggml_type wtype = first->src[0]->type;
 
     if (!ggml_sycl_supports_reorder_mmvq(wtype) || !ggml_sycl_mul_mat_vec_q_multi_reorder_supports_type(wtype)) {
-        return 0;
+        return false;
     }
     // for these the unfused path takes the ESIMD dequantize kernel, which is the faster one
     if (g_ggml_sycl_enable_esimd && ggml_sycl_supports_reorder_esimd(wtype) &&
-        can_use_dequantize_mul_mat_vec(first->src[0], act, first)) {
-        return 0;
+        can_use_dequantize_mul_mat_vec(first->src[0], act, const_cast<ggml_tensor *>(first))) {
+        return false;
     }
     if (act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || act->ne[2] != 1 || act->ne[3] != 1 ||
         act->ne[1] > MMVQ_MAX_BATCH_SIZE || act->ne[0] % (int64_t) ggml_blck_size(wtype) != 0) {
+        return false;
+    }
+    return true;
+}
+
+// Whether nj can join the group first started: the same activation and weight type, and a
+// dense F32 destination the fused launch can write directly.
+static bool ggml_sycl_mv_fuse_joins(const ggml_tensor * first, const ggml_tensor * nj) {
+    const ggml_tensor * act = first->src[1];
+    if (nj->op != GGML_OP_MUL_MAT || nj->src[1] != act) {
+        return false;
+    }
+    const ggml_tensor * w = nj->src[0];
+    // the fused launch writes nj->data directly, so split weights are out. graph_optimize asks
+    // before allocation, when only weights have a buffer
+    if (w->type != first->src[0]->type || (w->buffer && ggml_backend_buffer_is_sycl_split(w->buffer)) ||
+        !ggml_is_contiguous(w) ||
+        w->ne[0] != act->ne[0] || w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    if (nj->type != GGML_TYPE_F32 || !ggml_is_contiguous(nj) || nj->ne[0] != w->ne[1] ||
+        nj->ne[1] != act->ne[1] || nj->ne[2] != 1 || nj->ne[3] != 1) {
+        return false;
+    }
+    return true;
+}
+
+// Group adjacent mat-vecs that read the same activation: one quantize and one launch serve
+// them all. Returns the number of extra graph nodes consumed, or 0 if it declined.
+static int ggml_sycl_mul_mat_multi_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * first = cgraph->nodes[node_idx];
+    if (!ggml_sycl_mv_fuse_leader(first)) {
         return 0;
     }
+
+    const ggml_tensor *  act   = first->src[1];
+    const enum ggml_type wtype = first->src[0]->type;
 
     ggml_tensor * group[GGML_SYCL_MMVQ_MULTI_MAX];
     int           count = 0;
@@ -7573,17 +7615,7 @@ static int ggml_sycl_mul_mat_multi_mmvq_fused(ggml_backend_sycl_context & ctx, g
         if (ggml_sycl_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;  // not a launch; cannot break a run of siblings
         }
-        if (nj->op != GGML_OP_MUL_MAT || nj->src[1] != act) {
-            break;
-        }
-        const ggml_tensor * w = nj->src[0];
-        // the fused launch writes nj->data directly, so split weights are out
-        if (w->type != wtype || ggml_backend_buffer_is_sycl_split(w->buffer) || !ggml_is_contiguous(w) ||
-            w->ne[0] != act->ne[0] || w->ne[2] != 1 || w->ne[3] != 1) {
-            break;
-        }
-        if (nj->type != GGML_TYPE_F32 || !ggml_is_contiguous(nj) || nj->ne[0] != w->ne[1] ||
-            nj->ne[1] != act->ne[1] || nj->ne[2] != 1 || nj->ne[3] != 1) {
+        if (!ggml_sycl_mv_fuse_joins(first, nj)) {
             break;
         }
         bool indep = true;
@@ -7732,18 +7764,26 @@ static bool ggml_sycl_mul_mat_id_glu_mmvq_fused(ggml_backend_sycl_context & ctx,
         src1_row_stride, ids->nb[1], glu->nb[2], src1_token_stride, glu_op, stream);
 }
 
+static bool ggml_sycl_mv_fuse_id_leader(const ggml_tensor * first) {
+    return g_ggml_sycl_enable_fusion && g_ggml_sycl_mv_fuse && first->op == GGML_OP_MUL_MAT_ID &&
+           ggml_sycl_mul_mat_vec_q_id_supports_type(first->src[0]->type);
+}
+
+static bool ggml_sycl_mv_fuse_id_joins(const ggml_tensor * first, const ggml_tensor * nj) {
+    if (nj->op != GGML_OP_MUL_MAT_ID || nj->src[1] != first->src[1] || nj->src[2] != first->src[2]) {
+        return false;
+    }
+    // one grid, one set of block offsets and one set of destination strides for the group
+    const ggml_tensor * w  = nj->src[0];
+    const ggml_tensor * w0 = first->src[0];
+    return w->type == w0->type && ggml_are_same_shape(w, w0) && ggml_are_same_stride(w, w0) &&
+           nj->type == first->type && ggml_are_same_shape(nj, first) && ggml_are_same_stride(nj, first);
+}
+
 static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph,
                                                  int node_idx) {
-    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_mv_fuse) {
-        return 0;
-    }
-
-    ggml_tensor *       first = cgraph->nodes[node_idx];
-    const ggml_tensor * act   = first->src[1];
-    const ggml_tensor * ids   = first->src[2];
-    const ggml_tensor * w0    = first->src[0];
-
-    if (!ggml_sycl_mul_mat_vec_q_id_supports_type(w0->type)) {
+    ggml_tensor * first = cgraph->nodes[node_idx];
+    if (!ggml_sycl_mv_fuse_id_leader(first)) {
         return 0;
     }
 
@@ -7756,13 +7796,7 @@ static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx
         if (ggml_sycl_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;  // not a launch; cannot break a run of siblings
         }
-        if (nj->op != GGML_OP_MUL_MAT_ID || nj->src[1] != act || nj->src[2] != ids) {
-            break;
-        }
-        // one grid, one set of block offsets and one set of destination strides for the group
-        const ggml_tensor * w = nj->src[0];
-        if (w->type != w0->type || !ggml_are_same_shape(w, w0) || !ggml_are_same_stride(w, w0) ||
-            nj->type != first->type || !ggml_are_same_shape(nj, first) || !ggml_are_same_stride(nj, first)) {
+        if (!ggml_sycl_mv_fuse_id_joins(first, nj)) {
             break;
         }
         bool indep = true;
@@ -8564,9 +8598,78 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
 // The MoE reduction reads the mul's operands at the node where the add chain ends, so those
 // tensors have to outlive their last use as the graph sees it. Without this ggml-alloc is free
 // to hand their memory to something in between and the fusion would read its own output.
+// graph_optimize's sibling reorder asks these; see graph-reorder.hpp
+static bool ggml_sycl_reorder_leader(const ggml_tensor * cur, void * user_data) {
+    GGML_UNUSED(user_data);
+    if ((cur->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    return ggml_sycl_mv_fuse_leader(cur) || ggml_sycl_mv_fuse_id_leader(cur);
+}
+
+static bool ggml_sycl_reorder_joins(const ggml_tensor * leader, const ggml_tensor * cand, void * user_data) {
+    GGML_UNUSED(user_data);
+    if ((cand->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        return false;
+    }
+    return leader->op == GGML_OP_MUL_MAT ? ggml_sycl_mv_fuse_joins(leader, cand)
+                                         : ggml_sycl_mv_fuse_id_joins(leader, cand);
+}
+
+// Every node the compute loop could fold into a multi-node fusion other than the mat-vec
+// batcher. Moving one would break the run its matcher needs, and a leader inside one would
+// have its siblings inserted into the middle of it. Metal packs its fusion runs into single
+// units before reordering (ggml_graph_optimize); this is the same guard for a pass that only
+// ever moves mat-muls.
+static std::vector<uint8_t> ggml_sycl_reorder_pinned(const ggml_cgraph * cgraph) {
+    const int n = cgraph->n_nodes;
+    std::vector<uint8_t> pinned(n, 0);
+    auto pin = [&](int k, int span) {
+        for (int j = k; j <= k + span && j < n; ++j) {
+            pinned[j] = 1;
+        }
+    };
+    for (int k = 0; k < n; ++k) {
+        const ggml_tensor * node = cgraph->nodes[k];
+        // the QSA chains, the gather, cast/cont + add, unary * broadcast, rms_norm + scale
+        if (const int absorbed = ggml_backend_sycl_fusion_absorbs(nullptr, cgraph, k)) {
+            pin(k, absorbed);
+        }
+        // gate + up + GLU, dense and MoE: gate and up are themselves siblings, and the GLU
+        // fusion outranks the batcher
+        if (node->op == GGML_OP_MUL_MAT &&
+            ggml_sycl_can_fuse(cgraph, k, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, {})) {
+            pin(k, 2);
+        }
+        if (node->op == GGML_OP_MUL_MAT_ID && k + 2 < n && cgraph->nodes[k + 1]->op == GGML_OP_MUL_MAT_ID &&
+            cgraph->nodes[k + 2]->op == GGML_OP_GLU &&
+            ggml_can_fuse_subgraph(cgraph, k, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, { k + 2 })) {
+            pin(k, 2);
+        }
+    }
+    return pinned;
+}
+
 static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
                                              ggml_backend_graph_optimize_params * params) {
     GGML_UNUSED(backend);
+    // first: everything below indexes the final node order
+    if (g_ggml_sycl_graph_reorder && g_ggml_sycl_enable_fusion && g_ggml_sycl_mv_fuse && cgraph->n_nodes > 1) {
+        const std::vector<uint8_t> pinned = ggml_sycl_reorder_pinned(cgraph);
+
+        ggml_sycl_hoist_rules rules = {};
+        rules.leader    = ggml_sycl_reorder_leader;
+        rules.joins     = ggml_sycl_reorder_joins;
+        rules.user_data = nullptr;
+        rules.pinned    = pinned.data();
+        rules.window    = 128;
+        rules.max_group = GGML_SYCL_MMVQ_MULTI_MAX;
+
+        const int n_moved = ggml_sycl_graph_hoist_siblings(cgraph, rules);
+        if (g_ggml_sycl_graph_reorder > 1 && n_moved > 0) {
+            GGML_LOG_INFO("[REORDER] moved %d of %d nodes next to a mat-vec sibling\n", n_moved, cgraph->n_nodes);
+        }
+    }
     // before ggml-alloc sizes anything: a compact KQ mask is only allowed when every reader is taught
     ggml_sycl_kq_mask_compact_check(cgraph);
     // the tail of a packed KQ mask is lent as scratch for the whole split, so the mask must stay

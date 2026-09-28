@@ -158,6 +158,10 @@ Server results after mode 3 became the default, all defaults, 131k context:
   - The draft layer needs `-ts 34,34,32 -devd SYCL2` so card 3 does not page.
   - A runtime comparison (no MTP vs MTP, decode and acceptance) is queued.
   - Every number above is without MTP.
+- **Sibling reorder for the mat-vec batcher** (`GGML_SYCL_GRAPH_REORDER=1`, off by default): `graph_optimize` moves mat-vecs that read the same activation next to each other, as the Vulkan and Metal reorders do, so `GGML_SYCL_MV_FUSE` can batch them.
+  - Unmeasured: written without a SYCL device. Only the host code was type-checked, and the dependency test was run on the CPU (`test-sycl-graph-reorder`, a 200-graph fuzz with bit-identical results).
+  - To do: decode t/s with and without it, text check, and `GGML_SYCL_MV_FUSE_TRACE` to count the groups formed.
+  - Watch: at 3-8 columns the batcher's MMVQ multi kernel replaces the ESIMD multi-column q8_0/q6_K kernel for the grouped nodes, which may be slower per node.
 - **The bimodal long-context slowdown:** undiagnosed; it may be host or runtime scheduling rather than kernels.
 - **`-np 2` with separate KV:** the multi-stream paths (`ne[3] > 1` masks, 4-D K/V in oneMKL FA, QSA kernels) are unvalidated.
 - **Small kernel items:**

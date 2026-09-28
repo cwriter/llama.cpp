@@ -95,6 +95,7 @@ extern int g_ggml_sycl_fuse_qsa_mask;
 extern int g_ggml_sycl_fuse_qsa_fa_mask;
 extern int g_ggml_sycl_small_gemm;
 extern int g_ggml_sycl_mv_fuse;
+extern int g_ggml_sycl_graph_reorder;
 extern int g_ggml_sycl_topk_moe_radix;
 // Which quant types may have their MoE expert weights reordered into the per-expert SoA
 // layout. One bit per type so a new type is one bit, not another environment variable.
