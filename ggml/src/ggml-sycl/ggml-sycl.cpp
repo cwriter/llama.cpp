@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <regex>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <map>
 #include <utility>
@@ -1010,14 +1011,9 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         }
     }
 
-    std::vector<char> soa_buf;
-    if (ggml_sycl_kv_is_soa(tensor)) {
-        GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
-                    "a SoA KV write must cover whole spans; see kv-soa.hpp");
-        soa_buf.resize(size);
-        ggml_sycl_kv_soa_canonical_to_span(soa_buf.data(), data, size);
-        data = soa_buf.data();
-    }
+    const bool soa = ggml_sycl_kv_is_soa(tensor);
+    GGML_ASSERT((!soa || ggml_sycl_kv_soa_range_ok(offset, size)) &&
+                "a SoA KV write must cover whole spans; see kv-soa.hpp");
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_pipe_trace_scope trace_scope("SET", ctx->device, tensor->name, size);
     ggml_sycl_set_device(ctx->device);
@@ -1069,8 +1065,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         char *       dst       = (char *) tensor->data + offset;
         const char * src       = (const char *) data;
         size_t       remaining = size;
+        // a SoA chunk must hold whole spans, as the permute works one span at a time
+        const size_t align = soa ? ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>::span_size : 1;
         while (remaining > 0) {
-            const size_t chunk_max = std::min(ctx->staging_chunk_max, stg.cap / 4);
+            const size_t chunk_max = std::min(ctx->staging_chunk_max, stg.cap / 4) / align * align;
             const size_t chunk     = std::min(remaining, chunk_max);
             // the legacy mode spends a whole slot on every chunk
             const size_t span      = ring ? GGML_PAD(chunk, 256) : chunk_max;
@@ -1096,7 +1094,11 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
             }
             claim(stg.head, stg.head + span);
             char * stage = stg.data + stg.head;
-            memcpy(stage, src, chunk);
+            if (soa) {
+                ggml_sycl_kv_soa_canonical_to_span(stage, src, chunk);
+            } else {
+                memcpy(stage, src, chunk);
+            }
             stg.used.push_back({ stg.head, span, stream->memcpy(dst, stage, chunk) });
             stg.head  += span;
             src       += chunk;
@@ -1109,7 +1111,11 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // no pinned memory available: fall back to the old malloc bounce
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
     char * host_buf = (char *) malloc(size);
-    memcpy(host_buf, data, size);
+    if (soa) {
+        ggml_sycl_kv_soa_canonical_to_span(host_buf, data, size);
+    } else {
+        memcpy(host_buf, data, size);
+    }
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
     free(host_buf);
 }
@@ -1117,6 +1123,73 @@ catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
             << ", line:" << __LINE__ << std::endl;
   std::exit(1);
+}
+
+// Large reads go through the pinned staging block, as a copy into pageable memory is slow. The
+// caller often hands over freshly allocated memory, where the first write to each 4 KiB page takes a
+// page fault. Each worker owns one stage slot and loops over the chunks: queue the device copy, touch
+// the destination pages while it is in flight, wait, copy out. So the faults overlap the transfer and
+// run on several threads. Returns false when there is no staging, and the caller copies directly.
+static bool ggml_sycl_buffer_download_staged(ggml_backend_sycl_buffer_context * ctx, char * dst, const char * src,
+                                             size_t size, bool soa) {
+    constexpr size_t min_size  = 1*1024*1024;
+    constexpr size_t chunk_max = 1*1024*1024;
+    constexpr size_t n_max     = 4;
+    constexpr size_t page      = 4096;
+    if (size < min_size) {
+        return false;
+    }
+    auto & stg = ctx->staging;
+    if (stg.data == nullptr) {
+        // the size set_tensor starts a non-compute buffer with
+        const size_t cap = 4 * ctx->staging_chunk_max;
+        stg.data = (char *) sycl::malloc_host(cap, *ctx->stream);
+        stg.cap  = stg.data != nullptr ? cap : 0;
+    }
+    if (stg.cap < chunk_max) {
+        return false;
+    }
+    // uploads may still read the block; the download reuses all of it
+    for (auto & e : stg.used) {
+        e.ev.wait_and_throw();
+    }
+    stg.used.clear();
+    stg.head = 0;
+
+    // a SoA chunk must hold whole spans, as the unpermute works one span at a time
+    const size_t align  = soa ? ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>::span_size : 1;
+    const size_t chunk  = chunk_max / align * align;
+    const size_t n_chnk = (size + chunk - 1) / chunk;
+    const size_t n_work = std::min({ n_max, n_chnk, stg.cap / chunk });
+
+    sycl::queue &       q = *ctx->stream;
+    std::atomic<size_t> next{ 0 };
+    auto work = [&](size_t w) {
+        char * stage = stg.data + w * chunk;
+        for (size_t i = next++; i < n_chnk; i = next++) {
+            const size_t off = i * chunk;
+            const size_t n   = std::min(chunk, size - off);
+            sycl::event  ev  = q.memcpy(stage, src + off, n);
+            for (size_t j = 0; j < n; j += page) {
+                ((volatile char *) dst)[off + j] = 0;
+            }
+            ev.wait_and_throw();
+            if (soa) {
+                ggml_sycl_kv_soa_span_to_canonical(dst + off, stage, n);
+            } else {
+                memcpy(dst + off, stage, n);
+            }
+        }
+    };
+    std::vector<std::thread> workers;
+    for (size_t w = 1; w < n_work; ++w) {
+        workers.emplace_back(work, w);
+    }
+    work(0);
+    for (auto & t : workers) {
+        t.join();
+    }
+    return true;
 }
 
 static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -1140,13 +1213,13 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
 
     // a packed mask holds fewer bytes than size, and a compact one has no more allocated
-    if (!bits) {
+    if (!bits && !ggml_sycl_buffer_download_staged(ctx, (char *) data, (const char *) tensor->data + offset, size, soa)) {
         SYCL_CHECK(CHECK_TRY_ERROR(stream.memcpy(data, (const char *) tensor->data + offset, size).wait()));
-    }
 
-    if (soa) {
-        // spans keep their byte range, so this unpermutes in place
-        ggml_sycl_kv_soa_span_to_canonical(data, data, size);
+        if (soa) {
+            // spans keep their byte range, so this unpermutes in place
+            ggml_sycl_kv_soa_span_to_canonical(data, data, size);
+        }
     }
 
     if (bits) {
@@ -7208,19 +7281,9 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    if (ggml_sycl_kq_mask_is_bits(tensor)) {
-        // packing works on a host copy, so this one copy has to be synchronous
+    if (ggml_sycl_kq_mask_is_bits(tensor) || ggml_sycl_kv_is_soa(tensor)) {
+        // packing and permuting work on a host copy, which the staged upload takes care of
         ggml_backend_sycl_buffer_set_tensor(buf, tensor, data, offset, size);
-        return;
-    }
-    if (ggml_sycl_kv_is_soa(tensor)) {
-        // the permuted copy is a local, so this one copy has to be synchronous
-        GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
-                    "a SoA KV write must cover whole spans; see kv-soa.hpp");
-        std::vector<char> soa_buf(size);
-        ggml_sycl_kv_soa_canonical_to_span(soa_buf.data(), data, size);
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            (stream)->memcpy((char *)tensor->data + offset, soa_buf.data(), size).wait()));
         return;
     }
     SYCL_CHECK(CHECK_TRY_ERROR(
@@ -7244,17 +7307,9 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    if (ggml_sycl_kq_mask_is_bits(tensor)) {
+    if (ggml_sycl_kq_mask_is_bits(tensor) || ggml_sycl_kv_is_soa(tensor)) {
+        // unpacking and unpermuting need the bytes in hand, so this one copy has to be synchronous
         ggml_backend_sycl_buffer_get_tensor(buf, tensor, data, offset, size);
-        return;
-    }
-    if (ggml_sycl_kv_is_soa(tensor)) {
-        // unpermuting needs the bytes in hand, so this one copy has to be synchronous
-        GGML_ASSERT(ggml_sycl_kv_soa_range_ok(offset, size) &&
-                    "a SoA KV read must cover whole spans; see kv-soa.hpp");
-        SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
-            data, (const char *)tensor->data + offset, size).wait()));
-        ggml_sycl_kv_soa_span_to_canonical(data, data, size);
         return;
     }
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
