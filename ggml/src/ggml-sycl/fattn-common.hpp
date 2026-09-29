@@ -9,6 +9,7 @@
 #include "vecdotq.hpp"
 #include "fattn-buffers.hpp"
 #include "fattn.hpp"
+#include "fattn-sparse.hpp"
 
 #include "ggml.h"
 
@@ -1042,7 +1043,9 @@ void launch_fattn(
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
     //     multiple sequences of possibly different lengths.
-    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1)) {
+    // A gathered node (fattn-sparse.cpp) has its visible cells first and nothing but masked slots after them.
+    const bool gathered = ggml_get_op_params_i32(KQV, 4) == GGML_SYCL_FATTN_GATHERED;
+    if (mask && K->ne[1] % FATTN_KQ_STRIDE == 0 && (Q->ne[1] >= 1024 || Q->ne[3] > 1 || gathered)) {
         const int s31 = mask->nb[1] / sizeof(sycl::half2);
         const int s33 = mask->nb[3] / sizeof(sycl::half2);
 
