@@ -11486,6 +11486,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_sparse_fa(4096,   33,   1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 4));
     test_cases.emplace_back(new test_qsa_sparse_fa(4096,   33,   1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, true,  0.0f, 4));
     test_cases.emplace_back(new test_qsa_sparse_fa(8192,   1,    1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 1));
+    // a short batch (MTP verify): the rows share one gathered set, each keeps its own cells
+    for (int64_t n_tps : { 2, 3, 4 }) {
+        test_cases.emplace_back(new test_qsa_sparse_fa(32768,  n_tps, 1, 2051, GGML_TYPE_Q8_0));
+    }
+    test_cases.emplace_back(new test_qsa_sparse_fa(32768,  3,    1, 2051, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_qsa_sparse_fa(131072, 3,    1, 2051, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_qsa_sparse_fa(32768,  3,    1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 0, true));
+    test_cases.emplace_back(new test_qsa_sparse_fa(32768,  3,    1, 2051, GGML_TYPE_Q8_0, 256, 24, 2, false, 0.0f, 1, true));
+    test_cases.emplace_back(new test_qsa_sparse_fa(8192,   3,    1, 2051, GGML_TYPE_Q8_0));  // too little context: dense
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
@@ -11768,6 +11777,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
+
+    // sparse attn over a short batch (MTP verify): the rows select different cells
+    for (int nb : { 2, 3, 4 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2051));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2051));
 
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
