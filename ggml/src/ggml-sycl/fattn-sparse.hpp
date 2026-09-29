@@ -3,6 +3,10 @@
 
 #include "common.hpp"
 
+// op_params[4] of a node whose K/V were gathered: the visible cells come first and every slot after
+// them is masked, so a kernel may scan the mask for where the visible cells end
+#define GGML_SYCL_FATTN_GATHERED (-1)
+
 // Gather the K/V rows selected by a sparse mask and re-dispatch the dense
 // kernels onto them. Returns false if the caller should use the dense path.
 bool ggml_sycl_flash_attn_ext_sparse(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
