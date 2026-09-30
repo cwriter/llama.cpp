@@ -85,6 +85,9 @@ extern int g_ggml_sycl_xmx_gather_types;
 // The bf16 ones (bits 6, 7) are off by default: bf16 keeps fewer mantissa bits than f16.
 static constexpr int GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT = 0x3f;
 extern int g_ggml_sycl_xmx_gather_shapes;
+// 1: honor the [TAG_GGML_PREC] op_params of MUL_MAT/MUL_MAT_ID as CUDA does (src1 precision in
+// op_params[3], accumulator in op_params[0]). 0 (default): accept the same ops as before.
+extern int g_ggml_sycl_enforce_prec;
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;

@@ -107,6 +107,7 @@ int g_ggml_sycl_enable_esimd = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
 int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
+int g_ggml_sycl_enforce_prec = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -366,6 +367,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
         g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
+        g_ggml_sycl_enforce_prec = ggml_sycl_get_env("GGML_SYCL_ENFORCE_PREC", 0);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -476,6 +478,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
+        GGML_LOG_INFO("  GGML_SYCL_ENFORCE_PREC: %d\n", g_ggml_sycl_enforce_prec);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -2990,9 +2993,8 @@ inline void ggml_sycl_op_mul_mat_sycl(
     // dequantize inside the GEMM instead of writing the f16 weights out and reading them back; src1
     // goes in its own type, so there is no separate conversion pass
     if (use_fp16 && ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] &&
-        dst->op_params[0] == GGML_PREC_DEFAULT &&
         ggml_sycl_fused_dequant_gemm(src0->type, src0_dd_i, src1_ddf_i, src1->type, dst_dd_i, row_diff, src1_ncols, ne10,
-                                     ldc, ctx.pool(), stream)) {
+                                     ldc, dst->op_params[0], dst->op_params[3], ctx.pool(), stream)) {
         return;
     }
 
@@ -5335,11 +5337,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
         bool grouped = false;
         if (ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
-            dst->type == GGML_TYPE_F32 && dst->op_params[0] == GGML_PREC_DEFAULT &&
-            nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
+            dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
             grouped = ggml_sycl_grouped_dequant_gemm(src0->type, src0_original, nb02,
                                                      (const float *) src1_contiguous.get(), (float *) dst_contiguous.get(),
                                                      expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
+                                                     dst->op_params[0], dst->op_params[3],
                                                      ctx.mmid_tile_schedule_host, ctx.pool(), stream);
         }
 
@@ -6519,6 +6521,13 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 }
 
                 if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_TQ1_0) {
+                    return false;
+                }
+
+                // [TAG_GGML_PREC] src1 must stay F32 (it can exceed the F16 range), but the batched
+                // expert GEMMs convert it to F16; like CUDA, leave this case to another backend
+                if (g_ggml_sycl_enforce_prec && op->op == GGML_OP_MUL_MAT_ID &&
+                    ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                     return false;
                 }
 

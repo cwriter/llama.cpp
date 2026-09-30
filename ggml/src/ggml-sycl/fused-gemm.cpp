@@ -21,6 +21,7 @@ static constexpr int FG_KSPLIT = 4;
 // convert once, in registers, when they write the element, so any type costs the same one pass.
 //   store: storage in SLM (A) and in the packed B buffer
 //   mtype: matrix_type in matrix_combinations
+//   prec:  loosest ggml_prec [TAG_GGML_PREC] the type satisfies as a src1 representation
 //   src:   ggml type that needs no conversion into this type (GGML_TYPE_COUNT: none)
 //   slow:  XMX throughput class, 0 is fastest. f16 and bf16 share the DPAS rate; tf32 does half the
 //          K per instruction. B60, Qwen3-30B-A3B pp512: f16 1108, bf16 1000, tf32 751 t/s
@@ -30,6 +31,7 @@ template <> struct fg_elem<sycl::half> {
     using store = sycl::half;
     using pair  = sycl::half2;
     static constexpr mx::matrix_type mtype = mx::matrix_type::fp16;
+    static constexpr ggml_prec       prec  = GGML_PREC_F16;
     static constexpr ggml_type       src   = GGML_TYPE_F16;
     static constexpr int             mant  = 10;
     static constexpr int             slow  = 0;
@@ -55,6 +57,7 @@ template <> struct fg_elem<sycl::ext::oneapi::bfloat16> {
     using store = sycl::ext::oneapi::bfloat16;
     using pair  = fg_bf16x2;
     static constexpr mx::matrix_type mtype = mx::matrix_type::bf16;
+    static constexpr ggml_prec       prec  = GGML_PREC_BF16;
     static constexpr ggml_type       src   = GGML_TYPE_BF16;
     static constexpr int             mant  = 7;
     static constexpr int             slow  = 0;
@@ -62,11 +65,12 @@ template <> struct fg_elem<sycl::ext::oneapi::bfloat16> {
     static pair make(float x, float y) { return { cvt(x), cvt(y) }; }
 };
 
-// tf32 keeps f32 range and f16 mantissa, in f32 storage
+// tf32 keeps f32 range and f16 mantissa, so it satisfies a BF16 or F16 src1 request, not F32
 template <> struct fg_elem<mx::precision::tf32> {
     using store = float;
     using pair  = sycl::float2;
     static constexpr mx::matrix_type mtype = mx::matrix_type::tf32;
+    static constexpr ggml_prec       prec  = GGML_PREC_BF16;
     static constexpr ggml_type       src   = GGML_TYPE_COUNT;
     static constexpr int             mant  = 10;
     static constexpr int             slow  = 1;
@@ -239,13 +243,21 @@ static int fg_device_combos(const sycl::device & dev) {
     return available;
 }
 
-// Rank of combination S for a src1 of type src1_type, lower is better. Order:
+// Rank of combination S for a src1 of type src1_type, lower is better; -1 if S may not be used.
+// Hard filters (GGML_SYCL_ENFORCE_PREC only): the accumulator meets op_params[0] and the B type
+// meets the src1 precision in op_params[3] [TAG_GGML_PREC]. Order:
 //  1. throughput: a tile that does not spill, then the fastest type class of A and B
 //  2. B type equal to the src1 type, so the pack is a plain copy
 //  3. B at least as precise as f16
 //  4. the device's native DPAS tile (8 x SG x 32 bytes of K), then the largest M x K
 // A costs nothing to convert: the A stage emits any type at the same cost.
-template <typename S> static int64_t fg_rank(ggml_type src1_type) {
+template <typename S> static int64_t fg_rank(ggml_type src1_type, int32_t acc_prec, int32_t src1_prec) {
+    // C is f32, which meets any accumulator request
+    const bool acc_ok = acc_prec == GGML_PREC_UNDEFINED || GGML_PREC_F32 <= acc_prec;
+    const bool src_ok = src1_prec == GGML_PREC_UNDEFINED || S::EB::prec <= src1_prec;
+    if (!acc_ok || !src_ok) {
+        return -1;
+    }
     const int64_t spills  = !S::efficient;
     const int64_t slow    = std::max(S::EA::slow, S::EB::slow);
     const int64_t convert = S::EB::src != src1_type;
@@ -256,7 +268,14 @@ template <typename S> static int64_t fg_rank(ggml_type src1_type) {
 }
 
 // Best allowed combination for this call, or -1 if none
-static int fg_pick_combo(dpct::queue_ptr stream, ggml_type src1_type) {
+static int fg_pick_combo(dpct::queue_ptr stream, ggml_type src1_type, int32_t acc_prec, int32_t src1_prec) {
+    if (!g_ggml_sycl_enforce_prec) {
+        // accept the same ops as without the precision model: default accumulator only, src1 free
+        if (acc_prec != GGML_PREC_DEFAULT) {
+            return -1;
+        }
+        src1_prec = GGML_PREC_UNDEFINED;
+    }
     const sycl::device dev     = stream->get_device();
     const int          allowed = fg_device_combos(dev) & g_ggml_sycl_xmx_gather_shapes;
     int                best    = -1;
@@ -266,20 +285,20 @@ static int fg_pick_combo(dpct::queue_ptr stream, ggml_type src1_type) {
             continue;
         }
         fg_visit_combo(idx, [&](auto s) {
-            const int64_t rank = fg_rank<decltype(s)>(src1_type);
-            if (best < 0 || rank < best_rank) {
+            const int64_t rank = fg_rank<decltype(s)>(src1_type, acc_prec, src1_prec);
+            if (rank >= 0 && (best < 0 || rank < best_rank)) {
                 best      = idx;
                 best_rank = rank;
             }
         });
     }
     // log each distinct decision once
-    static std::mutex                                 mtx;
-    static std::set<std::tuple<size_t, int, int>> seen;
-    std::lock_guard<std::mutex>                       lock(mtx);
-    if (seen.emplace(std::hash<sycl::device>{}(dev), (int) src1_type, best).second) {
-        GGML_LOG_INFO("%s: src1 %s -> %s\n", __func__, ggml_type_name(src1_type),
-                      best >= 0 ? fg_combo_name(best).c_str() : "none (library GEMM)");
+    static std::mutex                                                   mtx;
+    static std::set<std::tuple<size_t, int, int32_t, int32_t, int>> seen;
+    std::lock_guard<std::mutex>                                         lock(mtx);
+    if (seen.emplace(std::hash<sycl::device>{}(dev), (int) src1_type, acc_prec, src1_prec, best).second) {
+        GGML_LOG_INFO("%s: src1 %s, acc prec %d, src1 prec %d -> %s\n", __func__, ggml_type_name(src1_type), acc_prec,
+                      src1_prec, best >= 0 ? fg_combo_name(best).c_str() : "none (library GEMM)");
     }
     return best;
 }
@@ -757,8 +776,8 @@ static bool fg_fused_run(ggml_type src0_type, const void * src0, const void * sr
 }
 
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,
-                                  float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd, ggml_sycl_pool & pool,
-                                  dpct::queue_ptr stream) {
+                                  float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd, int32_t acc_prec,
+                                  int32_t src1_prec, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
     // every BN columns dequantize A again, so wide N is left to the library GEMM
     if (!ggml_sycl_xmx_gather_type_enabled(src0_type)) {
         return false;
@@ -769,7 +788,7 @@ bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const 
     if (!ggml_sycl_fused_dequant_gemm_shape_ok(src0_type, M, N, K, ldd)) {
         return false;
     }
-    const int combo = fg_pick_combo(stream, src1_type);
+    const int combo = fg_pick_combo(stream, src1_type, acc_prec, src1_prec);
     if (combo < 0) {
         return false;
     }
@@ -814,8 +833,8 @@ static bool fg_grouped_run(ggml_type src0_type, const void * src0_base, size_t e
 
 bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, const void * src0_base, size_t expert_stride,
                                     const float * src1, float * dst, const int64_t * expert_row_offsets,
-                                    int64_t n_as, int64_t M, int64_t K, int64_t total_rows,
-                                    std::vector<ggml_sycl_gg_tile> & tiles, ggml_sycl_pool & pool,
+                                    int64_t n_as, int64_t M, int64_t K, int64_t total_rows, int32_t acc_prec,
+                                    int32_t src1_prec, std::vector<ggml_sycl_gg_tile> & tiles, ggml_sycl_pool & pool,
                                     dpct::queue_ptr stream) {
     int64_t n_active = 0;
     for (int64_t e = 0; e < n_as; ++e) {
@@ -827,7 +846,7 @@ bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, const void * src0_base,
     if (!ggml_sycl_grouped_dequant_gemm_shape_ok(src0_type, M, K, total_rows, n_active)) {
         return false;
     }
-    const int combo = fg_pick_combo(stream, GGML_TYPE_F32);
+    const int combo = fg_pick_combo(stream, GGML_TYPE_F32, acc_prec, src1_prec);
     if (combo < 0) {
         return false;
     }
