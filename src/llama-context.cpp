@@ -484,6 +484,12 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    for (auto * ev : nextn_ev) {
+        if (ev) {
+            ggml_backend_event_free(ev);
+        }
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1007,6 +1013,22 @@ float * llama_context::get_embeddings_nextn() {
     output_reorder();
 
     return embd_nextn.data;
+}
+
+float * llama_context::get_embeddings_nextn_prev() {
+    if (embd_nextn_prev.data == nullptr) {
+        return nullptr;
+    }
+
+    // wait only for the copies into this half, the last decode may still run
+    const int half = nextn_half ^ 1;
+    if (nextn_ev[half] && nextn_ev_set[half]) {
+        ggml_backend_event_synchronize(nextn_ev[half]);
+    } else {
+        synchronize();
+    }
+
+    return embd_nextn_prev.data;
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
@@ -1859,11 +1881,31 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    // write the nextn rows into the other half, so the rows of the last decode stay readable
+    const bool nextn_flip = cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    if (nextn_flip) {
+        nextn_half ^= 1;
+        nextn_ev_set[nextn_half] = false;
+    }
+
+    // on failure, the half written by this decode holds no complete rows
+    auto nextn_unflip = [&]() {
+        if (nextn_flip) {
+            nextn_half ^= 1;
+            output_reserve(n_outputs_all);
+        }
+    };
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+        if (nextn_flip) {
+            nextn_half ^= 1;
+        }
         return -2;
     };
+
+    ggml_backend_t nextn_backend = nullptr;
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -1918,6 +1960,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
                 memory->seq_rm(s, pos_min[s], -1);
             }
+
+            nextn_unflip();
 
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
@@ -2035,6 +2079,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
+
+                nextn_backend = backend_h;
             }
         }
 
@@ -2061,6 +2107,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
+
+    if (nextn_flip && nextn_backend) {
+        auto & ev = nextn_ev[nextn_half];
+        if (ev == nullptr) {
+            ev = ggml_backend_event_new(ggml_backend_get_device(nextn_backend));
+        }
+        if (ev) {
+            ggml_backend_event_record(ev, nextn_backend);
+            nextn_ev_set[nextn_half] = true;
+        }
+    }
 
     // set output mappings
     if (n_outputs > 0) {
@@ -2148,10 +2205,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
-    if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
-        // unmasked: nextn row exists for every token in the batch, not just
-        // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+    // unmasked: nextn row exists for every token in the batch, not just
+    // those flagged via batch.logits[i] -> size by token count instead.
+    // these rows live in buf_nextn, not in buf_output
+    const bool nextn_unmasked = has_embd_nextn && !cparams.embeddings_nextn_masked;
+    if (nextn_unmasked) {
+        embd_nextn.size = 0;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2177,6 +2236,22 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
+    auto * buft = ggml_backend_cpu_buffer_type();
+    // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
+    auto * output_dev = model.dev_output();
+    auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
+    if (output_dev_host_buft) {
+        buft = output_dev_host_buft;
+    }
+
+    if (nextn_unmasked && !buf_nextn) {
+        buf_nextn.reset(ggml_backend_buft_alloc_buffer(buft, 2 * (size_t) n_embd_out * n_batch * sizeof(float)));
+        if (buf_nextn == nullptr) {
+            LLAMA_LOG_ERROR("%s: failed to allocate nextn output buffer\n", __func__);
+            return 0;
+        }
+    }
+
     // alloc only when more than the current capacity is required
     // TODO: also consider shrinking the buffer
     if (!buf_output || prev_size < new_size) {
@@ -2197,13 +2272,6 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             }
         }
 
-        auto * buft = ggml_backend_cpu_buffer_type();
-        // try to use the host buffer of the device where the output tensor is allocated for faster transfer to system memory
-        auto * output_dev = model.dev_output();
-        auto * output_dev_host_buft = output_dev ? ggml_backend_dev_host_buffer_type(output_dev) : nullptr;
-        if (output_dev_host_buft) {
-            buft = output_dev_host_buft;
-        }
         buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
         if (buf_output == nullptr) {
             LLAMA_LOG_ERROR("%s: failed to allocate output buffer of size %.2f MiB\n", __func__, new_size / (1024.0 * 1024.0));
@@ -2225,6 +2293,14 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
     offset += embd_nextn.size * sizeof(float);
+
+    embd_nextn_prev = {nullptr, 0};
+    if (nextn_unmasked) {
+        const size_t n_half = (size_t) n_embd_out * n_batch;
+        float * nextn_base = (float *) ggml_backend_buffer_get_base(buf_nextn.get());
+        embd_nextn      = { nextn_base + n_half*nextn_half,       n_half };
+        embd_nextn_prev = { nextn_base + n_half*(nextn_half ^ 1), n_half };
+    }
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
@@ -4060,6 +4136,10 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn();
+}
+
+float * llama_get_embeddings_nextn_prev(llama_context * ctx) {
+    return ctx->get_embeddings_nextn_prev();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {

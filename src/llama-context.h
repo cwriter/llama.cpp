@@ -88,6 +88,7 @@ struct llama_context {
 
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
+    float * get_embeddings_nextn_prev();
 
     float * get_embeddings_layer_inp(uint32_t lid);
 
@@ -308,6 +309,13 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // the unmasked export has two halves in buf_nextn: the rows of the previous decode stay valid during the next one
+    buffer_view<float> embd_nextn_prev = {nullptr, 0};
+    ggml_backend_buffer_ptr buf_nextn;
+    int nextn_half = 0;
+    ggml_backend_event_t nextn_ev[2] = { nullptr, nullptr }; // recorded after the copies into each half
+    bool nextn_ev_set[2] = { false, false };
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true
