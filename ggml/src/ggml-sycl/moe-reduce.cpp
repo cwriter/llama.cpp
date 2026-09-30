@@ -70,8 +70,11 @@ bool ggml_sycl_match_moe_weighted_reduction(const ggml_cgraph * cgraph, int node
 
     const int     n_expert_used = (int) mul->ne[1];
     const int64_t n_tokens      = mul->ne[2] * mul->ne[3];
-    // a single expert leaves no add chain to absorb, and the span must fit ggml_can_fuse_subgraph
-    if (n_expert_used < 2 || n_expert_used > GGML_SYCL_MOE_REDUCE_MAX_EXPERTS || n_tokens <= 0) {
+    // a single expert leaves no add chain to absorb, and the span must fit ggml_can_fuse_subgraph.
+    // an empty span (a ubatch with no outputs) still matches: graph_optimize then adds the same
+    // alloc deps, so the graph keeps one topology and ggml-alloc keeps its plan. Compute skips
+    // empty nodes before it tries any fusion.
+    if (n_expert_used < 2 || n_expert_used > GGML_SYCL_MOE_REDUCE_MAX_EXPERTS || n_tokens < 0) {
         return false;
     }
 
