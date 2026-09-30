@@ -138,6 +138,7 @@ int g_ggml_sycl_fuse_qsa_topk = 1;
 int g_ggml_sycl_fuse_qsa_score = 1;
 int g_ggml_sycl_fuse_qsa_mask = 0;
 int g_ggml_sycl_fuse_qsa_fa_mask = 3;
+int g_ggml_sycl_qsa_fa_no_readback = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
 int g_ggml_sycl_topk_moe_radix = 1;
@@ -482,6 +483,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_qsa_score = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_SCORE", 1);
         g_ggml_sycl_fuse_qsa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_MASK", 0);
         g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 3);
+        g_ggml_sycl_qsa_fa_no_readback = ggml_sycl_get_env("GGML_SYCL_QSA_FA_NO_READBACK", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
         g_ggml_sycl_topk_moe_radix = ggml_sycl_get_env("GGML_SYCL_TOPK_MOE_RADIX", 1);
@@ -651,6 +653,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_SCORE: %d\n", g_ggml_sycl_fuse_qsa_score);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_MASK: %d\n", g_ggml_sycl_fuse_qsa_mask);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
+        GGML_LOG_INFO("  GGML_SYCL_QSA_FA_NO_READBACK: %d\n", g_ggml_sycl_qsa_fa_no_readback);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
         GGML_LOG_INFO("  GGML_SYCL_TOPK_MOE_RADIX: %d\n", g_ggml_sycl_topk_moe_radix);
