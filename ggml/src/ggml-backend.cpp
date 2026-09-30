@@ -948,6 +948,8 @@ struct ggml_backend_sched {
     struct ggml_hash_set  hash_set;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
+    size_t              * hv_copies_used;        // the [id][backend] entries of hv_tensor_copies that are set
+    size_t                n_hv_copies_used;
 
     int * node_backend_ids; // [graph_size]
     int * leaf_backend_ids; // [graph_size]
@@ -1590,6 +1592,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
+                        sched->hv_copies_used[sched->n_hv_copies_used++] = src_id * sched->n_backends + cur_backend_id;
                         int n_inputs = split->n_inputs++;
                         if (n_inputs >= split->inputs_capacity) {
                             ggml_backend_sched_split_inputs_grow(split);
@@ -1638,6 +1641,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     tensor_id_copy(leaf_id, leaf_backend_id, c) = tensor_copy;
                     SET_CAUSE(tensor_copy, "6.cpy");
                 }
+                sched->hv_copies_used[sched->n_hv_copies_used++] = leaf_id * sched->n_backends + leaf_backend_id;
             }
 
             int n_graph_inputs = sched->n_graph_inputs++;
@@ -2104,7 +2108,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-    sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    sched->hv_tensor_copies      = (ggml_tensor **) calloc(sched->hash_set.size * sched->n_backends * sched->n_copies, sizeof(struct ggml_tensor *));
+    sched->hv_copies_used        = (size_t *) malloc(sched->hash_set.size * sched->n_backends * sizeof(size_t));
+    sched->n_hv_copies_used      = 0;
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -2166,6 +2172,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
+    free(sched->hv_copies_used);
     free(sched->fusion_absorbed);
     free(sched->node_backend_ids);
     free(sched->leaf_backend_ids);
@@ -2183,7 +2190,11 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+        // clear only the copies that were set, the table is large with many copies
+        for (size_t i = 0; i < sched->n_hv_copies_used; i++) {
+            memset(&sched->hv_tensor_copies[sched->hv_copies_used[i] * sched->n_copies], 0, sched->n_copies * sizeof(struct ggml_tensor *));
+        }
+        sched->n_hv_copies_used = 0;
         sched->is_reset = true;
     }
     sched->is_alloc = false;
