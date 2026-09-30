@@ -1232,6 +1232,12 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    // the h_nextn export changes the graph topology, so the reserved worst-case graph must follow it,
+    // or every prompt ubatch plans the compute buffers anew (and drains all backends) as n_kv grows
+    if (cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked) {
+        sched_need_reserve = true;
+    }
+
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
 }
