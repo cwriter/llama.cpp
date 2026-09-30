@@ -93,6 +93,7 @@ extern int g_ggml_sycl_fuse_qsa_topk;
 extern int g_ggml_sycl_fuse_qsa_score;
 extern int g_ggml_sycl_fuse_qsa_mask;
 extern int g_ggml_sycl_fuse_qsa_fa_mask;
+extern int g_ggml_sycl_qsa_fa_no_readback;
 extern int g_ggml_sycl_small_gemm;
 extern int g_ggml_sycl_mv_fuse;
 extern int g_ggml_sycl_topk_moe_radix;

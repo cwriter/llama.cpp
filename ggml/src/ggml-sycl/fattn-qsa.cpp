@@ -22,6 +22,10 @@
 // that keeps, per query row, only the cells that row's own list names. The union is a sorted
 // cell list, so the result is deterministic. At a short context the union is the whole cache
 // and this is the dense kernel with bigger query tiles; at a long context it is a fraction.
+// The GEMMs need the union sizes on the host, so this path waits for the device once per node.
+// GGML_SYCL_QSA_FA_NO_READBACK runs the dense kernel with the selection bits instead: more GEMM
+// work (the union is 20-50% of the cache at 8k-64k), but no host wait, so pipeline parallelism
+// can keep feeding the other cards.
 //
 // Everything else (decode, short batches, sinks, softcap, ALiBi): the mask the graph wanted is
 // written into pool scratch at its real size and the dense kernels run unchanged, so the output
@@ -655,11 +659,11 @@ void ggml_sycl_qsa_sparse_fa(ggml_backend_sycl_context & ctx, ggml_tensor * fa, 
 
     static std::atomic<int> trace_left{ getenv("GGML_SYCL_QSA_MASK_TRACE") ?
                                         std::max(1, atoi(getenv("GGML_SYCL_QSA_MASK_TRACE"))) : 0 };
-    const bool small = take && fa->src[1]->ne[1] <= QSA_UNION_MIN_KV;
+    const bool bits  = take && (fa->src[1]->ne[1] <= QSA_UNION_MIN_KV || g_ggml_sycl_qsa_fa_no_readback);
     if (trace_left.fetch_sub(1) > 0) {
         fprintf(stderr, "[QSASPARSE] n_kv=%ld n_tps=%ld heads=%ld/%ld width=%ld path=%s kind=%d\n",
                 (long) mask->ne[0], (long) mask->ne[1], (long) fa->src[0]->ne[2], (long) fa->src[1]->ne[2],
-                (long) idx->ne[0], !take ? "dense" : small ? "bits" : "union", kind);
+                (long) idx->ne[0], !take ? "dense" : bits ? "bits" : "union", kind);
         fprintf(stderr, "[QSASPARSE] causal mask %s\n", ggml_sycl_kq_mask_is_bits(mask) ? "packed" : "f16");
     }
 
@@ -705,7 +709,7 @@ void ggml_sycl_qsa_sparse_fa(ggml_backend_sycl_context & ctx, ggml_tensor * fa, 
 
     GGML_ASSERT(a.Q && a.K && a.V && a.dst);
 
-    if (small) {
+    if (bits) {
         qsa_bits_mkl_fa(ctx, fa, mask, a);
         return;
     }
