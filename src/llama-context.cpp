@@ -427,8 +427,13 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // an MTP draft next to a pipelined target shares a device with it: without input copies, every
+        // upload of the draft waits for the target work queued on that device
+        const bool mtp_next_to_pipeline =
+            cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other && params.ctx_other->get_cparams().pipeline_parallel;
+
         bool pipeline_parallel =
-            model.n_devices() > 1 &&
+            (model.n_devices() > 1 || mtp_next_to_pipeline) &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
@@ -1437,7 +1442,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    // the KV-only catch-up of a pipelined MTP draft rebuilds its small graph rather than wait for the device it shares with the target
+    const bool can_reuse = !graph_reuse_disable && !(cparams.pipeline_parallel && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_outputs == 0);
+
+    if (can_reuse && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
