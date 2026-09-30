@@ -206,6 +206,10 @@ struct common_speculative_impl {
 
     virtual bool process(const common_batch & batch) = 0;
 
+    // (optional) process a batch after the target has decoded the next one, see common_speculative_process_prev()
+    virtual bool can_process_prev() const { return false; }
+    virtual bool process_prev(const common_batch & /*batch*/) { return false; }
+
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
@@ -1538,7 +1542,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    bool can_process_prev() const override {
+        return true;
+    }
+
     bool process(const common_batch & batch_in) override {
+        return process_impl(batch_in, false);
+    }
+
+    bool process_prev(const common_batch & batch_in) override {
+        return process_impl(batch_in, true);
+    }
+
+    // prev: the hidden states of batch_in are the target's previous nextn rows
+    bool process_impl(const common_batch & batch_in, bool prev) {
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1570,6 +1587,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // the target export is unmasked: one row per batch token
+        const float * h_tgt = prev ? llama_get_embeddings_nextn_prev(ctx_tgt) : llama_get_embeddings_nextn(ctx_tgt);
+        if (h_tgt == nullptr) {
+            SPC_ERR("%s", "no target nextn embeddings\n");
+            return false;
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -1580,8 +1604,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
-
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
@@ -1635,10 +1657,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
+            std::memcpy(verify_h[seq_id].data(), h_tgt + (size_t) i_batch_beg[seq_id] * n_embd, (size_t) n_rows * row_bytes);
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
@@ -2851,6 +2870,34 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
     }
+}
+
+bool common_speculative_can_process_prev(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (!impl->can_process_prev()) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool common_speculative_process_prev(common_speculative * spec, const common_batch & batch) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->process_prev(batch);
+    }
+
+    return result;
 }
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {

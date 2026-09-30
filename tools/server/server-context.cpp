@@ -996,6 +996,10 @@ private:
 
     common_speculative_ptr spec;
 
+    // a prompt batch whose draft catch-up waits for the next target decode, see decode()
+    common_batch spec_pending;
+    bool         spec_pending_set = false;
+
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
@@ -2510,8 +2514,28 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
+    // run the draft catch-up of the pending batch
+    // prev: the target decoded another batch since the pending one
+    bool spec_catch_up(bool prev) {
+        if (!spec_pending_set) {
+            return true;
+        }
+        spec_pending_set = false;
+
+        const bool ok = prev ? common_speculative_process_prev(spec.get(), spec_pending)
+                             : common_speculative_process     (spec.get(), spec_pending);
+        if (!ok) {
+            SRV_ERR("%s", "failed to process speculative batch\n");
+        }
+
+        return ok;
+    }
+
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+
+        // the draft state is saved below
+        spec_catch_up(false);
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2585,6 +2609,11 @@ private:
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+
+        // the task may change the slots or read the draft state
+        if (task.type != SERVER_TASK_TYPE_NEXT_RESPONSE && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+            spec_catch_up(false);
         }
 
         switch (task.type) {
@@ -3012,6 +3041,21 @@ private:
             SRV_INF("avg t_sampl       = %f ms\n", (double) t_sampl / n_sampl / 1000.0);
         }
 #endif
+
+        // the draft catch-up can wait for the next target decode only while its slot continues the prompt alone
+        if (spec_pending_set) {
+            int  n_busy = 0;
+            bool cont   = false;
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    n_busy++;
+                    cont = slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.id == spec_pending.tokens[0].seq_id;
+                }
+            }
+            if (n_busy != 1 || !cont) {
+                spec_catch_up(false);
+            }
+        }
 
         // check if all slots are idle
         {
@@ -3755,6 +3799,11 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
+                            // the chunk decodes the target, so the draft must catch up first
+                            if (!spec_catch_up(false)) {
+                                res = -1;
+                                return;
+                            }
                             res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
                         });
 
@@ -4077,9 +4126,19 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
+            // a prompt batch without outputs leaves its draft catch-up for after the next target decode,
+            // so the target is not drained to read the hidden states and the draft overlaps its next batch
+            const bool defer = !has_output && common_speculative_can_process_prev(spec.get());
+
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch.view);
+                ok = spec_catch_up(true);
+                if (ok && defer) {
+                    spec_pending.tokens = batch.view.tokens;
+                    spec_pending_set    = true;
+                } else if (ok) {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                }
             });
 
             if (!ok) {
