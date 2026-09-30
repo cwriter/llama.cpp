@@ -1708,8 +1708,15 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        // with events, wait only for the work of this scheduler, not for other users of the same device
         for (int i = 0; i < sched->n_backends; i++) {
-            ggml_backend_synchronize(sched->backends[i]);
+            if (sched->events[i][0] == NULL) {
+                ggml_backend_synchronize(sched->backends[i]);
+                continue;
+            }
+            for (int c = 0; c < sched->n_copies; c++) {
+                ggml_backend_event_synchronize(sched->events[i][c]);
+            }
         }
 
         if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
