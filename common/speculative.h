@@ -79,6 +79,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
+// true if common_speculative_process_prev() can be used
+bool common_speculative_can_process_prev(const common_speculative * spec);
+
+// like common_speculative_process(), but for the batch before the last target decode
+// this lets the target decode the next batch before the draft catches up with this one
+bool common_speculative_process_prev(common_speculative * spec, const common_batch & batch);
+
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);
 
