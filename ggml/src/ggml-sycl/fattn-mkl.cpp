@@ -948,9 +948,9 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     const bool v_interleaved =
         ((int64_t)V->ne[1] * V->nb[1] != V->nb[2]) && V->ne[2] > 1;
 
-    const mkl_fa_kv_desc K_desc = mkl_fa_make_desc(K, k_interleaved);
-    const mkl_fa_kv_desc V_desc = V_is_K_view
-        ? K_desc : mkl_fa_make_desc(V, v_interleaved);
+    const mkl_fa_kv_desc K_desc_all = mkl_fa_make_desc(K, k_interleaved);
+    const mkl_fa_kv_desc V_desc_all = V_is_K_view
+        ? K_desc_all : mkl_fa_make_desc(V, v_interleaved);
 
     MKL_ACCUM(dequant_time_us, t_deq);
 
@@ -1045,6 +1045,14 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
         const uint32_t * sel_batch = sel_bits;
         if (sel_bits && mask && mask->ne[3] > 1) {
             sel_batch += (int64_t)ib * n_queries * sel_words;
+        }
+
+        // one KV stream per sequence: batch ib reads stream ib
+        mkl_fa_kv_desc K_desc = K_desc_all;
+        mkl_fa_kv_desc V_desc = V_desc_all;
+        if (K->ne[3] > 1) {
+            K_desc.data += ib * K->nb[3];
+            V_desc.data += ib * V->nb[3];
         }
 
         for (int ikvh = 0; ikvh < n_kv_heads; ikvh++) {
