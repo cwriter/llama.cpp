@@ -10366,6 +10366,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // q8_0 and k-quants at the expert shapes of Qwen3-30B-A3B (gate/up and down), several blocks per row
+    for (ggml_type type_a : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {33, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 768, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2048, n, 768));
+        }
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 2048, 33, 768, {1, 1}, {1, 1}));
+    }
+
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
@@ -10388,7 +10397,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // src1 precision requests below F32
-    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S}) {
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+                             GGML_TYPE_Q6_K}) {
         test_cases.emplace_back(new test_mul_mat_id_prec(type_a, GGML_PREC_BF16, 768, 64, 2048));
         test_cases.emplace_back(new test_mul_mat_id_prec(type_a, GGML_PREC_BF16, 768, 64, 2048, 1e5f));
         test_cases.emplace_back(new test_mul_mat_id_prec(type_a, GGML_PREC_F16, 768, 64, 2048));
