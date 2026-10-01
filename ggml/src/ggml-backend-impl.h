@@ -28,6 +28,9 @@ extern "C" {
         size_t                (*get_alloc_size)  (ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
         // (optional) total data size needed to allocate the given tensors, including padding and splitting (defaults to per-tensor get_alloc_size)
         size_t                (*get_alloc_size_n)(ggml_backend_buffer_type_t buft, struct ggml_tensor ** tensors, int n_tensors);
+        // (optional) upper bound of get_alloc_size for this tensor in any later graph with the same topology (defaults to get_alloc_size)
+        // the graph allocator plans each tensor at this size, so a backend whose scratch depends on runtime shapes (e.g. the KV length) does not force a new plan
+        size_t                (*get_max_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)         (ggml_backend_buffer_type_t buft);
     };
