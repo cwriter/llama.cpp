@@ -660,10 +660,7 @@ void llama_context::sched_reserve() {
         }
     }
 
-    // avoid reserving graphs with zero outputs - assume one output per sequence
-    const int n_outputs = n_seqs;
-
-    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, n_outputs);
+    LLAMA_LOG_DEBUG("%s: worst-case: n_tokens = %d, n_seqs = %d, n_outputs = %d\n", __func__, n_tokens, n_seqs, graph_reserve_n_outputs(n_tokens));
 
     resolve_fused_ops(mctx.get(), n_seqs);
 
@@ -678,7 +675,8 @@ void llama_context::sched_reserve() {
     int n_inputs_tg        = -1;
     int n_input_tensors_tg = -1;
 
-    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+    // avoid reserving graphs with zero outputs - assume one output per sequence (except for an MTP draft)
+    const uint32_t n_outputs_pp = graph_reserve_n_outputs(n_tokens);
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
@@ -904,9 +902,7 @@ bool llama_context::memory_update(bool optimize) {
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
 
-        const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
-
-        auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_max, mctx.get());
+        auto * gf = graph_reserve(n_tokens, n_seqs, graph_reserve_n_outputs(n_tokens), mctx.get());
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to reserve graph after the memory update\n", __func__);
         }
@@ -2541,6 +2537,16 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     return res;
 }
 
+uint32_t llama_context::graph_reserve_n_outputs(uint32_t n_tokens) const {
+    // an MTP draft decodes large batches only for its KV catch-up, which has no outputs.
+    // its outputs come from the draft steps, one token per sequence, as in the tg graph.
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0;
+    }
+
+    return std::min(n_tokens, cparams.n_outputs_max);
+}
+
 llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
@@ -2613,7 +2619,7 @@ static void ubatch_prepare_reserve(
 ggml_cgraph * llama_context::graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
-    GGML_ASSERT(n_outputs >= 1);
+    GGML_ASSERT(n_outputs >= 1 || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP);
 
     if (n_tokens % n_seqs != 0) {
         n_tokens = ((n_tokens + (n_seqs - 1)) / n_seqs) * n_seqs; // round to next multiple of n_seqs

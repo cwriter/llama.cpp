@@ -264,6 +264,9 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    // number of outputs of the worst-case graph with n_tokens tokens
+    uint32_t graph_reserve_n_outputs(uint32_t n_tokens) const;
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
