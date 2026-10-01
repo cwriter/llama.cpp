@@ -47,6 +47,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_hbm_buffer_type(void) {
                            /* .get_max_size         = */ nullptr,  // defaults to SIZE_MAX
                            /* .get_alloc_size       = */ nullptr,  // defaults to ggml_nbytes
                            /* .get_alloc_size_n     = */ NULL,
+                           /* .get_max_alloc_size  = */ nullptr, // defaults to get_alloc_size
                            /* .is_host              = */ ggml_backend_cpu_buffer_type_is_host,
                            },
         /* .context  = */ nullptr,

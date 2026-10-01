@@ -220,6 +220,18 @@ size_t ggml_backend_buft_get_alloc_size_n(ggml_backend_buffer_type_t buft, struc
     return ggml_backend_buft_get_alloc_size_n_default(buft, tensors, n_tensors);
 }
 
+size_t ggml_backend_buft_get_max_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor) {
+    GGML_ASSERT(buft);
+    const size_t size = ggml_backend_buft_get_alloc_size(buft, tensor);
+    // get_max_alloc_size is optional, defaults to get_alloc_size
+    if (buft->iface.get_max_alloc_size) {
+        const size_t size_max = buft->iface.get_max_alloc_size(buft, tensor);
+        GGML_ASSERT(size_max >= size);
+        return size_max;
+    }
+    return size;
+}
+
 bool ggml_backend_buft_is_host(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(buft);
     if (buft->iface.is_host) {
@@ -2719,6 +2731,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
             /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
             /* .get_alloc_size_n    = */ NULL,
+            /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
             /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
@@ -2744,6 +2757,7 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
             /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
             /* .get_alloc_size      = */ NULL, // defaults to ggml_nbytes
             /* .get_alloc_size_n    = */ NULL,
+            /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
             /* .is_host             = */ ggml_backend_cpu_buffer_type_is_host,
         },
         /* .device  = */ NULL, // FIXME ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
