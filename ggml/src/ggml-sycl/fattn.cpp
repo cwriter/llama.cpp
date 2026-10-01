@@ -106,9 +106,9 @@ enum best_fattn_kernel {
 };
 
 
-// The shape envelope the oneMKL kernel is validated for. Split out of the dispatcher so the
-// staging budget below can ask the same question before it declines oneDNN.
-static bool ggml_sycl_fattn_mkl_supported(const ggml_tensor * dst) {
+// The shape envelope the oneMKL kernel is validated for, apart from the batch and the KV length.
+// Split out of the dispatcher so the staging budget below can ask the same question before it declines oneDNN.
+static bool ggml_sycl_fattn_mkl_envelope(const ggml_tensor * dst) {
     if (g_ggml_sycl_enable_mkl_fa <= 0) {
         return false;
     }
@@ -127,7 +127,7 @@ static bool ggml_sycl_fattn_mkl_supported(const ggml_tensor * dst) {
     memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
 
     if (Q->ne[2] / K->ne[2] < 2 || Q->ne[0] < 64 || Q->ne[0] > 512 || Q->ne[0] % 64 != 0 ||
-        Q->ne[0] != V->ne[0] || Q->ne[1] < 32 || K->ne[1] < 1024 ||
+        Q->ne[0] != V->ne[0] ||
         max_bias != 0.0f || logit_softcap != 0.0f ||
         (Q->ne[3] != K->ne[3] && K->ne[3] != 1)) {
         return false;
@@ -144,17 +144,36 @@ static bool ggml_sycl_fattn_mkl_supported(const ggml_tensor * dst) {
     return true;
 }
 
+static bool ggml_sycl_fattn_mkl_supported(const ggml_tensor * dst) {
+    return ggml_sycl_fattn_mkl_envelope(dst) && dst->src[0]->ne[1] >= 32 && dst->src[1]->ne[1] >= 1024;
+}
+
+// cells of the whole KV cache that K views
+static int64_t ggml_sycl_fattn_cache_cells(const ggml_tensor * K) {
+    if (K->ne[1] <= 0) {
+        return K->ne[1];
+    }
+    const int64_t       per_cell = ggml_nelements(K) / K->ne[1];
+    const ggml_tensor * Kc       = K->view_src ? K->view_src : K;
+    return per_cell > 0 ? std::max(K->ne[1], ggml_nelements(Kc) / per_cell) : K->ne[1];
+}
+
 // oneDNN SDPA and TILE both stage an F16 copy of the WHOLE KV cache, which the graph allocator
 // has to reserve, and which grows with the context and not with the batch. At the
 // GGML_SYCL_FA_MAX_MEM_MIB ceiling the node goes to the oneMKL kernel instead: it walks the cache
 // in chunks sized to fit the same ceiling, so it reserves nothing.
 //
-// Size the decision from the whole KV cache, not from this graph's n_kv. The reservation is made
-// on a worst-case graph at the full context while real graphs are shorter, so a decision that
-// read n_kv would clamp the reservation and then not clamp the graph that runs, and the
-// reservation would stop bounding it.
+// Size the decision from the whole KV cache and the static kernel envelope, not from this graph's
+// n_kv or batch. The allocator plans a node for every batch and KV length it may later run at
+// (get_max_alloc_size), so a capped node must stay bounded on every path; see
+// ggml_sycl_fattn_capped_tile().
 bool ggml_sycl_fattn_stage_capped(const ggml_tensor * dst) {
     if (g_ggml_sycl_fa_max_mem_mib <= 0 || dst->op != GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+    // the sparse path's gathered node is small by construction, and the slots past its live cells
+    // hold stale data that only TILE and VEC know to skip
+    if (ggml_get_op_params_i32(dst, 4) == GGML_SYCL_FATTN_GATHERED) {
         return false;
     }
     const ggml_tensor * K = dst->src[1];
@@ -166,7 +185,29 @@ bool ggml_sycl_fattn_stage_capped(const ggml_tensor * dst) {
     const ggml_tensor * Vc = V->view_src ? V->view_src : V;
     // count both even when V aliases K: oneDNN stages them apart, only TILE shares the copy
     const size_t stage = (size_t) (ggml_nelements(Kc) + ggml_nelements(Vc)) * 2;
-    return stage >= (size_t) g_ggml_sycl_fa_max_mem_mib * 1024 * 1024 && ggml_sycl_fattn_mkl_supported(dst);
+    return stage >= (size_t) g_ggml_sycl_fa_max_mem_mib * 1024 * 1024 && ggml_sycl_fattn_mkl_envelope(dst);
+}
+
+static ggml_sycl_fattn_extra ggml_sycl_fattn_layout(const ggml_tensor * dst, int64_t n_kv, bool onednn, bool tile);
+
+static size_t ggml_sycl_fattn_layout_size(const ggml_tensor * dst, int64_t n_kv, bool onednn, bool tile) {
+    return (size_t) (ggml_sycl_fattn_layout(dst, n_kv, onednn, tile).end - (uintptr_t) dst->data);
+}
+
+// A capped node never stages the whole cache. TILE (which stages K/V) still takes a short context,
+// where oneMKL does not apply, and a short batch whose staging is no larger than what the sparse
+// path stages for its largest batch. The chunked oneMKL kernel takes every other batch.
+static bool ggml_sycl_fattn_capped_tile(const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    if (K->ne[1] < 1024) {
+        return true;
+    }
+    if (Q->ne[1] >= 32) {
+        return false;
+    }
+    const size_t budget = ggml_sycl_fattn_sparse_max_alloc_size(dst, ggml_sycl_fattn_cache_cells(K));
+    return ggml_sycl_fattn_layout_size(dst, K->ne[1], false, true) <= budget;
 }
 
 static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
@@ -194,6 +235,9 @@ static best_fattn_kernel ggml_sycl_get_best_fattn_kernel(const int device, const
     // ONEDNN requires min 32 query tokens — short-circuit decode to avoid
     // calling _supported() on every decode FA call.
     const bool stage_capped = ggml_sycl_fattn_stage_capped(dst);
+    if (stage_capped && !ggml_sycl_fattn_capped_tile(dst)) {
+        return BEST_FATTN_KERNEL_MKL;
+    }
 
     // oneDNN needs a dense f16 mask, and a compact one could only be expanded into as much
     // scratch as the compaction saved; the MKL kernel below reads the bits directly
@@ -501,8 +545,9 @@ bool ggml_sycl_flash_attn_ext_supported(int device, const ggml_tensor * dst) {
     return ggml_sycl_get_best_fattn_kernel(device, dst) != BEST_FATTN_KERNEL_NONE;
 }
 
-// Mirrors the oneDNN-then-MKL order of ggml_sycl_get_best_fattn_kernel(). The device only
-// enters the VEC/TILE choice below MKL, so the answer does not depend on it.
+// Mirrors the oneDNN-then-MKL order of ggml_sycl_get_best_fattn_kernel() for a prefill batch. The
+// device only enters the VEC/TILE choice below MKL, so the answer does not depend on it. A capped
+// node also runs a long short batch on oneMKL; that is not reported here.
 bool ggml_sycl_fattn_picks_mkl(const ggml_tensor * dst) {
     if (!g_ggml_sycl_enable_flash_attention || dst->op != GGML_OP_FLASH_ATTN_EXT || !dst->src[0]) {
         return false;
@@ -534,58 +579,50 @@ static uintptr_t ggml_sycl_fattn_reserve_halves(ggml_sycl_fattn_extra & extra, s
     return block;
 }
 
-ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
+// The scratch after dst for oneDNN and/or TILE, with K/V at n_kv cells.
+static ggml_sycl_fattn_extra ggml_sycl_fattn_layout(const ggml_tensor * dst, int64_t n_kv, bool onednn, bool tile) {
     ggml_sycl_fattn_extra extra;
 
     extra.end = (uintptr_t) dst->data + ggml_nbytes(dst);
 
-    if (dst->op != GGML_OP_FLASH_ATTN_EXT) {
-        return extra;
-    }
-
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
-    if (!Q || !K || !V) {
-        return extra;
-    }
 
     const int64_t d = K->ne[0];
     const int64_t H = Q->ne[2];
     const int64_t q = Q->ne[1];
 
-    // calculate the worst-case memory consumption across all kernels. A capped node runs on
-    // the chunked oneMKL kernel, which takes its scratch from the pool, so it reserves nothing.
-    const bool capped = ggml_sycl_fattn_stage_capped(dst);
-    const bool onednn_supported = !capped && ggml_sycl_flash_attn_ext_onednn_supported(dst, /* use_shape_limit */ false);
+    const size_t n_K = K->ne[1] > 0 ? (size_t) (ggml_nelements(K) / K->ne[1] * n_kv) : 0;
+    const size_t n_V = V->ne[1] > 0 ? (size_t) (ggml_nelements(V) / V->ne[1] * n_kv) : 0;
 
-    const bool tile_needs_K = !capped && K->type != GGML_TYPE_F16;
-    const bool tile_needs_V = !capped && V->type != GGML_TYPE_F16;
+    const bool tile_needs_K = tile && K->type != GGML_TYPE_F16;
+    const bool tile_needs_V = tile && V->type != GGML_TYPE_F16;
 
     const bool V_is_K_view = V->view_src &&
         (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
 
     size_t need_K = 0, need_V = 0, need_Q = 0, need_out = 0, need_scale = 0;
-    if (onednn_supported) {
+    if (onednn) {
         need_Q     = (size_t) H * q * d;
         need_out   = (size_t) H * q * d;
         need_scale = 1;
         // an f16 cache is bound in place, so it needs no staging copy
         if (!ggml_sycl_fattn_onednn_binds_kv(K, V)) {
-            need_K = (size_t) ggml_nelements(K);
-            need_V = (size_t) ggml_nelements(V);
+            need_K = n_K;
+            need_V = n_V;
         }
     }
     if (tile_needs_K) {
-        need_K = std::max(need_K, (size_t) ggml_nelements(K));
+        need_K = std::max(need_K, n_K);
     }
     if (tile_needs_V) {
-        need_V = std::max(need_V, (size_t) ggml_nelements(V));
+        need_V = std::max(need_V, n_V);
     }
 
     extra.Q_buffer_ptr = ggml_sycl_fattn_reserve_halves(extra, need_Q);
     extra.K_buffer_ptr = ggml_sycl_fattn_reserve_halves(extra, need_K);
-    extra.V_buffer_ptr = (V_is_K_view && !onednn_supported && need_V)
+    extra.V_buffer_ptr = (V_is_K_view && !onednn && need_V)
                        ? extra.K_buffer_ptr
                        : ggml_sycl_fattn_reserve_halves(extra, need_V);
     extra.scale_buffer_ptr = ggml_sycl_fattn_reserve_halves(extra, need_scale);
@@ -594,7 +631,71 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
     return extra;
 }
 
+// The node as the sparse check in ggml_sycl_flash_attn_ext() sees it: a packed mask that the
+// kernel does not read is expanded to a dense one first. Fills mask/node when it differs.
+static const ggml_tensor * ggml_sycl_fattn_sparse_view(const ggml_tensor * dst, bool read_bits, ggml_tensor & mask, ggml_tensor & node) {
+    if (!ggml_sycl_kq_mask_is_bits(dst->src[3]) || read_bits) {
+        return dst;
+    }
+    mask         = *dst->src[3];
+    mask.extra   = nullptr;
+    node         = *dst;
+    node.src[3]  = &mask;
+    return &node;
+}
+
+ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst) {
+    ggml_sycl_fattn_extra extra;
+
+    extra.end = (uintptr_t) dst->data + ggml_nbytes(dst);
+
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT || !dst->src[0] || !dst->src[1] || !dst->src[2]) {
+        return extra;
+    }
+
+    // calculate the worst-case memory consumption across the kernels this node may take
+    if (!ggml_sycl_fattn_stage_capped(dst)) {
+        return ggml_sycl_fattn_layout(dst, dst->src[1]->ne[1], ggml_sycl_flash_attn_ext_onednn_supported(dst, false), true);
+    }
+    // a capped node never takes oneDNN. The sparse path lays out its gathered node from dst->data
+    ggml_tensor mask, node;
+    const ggml_tensor * sv = ggml_sycl_fattn_sparse_view(dst, ggml_sycl_fattn_reads_mask_bits(dst), mask, node);
+    if (ggml_sycl_fattn_sparse_applies(sv)) {
+        extra.end = (uintptr_t) dst->data + ggml_sycl_fattn_sparse_alloc_size(sv);
+        return extra;
+    }
+    if (ggml_sycl_fattn_capped_tile(dst)) {
+        return ggml_sycl_fattn_layout(dst, dst->src[1]->ne[1], false, true);
+    }
+    return extra;  // oneMKL takes its scratch from the pool
+}
+
 size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst) {
     const ggml_sycl_fattn_extra extra = ggml_sycl_fattn_get_extra(dst);
     return (size_t) (extra.end - (uintptr_t) dst->data);
+}
+
+// The KV view may grow up to the whole cache and the batch may shrink, which can move the node to
+// another kernel. Bound what get_alloc_size reports over all of them.
+size_t ggml_sycl_flash_attn_ext_get_max_alloc_size(const ggml_tensor * dst) {
+    size_t size = ggml_sycl_flash_attn_ext_get_alloc_size(dst);
+    if (dst->op != GGML_OP_FLASH_ATTN_EXT || !dst->src[0] || !dst->src[1] || !dst->src[2]) {
+        return size;
+    }
+    const int64_t cells = ggml_sycl_fattn_cache_cells(dst->src[1]);
+    if (!ggml_sycl_fattn_stage_capped(dst)) {
+        // the oneDNN KV ceiling only depends on n_kv, so drop it here: below it oneDNN may run
+        ggml_tensor K = *dst->src[1];
+        ggml_tensor d = *dst;
+        K.ne[1]   = 0;
+        d.src[1]  = &K;
+        const bool onednn = ggml_sycl_flash_attn_ext_onednn_supported(&d, false);
+        return std::max(size, ggml_sycl_fattn_layout_size(dst, cells, onednn, true));
+    }
+    // TILE on a short context at this batch, TILE within the sparse budget or the sparse path itself, oneMKL
+    size = std::max(size, ggml_sycl_fattn_layout_size(dst, std::min<int64_t>(cells, 1024), false, true));
+    ggml_tensor mask, node;
+    const ggml_tensor * sv = ggml_sycl_fattn_sparse_view(dst, false, mask, node);
+    size = std::max(size, ggml_sycl_fattn_sparse_max_alloc_size(sv, cells));
+    return size;
 }
