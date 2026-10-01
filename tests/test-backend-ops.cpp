@@ -5192,6 +5192,21 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
     init_mul_mat_id_ids(ctx, n_mats);
 }
 
+// src1 precision request [TAG_GGML_PREC] on MUL_MAT
+struct test_mul_mat_prec : public test_mul_mat {
+    const ggml_prec prec;
+    std::string vars() override {
+        return test_mul_mat::vars() + ",prec=" + std::to_string(prec);
+    }
+    test_mul_mat_prec(ggml_type type_a, ggml_prec prec, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}), prec(prec) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat::build_graph(ctx);
+        ggml_prec_set_src(out, prec, 1);
+        return out;
+    }
+};
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -5268,6 +5283,21 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// src1 precision request [TAG_GGML_PREC] on MUL_MAT_ID
+struct test_mul_mat_id_prec : public test_mul_mat_id {
+    const ggml_prec prec;
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",prec=" + std::to_string(prec);
+    }
+    test_mul_mat_id_prec(ggml_type type_a, ggml_prec prec, int64_t m, int64_t n, int64_t k, float amax = 1.0f)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, m, n, k, amax), prec(prec) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_mul_mat_id::build_graph(ctx);
+        ggml_prec_set_src(out, prec, 1);
+        return out;
     }
 };
 
@@ -10355,6 +10385,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : {16, 32, 64}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 128, 4, false, 4096, n, 2048, 1e5f));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8,   2, false, 512,  n, 256,  1e5f));
+    }
+
+    // src1 precision requests below F32
+    for (ggml_type type_a : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ3_S}) {
+        test_cases.emplace_back(new test_mul_mat_id_prec(type_a, GGML_PREC_BF16, 768, 64, 2048));
+        test_cases.emplace_back(new test_mul_mat_id_prec(type_a, GGML_PREC_BF16, 768, 64, 2048, 1e5f));
+        test_cases.emplace_back(new test_mul_mat_id_prec(type_a, GGML_PREC_F16, 768, 64, 2048));
+        test_cases.emplace_back(new test_mul_mat_prec(type_a, GGML_PREC_BF16, 2048, 33, 768));
+        test_cases.emplace_back(new test_mul_mat_prec(type_a, GGML_PREC_F16, 2048, 33, 768));
     }
 
     for (ggml_type type_a : base_types) {
