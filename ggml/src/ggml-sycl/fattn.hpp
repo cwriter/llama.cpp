@@ -40,12 +40,17 @@ ggml_sycl_fattn_extra ggml_sycl_fattn_get_extra(const ggml_tensor * dst);
 
 size_t ggml_sycl_flash_attn_ext_get_alloc_size(const ggml_tensor * dst);
 
+// Upper bound of ggml_sycl_flash_attn_ext_get_alloc_size() for this node in any later graph of the
+// same topology: a smaller batch, or a KV view up to the whole cache.
+size_t ggml_sycl_flash_attn_ext_get_max_alloc_size(const ggml_tensor * dst);
+
 // True when GGML_SYCL_FA_MAX_MEM_MIB rejects the whole-cache F16 staging that oneDNN and TILE
-// need, so the chunked oneMKL kernel takes the node instead and nothing has to be reserved.
+// need, so the node never stages the whole cache: the chunked oneMKL kernel takes it, except a
+// short context or a short batch that stages within the sparse path's budget (TILE).
 bool ggml_sycl_fattn_stage_capped(const ggml_tensor * dst);
 
-// True when the dispatcher gives this node to the chunked oneMKL kernel. Only that kernel can
-// take a selection bitmap, so the QSA mask fusion asks here before it declines.
+// True when the dispatcher gives this prefill node (32+ rows) to the chunked oneMKL kernel. Only that
+// kernel can take a selection bitmap, so the QSA mask fusion asks here before it declines.
 bool ggml_sycl_fattn_picks_mkl(const ggml_tensor * dst);
 // The shape envelope of that kernel alone, whichever kernel the dispatcher would pick.
 bool ggml_sycl_fattn_mkl_shape_ok(const ggml_tensor * dst);

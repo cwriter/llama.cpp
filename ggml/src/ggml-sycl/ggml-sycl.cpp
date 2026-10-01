@@ -1679,6 +1679,15 @@ static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_t
     return ggml_sycl_kq_mask_alloc_size(buft_ctx->device, tensor, size);
 }
 
+// only flash attention reports scratch that depends on the batch and the KV length
+static size_t ggml_backend_sycl_buffer_type_get_max_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    const size_t size = ggml_backend_sycl_buffer_type_get_alloc_size(buft, tensor);
+    if (tensor->op != GGML_OP_FLASH_ATTN_EXT) {
+        return size;
+    }
+    return std::max(size, ggml_sycl_flash_attn_ext_get_max_alloc_size(tensor));
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface = {
     /* .get_name            = */ ggml_backend_sycl_buffer_type_get_name,
     /* .alloc_buffer        = */ ggml_backend_sycl_buffer_type_alloc_buffer,
@@ -1687,7 +1696,7 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface 
     /* .get_max_size        = */ ggml_backend_sycl_buffer_type_get_max_size,
     /* .get_alloc_size      = */ ggml_backend_sycl_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
-    /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+    /* .get_max_alloc_size  = */ ggml_backend_sycl_buffer_type_get_max_alloc_size,
     /* .is_host             = */ NULL,
 };
 

@@ -221,6 +221,12 @@ static void sparse_fa_gather_mask(sycl::queue * stream,
         });
 }
 
+// cells the sparse path gathers for n_rows queries over n_kv cells
+static int64_t sparse_fa_cells(const ggml_tensor * dst, int64_t n_rows, int64_t n_kv) {
+    const int64_t n_sel = std::min<int64_t>(n_kv, n_rows * (int64_t) ggml_get_op_params_i32(dst, 4));
+    return GGML_PAD(n_sel + sparse_fa_margin(), SPARSE_FA_PAD);
+}
+
 static bool sparse_fa_applicable(const ggml_tensor * dst, int64_t & n_kv_g_out) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -279,14 +285,109 @@ static bool sparse_fa_applicable(const ggml_tensor * dst, int64_t & n_kv_g_out) 
     }
 
     // every row sees at most n_kv_max cells, so the union of the rows is bounded by their sum
-    const int64_t n_sel  = std::min<int64_t>(K->ne[1], Q->ne[1] * (int64_t) n_kv_max);
-    const int64_t n_kv_g = GGML_PAD(n_sel + sparse_fa_margin(), SPARSE_FA_PAD);
+    const int64_t n_kv_g = sparse_fa_cells(dst, Q->ne[1], K->ne[1]);
     if (n_kv_g * SPARSE_FA_MIN_RATIO > K->ne[1]) {
         return false;
     }
 
     n_kv_g_out = n_kv_g;
     return true;
+}
+
+// The node handed back to the dense kernels: shallow copies retargeted at the gathered buffers,
+// which are plain canonical tensors (no view, no layout marker). Built in place, as dst points at K/V/M.
+struct sparse_fa_node {
+    ggml_tensor K, V, M, dst;
+
+    sparse_fa_node(const ggml_tensor * node, int64_t n_kv_g, void * K_data, void * V_data, void * M_data) {
+        const ggml_tensor * K0 = node->src[1];
+        const ggml_tensor * V0 = node->src[2];
+        const ggml_tensor * M0 = node->src[3];
+
+        const size_t k_row = ggml_row_size(K0->type, K0->ne[0]);
+        const size_t v_row = ggml_row_size(V0->type, V0->ne[0]);
+
+        K           = *K0;
+        K.data      = K_data;
+        K.ne[1]     = n_kv_g;
+        K.nb[1]     = k_row;
+        K.nb[2]     = (size_t) n_kv_g * k_row;
+        K.nb[3]     = (size_t) K0->ne[2] * n_kv_g * k_row;
+        K.view_src  = nullptr;
+        K.view_offs = 0;
+        K.extra     = nullptr;
+
+        V           = *V0;
+        V.data      = V_data;
+        V.ne[1]     = n_kv_g;
+        V.nb[1]     = v_row;
+        V.nb[2]     = (size_t) n_kv_g * v_row;
+        V.nb[3]     = (size_t) V0->ne[2] * n_kv_g * v_row;
+        V.view_src  = nullptr;
+        V.view_offs = 0;
+        V.extra     = nullptr;
+
+        M           = *M0;
+        M.data      = M_data;
+        M.ne[0]     = n_kv_g;
+        M.nb[1]     = (size_t) n_kv_g * sizeof(sycl::half);
+        M.nb[2]     = M.nb[1] * M0->ne[1];
+        M.nb[3]     = M.nb[2];
+        M.view_src  = nullptr;
+        M.view_offs = 0;
+        M.extra     = nullptr;
+
+        dst        = *node;
+        dst.src[1] = &K;
+        dst.src[2] = &V;
+        dst.src[3] = &M;
+        // not re-entering this path; the live cells come first, so the kernel may stop at the last one
+        dst.op_params[4] = GGML_SYCL_FATTN_GATHERED;
+    }
+};
+
+bool ggml_sycl_fattn_sparse_applies(const ggml_tensor * dst) {
+    int64_t n_kv_g = 0;
+    return sparse_fa_enabled() && sparse_fa_applicable(dst, n_kv_g);
+}
+
+size_t ggml_sycl_fattn_sparse_alloc_size(const ggml_tensor * dst) {
+    int64_t n_kv_g = 0;
+    if (!sparse_fa_enabled() || !sparse_fa_applicable(dst, n_kv_g)) {
+        return 0;
+    }
+    const sparse_fa_node g(dst, n_kv_g, nullptr, nullptr, nullptr);
+    return ggml_sycl_flash_attn_ext_get_alloc_size(&g.dst);
+}
+
+size_t ggml_sycl_fattn_sparse_max_alloc_size(const ggml_tensor * dst, int64_t n_kv) {
+    if (!sparse_fa_enabled()) {
+        return 0;
+    }
+    // the same node over n_kv cells, at the most rows the path takes there
+    ggml_tensor Q = *dst->src[0];
+    ggml_tensor K = *dst->src[1];
+    ggml_tensor V = *dst->src[2];
+    ggml_tensor M = *dst->src[3];
+    ggml_tensor d = *dst;
+    d.src[0] = &Q;
+    d.src[1] = &K;
+    d.src[2] = &V;
+    d.src[3] = &M;
+    K.ne[1] = n_kv;
+    V.ne[1] = n_kv;
+    M.ne[0] = std::max(M.ne[0], n_kv);
+    for (int64_t n_rows = SPARSE_FA_MAX_ROWS; n_rows > 0; --n_rows) {
+        Q.ne[1] = n_rows;
+        M.ne[1] = std::max(dst->src[3]->ne[1], n_rows);
+        d.ne[2] = n_rows;
+        int64_t n_kv_g = 0;
+        if (sparse_fa_applicable(&d, n_kv_g)) {
+            const sparse_fa_node g(&d, n_kv_g, nullptr, nullptr, nullptr);
+            return ggml_sycl_flash_attn_ext_get_alloc_size(&g.dst);
+        }
+    }
+    return 0;
 }
 
 bool ggml_sycl_flash_attn_ext_sparse(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
@@ -360,46 +461,8 @@ bool ggml_sycl_flash_attn_ext_sparse(ggml_backend_sycl_context & ctx, ggml_tenso
                 h_cnt > (int32_t) n_kv_g ? "  OVERFLOW" : "");
     }
 
-    // shallow copies retargeted at the gathered buffers; kernels are unchanged. The gathered
-    // K/V are plain canonical tensors: no view, no layout marker.
-    ggml_tensor K_g = *K;
-    K_g.data      = d_K;
-    K_g.ne[1]     = n_kv_g;
-    K_g.nb[1]     = k_row;
-    K_g.nb[2]     = (size_t) n_kv_g * k_row;
-    K_g.nb[3]     = (size_t) n_head_k * n_kv_g * k_row;
-    K_g.view_src  = nullptr;
-    K_g.view_offs = 0;
-    K_g.extra     = nullptr;
-
-    ggml_tensor V_g = *V;
-    V_g.data      = d_V;
-    V_g.ne[1]     = n_kv_g;
-    V_g.nb[1]     = v_row;
-    V_g.nb[2]     = (size_t) n_kv_g * v_row;
-    V_g.nb[3]     = (size_t) V->ne[2] * n_kv_g * v_row;
-    V_g.view_src  = nullptr;
-    V_g.view_offs = 0;
-    V_g.extra     = nullptr;
-
-    ggml_tensor M_g = *mask;
-    M_g.data      = d_mask;
-    M_g.ne[0]     = n_kv_g;
-    M_g.nb[1]     = (size_t) n_kv_g * sizeof(sycl::half);
-    M_g.nb[2]     = M_g.nb[1] * mask->ne[1];
-    M_g.nb[3]     = M_g.nb[2];
-    M_g.view_src  = nullptr;
-    M_g.view_offs = 0;
-    M_g.extra     = nullptr;
-
-    ggml_tensor dst_g = *dst;
-    dst_g.src[1] = &K_g;
-    dst_g.src[2] = &V_g;
-    dst_g.src[3] = &M_g;
-    // not re-entering this path; the live cells come first, so the kernel may stop at the last one
-    dst_g.op_params[4] = GGML_SYCL_FATTN_GATHERED;
-
-    ggml_sycl_flash_attn_ext(ctx, &dst_g);
+    sparse_fa_node g(dst, n_kv_g, d_K, d_V, d_mask);
+    ggml_sycl_flash_attn_ext(ctx, &g.dst);
 
     return true;
 }
