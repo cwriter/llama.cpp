@@ -419,6 +419,7 @@ ggml_backend_buffer_type_t ggml_backend_zdnn_buffer_type(void) {
             /* .get_alignment  = */ ggml_backend_zdnn_buffer_type_get_alignment,
             /* .get_max_size   = */ NULL,
             /* .get_alloc_size = */ NULL,  // defaults to ggml_nbytes
+            /* .get_max_alloc_size = */ NULL, // defaults to get_alloc_size
             /* .is_host        = */ ggml_backend_zdnn_buffer_type_is_host,
         },
         /* .device  = */ &g_ggml_backend_zdnn_device,

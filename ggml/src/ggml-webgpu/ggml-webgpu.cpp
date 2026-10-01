@@ -4330,6 +4330,7 @@ static ggml_backend_buffer_type_t ggml_backend_webgpu_device_get_buffer_type(ggm
                         /* .get_alignment  = */ ggml_backend_webgpu_buffer_type_get_alignment,
                         /* .get_max_size   = */ ggml_backend_webgpu_buffer_type_get_max_size,
                         /* .get_alloc_size = */ ggml_backend_webgpu_buffer_type_get_alloc_size,
+                        /* .get_max_alloc_size = */ NULL, // defaults to get_alloc_size
                         /* .is_host        = */ NULL,  // defaults to false
         },
         /* .device  = */
