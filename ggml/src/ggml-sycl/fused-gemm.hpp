@@ -15,12 +15,14 @@ struct ggml_sycl_gg_rows {
 
 // Shape and type gates, shared by the kernels below and by the graph compatibility check, so
 // the two cannot drift. Device capability is separate: it needs a queue to ask.
+// GGML_SYCL_FG_BN is the tile width of the device-built MUL_MAT_ID schedule; only XMX combinations
+// whose tile is that wide take the device-scheduled path.
 static constexpr int      GGML_SYCL_FG_BN      = 32;              // B columns of one output tile
-static constexpr int      GGML_SYCL_FG_MAX_N   = 2 * GGML_SYCL_FG_BN;
+static constexpr int      GGML_SYCL_FG_MAX_N   = 64;              // widest N taken; each shape covers it in BN-wide tiles
 static constexpr int64_t  GGML_SYCL_SK_MAX_MNK = 256 * 256 * 256;
 
 // weight formats the fused A stage decodes; K must cover whole stored blocks
-constexpr bool ggml_sycl_fused_dequant_gemm_f16_type_ok(ggml_type src0_type, int64_t K) {
+constexpr bool ggml_sycl_fused_dequant_gemm_type_ok(ggml_type src0_type, int64_t K) {
     // iq4_nl and q8_0 store 32 values per block, which is exactly one A-stage k step; every
     // other format here is a 256-value superblock the A stage walks in steps of 32, so K must
     // cover whole superblocks.
@@ -58,9 +60,7 @@ inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
         case GGML_TYPE_IQ1_S:   return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ1_S   ) != 0;
         case GGML_TYPE_IQ1_M:   return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_IQ1_M   ) != 0;
         case GGML_TYPE_Q8_0:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q8_0    ) != 0;
-        // q4_K only under GGML_SYCL_FAST_AND_SLOPPY: see the flag's comment in common.hpp.
-        case GGML_TYPE_Q4_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q4_K    ) != 0 &&
-                                       g_ggml_sycl_fast_and_sloppy != 0;
+        case GGML_TYPE_Q4_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q4_K    ) != 0;
         case GGML_TYPE_Q5_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q5_K    ) != 0;
         case GGML_TYPE_Q6_K:    return (g_ggml_sycl_xmx_gather_types & GGML_SYCL_XMX_GATHER_Q6_K    ) != 0;
         default:          return false;
@@ -76,15 +76,15 @@ inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
 // without an entry here the gather bit alone would buy nothing, because every launch would
 // decline on `reordered && !reorder_ok`. q8_0 is reordered only when GGML_SYCL_REORDER_Q8_0 is
 // set (off by default), so it must be listed too or it would lose coverage the moment it is.
-constexpr bool ggml_sycl_fused_dequant_gemm_f16_reorder_ok(ggml_type src0_type) {
+constexpr bool ggml_sycl_fused_dequant_gemm_reorder_ok(ggml_type src0_type) {
     return src0_type == GGML_TYPE_IQ3_S || src0_type == GGML_TYPE_IQ4_NL ||
            src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_Q4_K ||
            src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K;
 }
 
-constexpr bool ggml_sycl_fused_dequant_gemm_f16_shape_ok(ggml_type src0_type, int64_t M, int64_t N, int64_t K,
-                                                         int64_t ldd) {
-    return ggml_sycl_fused_dequant_gemm_f16_type_ok(src0_type, K) && M > 0 && N > 0 && K > 0 &&
+constexpr bool ggml_sycl_fused_dequant_gemm_shape_ok(ggml_type src0_type, int64_t M, int64_t N, int64_t K,
+                                                     int64_t ldd) {
+    return ggml_sycl_fused_dequant_gemm_type_ok(src0_type, K) && M > 0 && N > 0 && K > 0 &&
            N <= GGML_SYCL_FG_MAX_N &&
            M <= INT32_MAX && N <= INT32_MAX && K <= INT32_MAX && ldd <= INT32_MAX;
 }
@@ -95,9 +95,9 @@ constexpr bool ggml_sycl_small_gemm_f32_shape_ok(int64_t M, int64_t N, int64_t K
 }
 
 // grouped variant, routing-independent half: type, weight geometry and row count
-constexpr bool ggml_sycl_grouped_dequant_gemm_f16_shape_ok(ggml_type src0_type, int64_t M, int64_t K,
-                                                           int64_t total_rows) {
-    return ggml_sycl_fused_dequant_gemm_f16_shape_ok(src0_type, M, 1, K, M) && total_rows > 0 &&
+constexpr bool ggml_sycl_grouped_dequant_gemm_shape_ok(ggml_type src0_type, int64_t M, int64_t K,
+                                                       int64_t total_rows) {
+    return ggml_sycl_fused_dequant_gemm_shape_ok(src0_type, M, 1, K, M) && total_rows > 0 &&
            total_rows <= INT32_MAX;
 }
 
@@ -105,7 +105,7 @@ constexpr bool ggml_sycl_grouped_dequant_gemm_f16_shape_ok(ggml_type src0_type, 
 // average slices are left to the per-expert library GEMM loop. This is the one clause that reads
 // the routing, so it is a pure performance heuristic: a caller that cannot count the active
 // experts (the schedule lives on the device) passes the bound min(n_as, total_rows) instead.
-constexpr bool ggml_sycl_grouped_dequant_gemm_f16_width_ok(int64_t total_rows, int64_t n_active) {
+constexpr bool ggml_sycl_grouped_dequant_gemm_width_ok(int64_t total_rows, int64_t n_active) {
     return total_rows <= n_active * GGML_SYCL_FG_MAX_N;
 }
 
@@ -127,29 +127,29 @@ constexpr int64_t ggml_sycl_grouped_gemm_max_tiles(int64_t total_rows, int64_t n
     return bound < total_rows ? bound : total_rows;
 }
 
-// True if the device can run the kernel at all; cached, so it is cheap to ask per node.
-bool ggml_sycl_fused_dequant_gemm_f16_device_ok(dpct::queue_ptr stream);
 bool ggml_sycl_small_gemm_f32_device_ok(dpct::queue_ptr stream);
 
-// dst[n*ldd + m] = sum_k dequant(src0)[m*K + k] * src1_f16[n*K + k]
-// Returns false when the case is not handled (type, device, or shape).
+// dst[n*ldd + m] = sum_k dequant(src0)[m*K + k] * src1[n*K + k], src1 is F32, F16 or BF16.
+// The XMX combination is picked per call from the src1 type and its precision request src1_prec
+// (op_params[3], [TAG_GGML_PREC]); the accumulator is f32, which meets any request.
 // `reordered` says src0 is in the reorder (SoA) layout; src0 must then be the base of the whole
 // reordered region, because the SoA offsets are relative to it.
-bool ggml_sycl_fused_dequant_gemm_f16(ggml_type src0_type, const void * src0, const sycl::half * src1_f16, float * dst,
-                                      int64_t M, int64_t N, int64_t K, int64_t ldd, bool reordered,
-                                      ggml_sycl_pool & pool, dpct::queue_ptr stream);
+// Returns false when the case is not handled (type, layout, device, precision, or shape).
+bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,
+                                  int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
+                                  bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
 // One launch for every expert of a MUL_MAT_ID: rows of src1/dst are grouped by expert, expert e
 // owns rows [expert_row_offsets[e], expert_row_offsets[e+1]) and reads its weights at
 // src0_base + e*expert_stride. tiles is host scratch that must stay alive until the queue drains.
 // dst[n*M + m] = sum_k dequant(src0_e)[m*K + k] * src1[n*K + k]
-// Returns false when the case is not handled (type, device, or shape).
 // `reordered` says every expert slice is in the reorder (SoA) layout, reordered per slice.
-bool ggml_sycl_grouped_dequant_gemm_f16(ggml_type src0_type, const void * src0_base, size_t expert_stride,
-                                        const float * src1, float * dst, const int64_t * expert_row_offsets,
-                                        int64_t n_as, int64_t M, int64_t K, int64_t total_rows, bool reordered,
-                                        std::vector<ggml_sycl_gg_tile> & tiles, ggml_sycl_pool & pool,
-                                        dpct::queue_ptr stream);
+// Returns false when the case is not handled (type, layout, device, precision, or shape).
+bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, const void * src0_base, size_t expert_stride,
+                                    const float * src1, int32_t src1_prec, float * dst,
+                                    const int64_t * expert_row_offsets, int64_t n_as, int64_t M, int64_t K,
+                                    int64_t total_rows, bool reordered, std::vector<ggml_sycl_gg_tile> & tiles,
+                                    ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
 // Largest expert count the device schedule kernel can hold in shared local memory.
 static constexpr int64_t GGML_SYCL_MMID_SCHED_MAX_EXPERTS = 4096;
@@ -169,19 +169,19 @@ bool ggml_sycl_build_mmid_schedule(const int32_t * ids_dev, size_t ids_token_str
 // Host-side half of the gate for the device-scheduled arm: everything the caller can decide
 // without reading the routing. n_active is not knowable here, so the width heuristic is asked
 // with its host bound min(n_as, total_rows).
-bool ggml_sycl_grouped_dequant_gemm_f16_dev_ok(ggml_type src0_type, int64_t M, int64_t K, int64_t total_rows,
-                                               int64_t n_as, bool reordered, dpct::queue_ptr stream);
+bool ggml_sycl_grouped_dequant_gemm_dev_ok(ggml_type src0_type, int64_t M, int64_t K, int64_t total_rows,
+                                           int64_t n_as, bool reordered, int32_t src1_prec, dpct::queue_ptr stream);
 
 // Grouped GEMM fed by a device-built tile table. The schedule is not on the host, so the launch is
 // bounded by n_tiles_max and the empty tiles exit early.
 // Npad is derived from n_tiles_max ONCE here and is the packed-B column stride for both the pack
 // and the GEMM; the two must never be given different values.
 // src1 is read and dst written through their row maps, so the caller stages no expert-major copies.
-bool ggml_sycl_grouped_dequant_gemm_f16_dev(ggml_type src0_type, const void * src0_base, size_t expert_stride,
-                                            const ggml_sycl_gg_rows & src1, const ggml_sycl_gg_rows & dst,
-                                            const ggml_sycl_gg_tile * tiles_dev,
-                                            int64_t n_tiles_max, int64_t M, int64_t K, int64_t total_rows,
-                                            bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream);
+bool ggml_sycl_grouped_dequant_gemm_dev(ggml_type src0_type, const void * src0_base, size_t expert_stride,
+                                        const ggml_sycl_gg_rows & src1, int32_t src1_prec, const ggml_sycl_gg_rows & dst,
+                                        const ggml_sycl_gg_tile * tiles_dev,
+                                        int64_t n_tiles_max, int64_t M, int64_t K, int64_t total_rows,
+                                        bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
 // dst[n*ldd + m] = sum_k a[m*lda + k] * b[n*K + k], split-K for small M*N with long K
 // Returns false when the case is not handled (shape too large or device too small).

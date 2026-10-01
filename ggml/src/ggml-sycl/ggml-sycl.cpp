@@ -14,6 +14,7 @@
 #include <array>
 #include <assert.h>
 #include <atomic>
+#include <cctype>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
@@ -145,6 +146,29 @@ int g_ggml_sycl_topk_moe_radix = 1;
 // bitmask of ggml_sycl_reorder_type; see GGML_SYCL_REORDER_DEFAULT in common.hpp
 int g_ggml_sycl_reorder_types = GGML_SYCL_REORDER_DEFAULT;
 int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
+int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
+int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
+int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
+static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
+
+// value of a GGML_SYCL_DYNAMIC_PRECISION-style variable; def if unset or invalid
+static int ggml_sycl_get_env_precision(const char * name, int def) {
+    const char * env = getenv(name);
+    if (!env) {
+        return def;
+    }
+    std::string mode(env);
+    for (char & c : mode) {
+        c = (char) std::toupper((unsigned char) c);
+    }
+    for (int i = GGML_SYCL_DYNAMIC_PRECISION_F16; i <= GGML_SYCL_DYNAMIC_PRECISION_F32; i++) {
+        if (mode == ggml_sycl_dynamic_precision_names[i]) {
+            return i;
+        }
+    }
+    GGML_LOG_WARN("%s: unknown %s=%s, using %s\n", __func__, name, env, ggml_sycl_dynamic_precision_names[def]);
+    return def;
+}
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_use_async_mem_op_requested = 1;
 int g_ggml_sycl_use_level_zero_api = 0;
@@ -162,7 +186,6 @@ int g_ggml_sycl_kq_mask_bits = GGML_SYCL_KQ_MASK_DEFAULT;
 int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_mem_save = GGML_SYCL_MEM_SAVE_DEFAULT;
 size_t g_ggml_sycl_reorder_chunk_bytes = 32ull << 20;
-int g_ggml_sycl_fast_and_sloppy = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
 int g_ggml_sycl_get_mem_api = MEMORY_API_TYPE_LEVEL_ZERO;
@@ -489,6 +512,11 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_topk_moe_radix = ggml_sycl_get_env("GGML_SYCL_TOPK_MOE_RADIX", 1);
         g_ggml_sycl_reorder_types = ggml_sycl_get_env("GGML_SYCL_REORDER_TYPES", GGML_SYCL_REORDER_DEFAULT);
         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
+        g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
+        g_ggml_sycl_dynamic_precision =
+            ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
+        g_ggml_sycl_dynamic_required_precision =
+            ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_REQUIRED_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_F32);
 
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
         g_ggml_sycl_use_level_zero_api = ggml_sycl_get_env("GGML_SYCL_USE_LEVEL_ZERO_API", 1);
@@ -523,7 +551,6 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_usm_system = ggml_sycl_get_env("GGML_SYCL_USM_SYSTEM", 0);
         g_ggml_sycl_mem_save = ggml_sycl_get_env("GGML_SYCL_MEM_SAVE", GGML_SYCL_MEM_SAVE_DEFAULT);
         g_ggml_sycl_reorder_chunk_bytes = (size_t) std::max(1, ggml_sycl_get_env("GGML_SYCL_REORDER_CHUNK_KIB", 32 * 1024)) << 10;
-        g_ggml_sycl_fast_and_sloppy = ggml_sycl_get_env("GGML_SYCL_FAST_AND_SLOPPY", 0);
         g_ggml_sycl_enable_host_pinned_mem =
             ggml_sycl_get_env("GGML_SYCL_ENABLE_HOST_PINNED_MEM", 1);
 
@@ -664,6 +691,11 @@ static void ggml_check_sycl() try {
                       (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0)   != 0);
         GGML_LOG_INFO("  GGML_SYCL_FA_MAX_MEM_MIB: %d\n", g_ggml_sycl_fa_max_mem_mib);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
+        GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
+        GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_PRECISION: %s\n",
+                      ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_precision]);
+        GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_REQUIRED_PRECISION: %s\n",
+                      ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_required_precision]);
 
 #if defined(GGML_SYCL_SUPPORT_VMM)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_VMM: %d\n", g_ggml_sycl_enable_vmm);
@@ -696,7 +728,6 @@ static void ggml_check_sycl() try {
                       (g_ggml_sycl_usm_system & GGML_SYCL_USM_SYSTEM_ALLOC)          != 0,
                       (g_ggml_sycl_usm_system & GGML_SYCL_USM_SYSTEM_MAPPED_WEIGHTS) != 0);
         GGML_LOG_INFO("  GGML_SYCL_MEM_SAVE: 0x%x\n", g_ggml_sycl_mem_save);
-        GGML_LOG_INFO("  GGML_SYCL_FAST_AND_SLOPPY: %d\n", g_ggml_sycl_fast_and_sloppy);
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_HOST_PINNED_MEM: %d\n", g_ggml_sycl_enable_host_pinned_mem);
         GGML_LOG_INFO("  GGML_SYCL_HOST_PINNED_MEM_2G: %d\n", g_ggml_sycl_host_pinned_mem_2g);
 
@@ -3651,6 +3682,23 @@ inline void ggml_sycl_op_mul_mat_sycl(
     }
 #endif
 
+    // dequantize inside the GEMM instead of writing the f16 weights out and reading them back; src1
+    // goes in its own type, so there is no separate conversion pass
+    if (g_ggml_sycl_fused_gemm && ggml_is_quantized(src0->type) && ggml_is_contiguous(src0) && row_diff == src0->ne[1]) {
+        // the reorder (SoA) offsets are relative to the start of the reordered region, so the
+        // fused GEMM only runs on a reordered weight when it gets that base pointer
+        const auto * src0_extra_fg  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        const bool   src0_reordered = src0_extra_fg && src0_extra_fg->optimized_feature.is_reordered();
+        if ((!src0_reordered || src0_dd_i == (const char *) src0->data) &&
+            ggml_sycl_fused_dequant_gemm(src0->type, src0_dd_i, src1_ddf_i, src1->type, ggml_sycl_src1_prec(dst),
+                                         dst_dd_i, row_diff, src1_ncols, ne10, ldc, src0_reordered, ctx.pool(),
+                                         stream)) {
+            return;
+        }
+    }
+
+    // the f16 route converts src1 to f16 [TAG_GGML_PREC]
+    use_fp16 = use_fp16 && ggml_sycl_src1_f16_ok(dst);
     if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && use_fp16 && ggml_is_contiguous(src0) &&
         row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         ggml_sycl_pool_alloc<sycl::half> src1_as_f16(ctx.pool());
@@ -3666,19 +3714,6 @@ inline void ggml_sycl_op_mul_mat_sycl(
         const sycl::half *src1_ptr = src1->type == GGML_TYPE_F16
                 ? (const sycl::half *)src1->data + src1_padded_row_size
                                          : src1_as_f16.get();
-
-        // the reorder (SoA) offsets are relative to the start of the reordered region, so the
-        // fused GEMM only runs on a reordered weight when it gets that base pointer
-        const auto * src0_extra_fg  = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-        const bool   src0_reordered = src0_extra_fg && src0_extra_fg->optimized_feature.is_reordered();
-        const bool   fused_gemm_ok  = !src0_reordered || src0_dd_i == (const char *) src0->data;
-
-        // dequantize inside the GEMM instead of writing the f16 weights out and reading them back
-        if (g_ggml_sycl_fused_gemm && fused_gemm_ok && src0->type != GGML_TYPE_F16 &&
-            ggml_sycl_fused_dequant_gemm_f16(src0->type, src0_dd_i, src1_ptr, dst_dd_i, row_diff, src1_ncols, ne10, ldc,
-                                             src0_reordered, ctx.pool(), stream)) {
-            return;
-        }
 
         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
         if (src0->type != GGML_TYPE_F16) {
@@ -5862,6 +5897,10 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     // check data types and tensor shapes for custom matrix multiplication kernels:
     bool use_dequantize_mul_mat_vec = can_use_dequantize_mul_mat_vec(src0, src1, dst);
+#ifdef GGML_SYCL_F16
+    // dmmv may convert src1 to f16 in this build [TAG_GGML_PREC]
+    use_dequantize_mul_mat_vec = use_dequantize_mul_mat_vec && ggml_sycl_src1_f16_ok(dst);
+#endif
 
     bool use_mul_mat_vec_q = can_use_mul_mat_vec_q(src0, src1, dst);
 
@@ -6357,17 +6396,17 @@ static bool ggml_sycl_mul_mat_id_device_sched(ggml_sycl_pool & pool, queue_ptr s
     if (!ggml_is_contiguous(src0) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return false;
     }
-    if (dst->op_params[0] != GGML_PREC_DEFAULT) {
-        return false;
-    }
+    // the XMX paths accumulate in f32, which meets any accumulator request
     if (nb11 != sizeof(float) * ne10 || nb1 != sizeof(float) * ne0) {
         return false;
     }
 
-    const auto * extra     = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
-    const bool   reordered = extra && extra->optimized_feature.is_reordered();
+    const auto *  extra     = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    const bool    reordered = extra && extra->optimized_feature.is_reordered();
+    const int32_t src1_prec = ggml_sycl_src1_prec(dst);
 
-    if (!ggml_sycl_grouped_dequant_gemm_f16_dev_ok(src0->type, ne01, ne10, n_routed_rows, n_as, reordered, stream)) {
+    if (!ggml_sycl_grouped_dequant_gemm_dev_ok(src0->type, ne01, ne10, n_routed_rows, n_as, reordered, src1_prec,
+                                               stream)) {
         return false;
     }
 
@@ -6388,8 +6427,8 @@ static bool ggml_sycl_mul_mat_id_device_sched(ggml_sycl_pool & pool, queue_ptr s
     const ggml_sycl_gg_rows dst_rows  = { (char *) dst->data, row_mapping.get(), dst->ne[1], nb1, nb2 };
 
     // the type and device gates above are the whole decision, so this cannot decline here
-    const bool launched = ggml_sycl_grouped_dequant_gemm_f16_dev(
-        src0->type, src0->data, nb02, src1_rows, dst_rows,
+    const bool launched = ggml_sycl_grouped_dequant_gemm_dev(
+        src0->type, src0->data, nb02, src1_rows, src1_prec, dst_rows,
         tiles.get(), n_tiles_max, ne01, ne10, n_routed_rows, reordered, pool, stream);
     GGML_ASSERT(launched && "device-scheduled grouped GEMM declined after its gate passed");
     return true;
@@ -6592,8 +6631,8 @@ static void ggml_sycl_mul_mat_id_host_sched(ggml_backend_sycl_context & ctx,
         // The reorder is applied lazily and only the mat-vec path triggers it, so a prefill
         // that runs before any decode always saw unreordered weights. Trigger it here too,
         // but only for a type the grouped kernel can consume reordered: for any other type a
-        // reordered tensor makes ggml_sycl_grouped_dequant_gemm_f16() decline the launch.
-        if (ggml_sycl_fused_dequant_gemm_f16_reorder_ok(src0->type)) {
+        // reordered tensor makes ggml_sycl_grouped_dequant_gemm() decline the launch.
+        if (ggml_sycl_fused_dequant_gemm_reorder_ok(src0->type)) {
             opt_for_reorder_id(&ctx, src0);
         }
 
@@ -6604,13 +6643,13 @@ static void ggml_sycl_mul_mat_id_host_sched(ggml_backend_sycl_context & ctx,
 
         bool grouped = false;
         if (g_ggml_sycl_grouped_gemm && ggml_is_contiguous(src0) && src1->type == GGML_TYPE_F32 &&
-            dst->type == GGML_TYPE_F32 && dst->op_params[0] == GGML_PREC_DEFAULT &&
-            nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
-            grouped = ggml_sycl_grouped_dequant_gemm_f16(src0->type, src0_original, nb02,
-                                                         (const float *) src1_contiguous.get(), (float *) dst_contiguous.get(),
-                                                         expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
-                                                         src0_reordered_gg,
-                                                         ctx.mmid_tile_schedule_host, ctx.pool(), stream);
+            dst->type == GGML_TYPE_F32 && nb11 == sizeof(float)*ne10 && nb1 == sizeof(float)*ne0) {
+            grouped = ggml_sycl_grouped_dequant_gemm(src0->type, src0_original, nb02,
+                                                     (const float *) src1_contiguous.get(), ggml_sycl_src1_prec(dst),
+                                                     (float *) dst_contiguous.get(),
+                                                     expert_row_offsets.data(), n_as, ne01, ne10, n_routed_rows,
+                                                     src0_reordered_gg,
+                                                     ctx.mmid_tile_schedule_host, ctx.pool(), stream);
         }
 
         for (int64_t i02 = 0; i02 < n_as && !grouped; i02++) {
@@ -6709,7 +6748,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx, ggml_tensor * 
     // The reorder is lazy and the host path triggers it for itself. Do it here too, or the device
     // arm decodes the canonical layout while the host arm decodes the SoA one: same values, but a
     // different A stage, so the two arms stop agreeing to the last bit.
-    if (ggml_sycl_fused_dequant_gemm_f16_reorder_ok(dst->src[0]->type)) {
+    if (ggml_sycl_fused_dequant_gemm_reorder_ok(dst->src[0]->type)) {
         opt_for_reorder_id(&ctx, dst->src[0]);
     }
 
