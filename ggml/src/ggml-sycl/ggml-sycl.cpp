@@ -132,13 +132,8 @@ int g_ggml_sycl_fused_gemm = 1;
 int g_ggml_sycl_grouped_gemm = 1;
 int g_ggml_sycl_mmid_sched = 0;
 int g_ggml_sycl_wide_loads = GGML_SYCL_WIDE_LOADS_DEFAULT;
-int g_ggml_sycl_fuse_cast_add = 1;
-int g_ggml_sycl_fuse_cont_add = 0;
-int g_ggml_sycl_fuse_qsa_gather = 1;
-int g_ggml_sycl_fuse_qsa_topk = 1;
 int g_ggml_sycl_fuse_qsa_score = 1;
-int g_ggml_sycl_fuse_qsa_mask = 0;
-int g_ggml_sycl_fuse_qsa_fa_mask = 3;
+int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_qsa_fa_no_readback = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
@@ -499,13 +494,8 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fused_gemm = ggml_sycl_get_env("GGML_SYCL_FUSED_GEMM", 1);
         g_ggml_sycl_grouped_gemm = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM", 1);
         g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", 0);
-        g_ggml_sycl_fuse_cast_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CAST_ADD", 1);
-        g_ggml_sycl_fuse_cont_add = ggml_sycl_get_env("GGML_SYCL_FUSE_CONT_ADD", 0);
-        g_ggml_sycl_fuse_qsa_gather = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_GATHER", 1);
-        g_ggml_sycl_fuse_qsa_topk = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_TOPK", 1);
         g_ggml_sycl_fuse_qsa_score = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_SCORE", 1);
-        g_ggml_sycl_fuse_qsa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_MASK", 0);
-        g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 3);
+        g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 1);
         g_ggml_sycl_qsa_fa_no_readback = ggml_sycl_get_env("GGML_SYCL_QSA_FA_NO_READBACK", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
@@ -673,12 +663,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_GROUPED_GEMM: %d\n", g_ggml_sycl_grouped_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MMID_SCHED: %d\n", g_ggml_sycl_mmid_sched);
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_CAST_ADD: %d\n", g_ggml_sycl_fuse_cast_add);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_CONT_ADD: %d\n", g_ggml_sycl_fuse_cont_add);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_GATHER: %d\n", g_ggml_sycl_fuse_qsa_gather);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_TOPK: %d\n", g_ggml_sycl_fuse_qsa_topk);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_SCORE: %d\n", g_ggml_sycl_fuse_qsa_score);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_MASK: %d\n", g_ggml_sycl_fuse_qsa_mask);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
         GGML_LOG_INFO("  GGML_SYCL_QSA_FA_NO_READBACK: %d\n", g_ggml_sycl_qsa_fa_no_readback);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
@@ -8001,9 +7986,6 @@ static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx);
 
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
-    // returns anything a previous graph left behind between a QSA mask chain and its reader
-    sycl_ctx->qsa_sel_reset();
-
     ggml_sycl_kq_mask_graph kq_mask;
     ggml_sycl_kq_mask_graph_begin(*sycl_ctx, cgraph, kq_mask);
 
@@ -8057,6 +8039,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // the nodes of a QSA mask chain whose flash attention reads the selection list itself
+        if (ggml_sycl_qsa_mask_absorbs(cgraph, i)) {
+            continue;
+        }
+
         if (kq_mask.tail) {
             ggml_sycl_kq_mask_graph_at(kq_mask, node);
         }
@@ -8072,7 +8059,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
-        // flash attention whose dense QSA mask was absorbed: run it off the selection bitmap
+        // flash attention whose dense QSA mask was absorbed: run it off the selection list
         if (node->op == GGML_OP_FLASH_ATTN_EXT && ggml_sycl_qsa_fa_mask(*sycl_ctx, cgraph, i)) {
             continue;
         }
@@ -8735,27 +8722,13 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 // every predicate here is purely structural, so it holds for every later execution
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
-    // every copy of the QSA indexer chain, which the fused top-k rebuilds instead of reading
-    if (const int n = ggml_sycl_qsa_topk_absorbs(cgraph, node_idx)) {
-        return n;
-    }
     // the indexer score GEMM, its relu and the head sums that the tiled epilogue replaces
     if (const int n = ggml_sycl_qsa_score_absorbs(cgraph, node_idx)) {
         return n;
     }
-    // the two fills of the QSA mask chain, which the fused select writes past
+    // the QSA mask chain, which flash attention reads from the selection list instead
     if (const int n = ggml_sycl_qsa_mask_absorbs(cgraph, node_idx)) {
         return n;
-    }
-    // the gather fusion runs at the first CONT and writes the last
-    if (ggml_sycl_can_fuse_qsa_gather(cgraph, node_idx)) {
-        return 3;
-    }
-    if (ggml_sycl_can_fuse_cast_add(cgraph, node_idx, NULL)) {
-        return 1;
-    }
-    if (ggml_sycl_can_fuse_cont_add(cgraph, node_idx, NULL, NULL)) {
-        return 1;
     }
     // both of these run at the node they absorb and write the next one, reading the absorbed
     // node's own input; marking it absorbed keeps that input live and reserves no dst for it
