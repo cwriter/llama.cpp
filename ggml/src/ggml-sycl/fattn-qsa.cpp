@@ -13,8 +13,8 @@
 #include <vector>
 
 // Flash attention for the QSA layers without the dense [n_kv, n_tps] mask. The graph says
-//   out = flash_attn(q, k, v, (top-k select ? kq_mask : -inf))
-// and here the FLASH_ATTN_EXT node gets the top-k list and the causal mask instead.
+//   out = flash_attn(q, k, v, (selected ? kq_mask : -inf))
+// and here the FLASH_ATTN_EXT node gets the selection list and the causal mask instead.
 //
 // Prefill (the chunked oneMKL kernel would take the node): neighbouring tokens select mostly the
 // same cells, so a tile of T tokens gathers the UNION of its lists once, dequantizes those rows

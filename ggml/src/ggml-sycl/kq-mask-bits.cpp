@@ -1,5 +1,4 @@
 #include "kq-mask-bits.hpp"
-#include "qsa-mask.hpp"
 
 #include "ggml-backend-impl.h"
 
@@ -504,7 +503,7 @@ static bool kq_mask_reader_taught(const ggml_tensor * n, int j, const ggml_tenso
         case GGML_OP_ADD:
             return kq_mask_add_operand(n, owner) == j;
         case GGML_OP_CPY:
-            // a cast: the fused QSA top-k, the fused cast+add or the standalone copy reads it
+            // a cast or copy of the whole mask
             return j == 0 && kq_mask_cpy_dst(n->src[0], n->src[1] ? n->src[1] : n, owner) == owner;
         case GGML_OP_FLASH_ATTN_EXT:
             {
@@ -523,46 +522,23 @@ static bool kq_mask_reader_taught(const ggml_tensor * n, int j, const ggml_tenso
 // `readers` collects the taught readers when given.
 static const char * kq_mask_untaught_reader(const ggml_cgraph * cgraph, const ggml_tensor * owner,
                                             std::vector<const ggml_tensor *> * readers, const ggml_tensor ** who) {
-    bool has_cast = false;
-    int  fused_to = 0;  // nodes before it belong to a QSA chain the fusion runs from its FILL
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
-        if (i < fused_to || kq_mask_is_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+        if (kq_mask_is_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (!n->src[j] || kq_mask_owner(n->src[j]) != owner) {
                 continue;
             }
-            if (n->op == GGML_OP_FILL && j == 0) {
-                // only its shape is read, unless a QSA chain fusion starts here: it reads the mask
-                // as bits (qsa-mask.cpp, fattn-qsa.cpp) on behalf of the whole chain, and reports
-                // itself on this FILL; the chain's own ADD never runs
-                const int span = (g_ggml_sycl_fuse_qsa_mask || g_ggml_sycl_fuse_qsa_fa_mask) ?
-                                 ggml_sycl_qsa_mask_absorbs(cgraph, i) : 0;
-                if (span > 0) {
-                    fused_to = i + span;
-                    if (readers) {
-                        readers->push_back(n);
-                    }
-                    break;
-                }
-                continue;
-            }
             if (!kq_mask_reader_taught(n, j, owner)) {
                 *who = n;
                 return "untaught op";
             }
-            has_cast |= n->op == GGML_OP_CPY;
             if (readers) {
                 readers->push_back(n);
             }
         }
-    }
-    // the CONT+ADD fusion reads a cast's f16 source itself
-    if (has_cast && g_ggml_sycl_fuse_cont_add) {
-        *who = nullptr;
-        return "CONT+ADD fusion";
     }
     return nullptr;
 }
@@ -682,7 +658,7 @@ void ggml_sycl_kq_mask_graph_begin(ggml_backend_sycl_context & ctx, const ggml_c
                         GGML_LOG_INFO("[KQ-MASK] dev %d mask %s ne=[%lld,%lld]: #%d %s %s src[%d] %s\n", ctx.device,
                                       owner->name, (long long) owner->ne[0], (long long) owner->ne[1], i,
                                       ggml_op_desc(n), n->name, j,
-                                      r ? "reader" : kq_mask_is_noop(n) ? "view" : n->op == GGML_OP_FILL ? "shape only" : "not run");
+                                      r ? "reader" : kq_mask_is_noop(n) ? "view" : "not run");
                     }
                 }
             }

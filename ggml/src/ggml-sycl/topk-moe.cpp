@@ -8,10 +8,7 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
-#include "binbcast.hpp"
-#include "getrows.hpp"
 #include "topk-moe.hpp"
-#include "qsa-mask.hpp"
 #include "qsa-score.hpp"
 #include "topk-radix.hpp"
 
@@ -700,27 +697,6 @@ int ggml_sycl_fuse(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i)
     }
 
     if (const int n = ggml_sycl_fuse_qsa_score(ctx, cgraph, i)) {
-        return n;
-    }
-
-    if (const int n = ggml_sycl_fuse_qsa_mask(ctx, cgraph, i)) {
-        return n;
-    }
-
-    // before the gather fusion: this one subsumes it and absorbs the ADD as well
-    if (const int n = ggml_sycl_fuse_qsa_topk(ctx, cgraph, i)) {
-        return n;
-    }
-
-    if (const int n = ggml_sycl_fuse_qsa_gather(ctx, cgraph, i)) {
-        return n;
-    }
-
-    if (const int n = ggml_sycl_fuse_cont_add(ctx, cgraph, i)) {
-        return n;
-    }
-
-    if (const int n = ggml_sycl_fuse_cast_add(ctx, cgraph, i)) {
         return n;
     }
 
