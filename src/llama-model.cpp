@@ -2721,8 +2721,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
-                            if (filter_idx) {
+                            // a dense MTP block (compress ratio 0) never reads an indexer cache
+                            bool mtp_qsa = false;
+                            for (uint32_t i = hparams.n_layer(); i < hparams.n_layer_all; ++i) {
+                                mtp_qsa = mtp_qsa || hparams.dsv4_compress_ratios[i] > 0;
+                            }
+                            if (filter_idx && mtp_qsa) {
                                 filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            } else {
+                                filter_idx = nullptr;
                             }
                         }
                     }
