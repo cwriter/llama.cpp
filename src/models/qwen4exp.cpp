@@ -575,15 +575,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the draft memory has no recurrent layer, but its input still has to be allocated
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
+    // the k-pool inputs are only read by a QSA block
     llm_graph_input_kpool * inp_kpool = nullptr;
-    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
+    if (mctx_hyb->get_idx() && hparams.dsv4_compress_ratios[il] > 0) {
         GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
         inp_kpool = build_inp_kpool(mctx_hyb);
     }
 
-    ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    ggml_tensor * inp_pos = build_inp_pos();
 
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
@@ -597,6 +597,17 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * inject = nullptr;
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
+
+    // a decode without outputs is the KV catch-up over the verified tokens: only the K/V of the
+    // block lasts, so store just that, like the DFlash KV-injection pass (a QSA block would also
+    // have to fill its indexer cache)
+    if (n_outputs == 0 && !inp_kpool) {
+        build_layer_kv(inp_hyb->get_attn(), cur, inp_pos, sections, il);
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
@@ -622,6 +633,41 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+// the K/V stores of build_layer_attn without the attention
+void llama_model_qwen4exp::graph::build_layer_kv(
+        llm_graph_input_attn_kv * inp,
+        ggml_tensor *             cur,
+        ggml_tensor *             inp_pos,
+        int *                     sections,
+        int                       il) {
+    const int64_t n_embd_head = hparams.n_embd_head_v();
+
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+    Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+    Kcur = ggml_rope_multi(ctx0, Kcur, inp_pos, nullptr,
+            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+            ext_factor, attn_factor, beta_fast, beta_slow);
+    cb(Kcur, "Kcur", il);
+
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+    cb(Vcur, "Vcur", il);
+
+    if (inp->self_k_rot) {
+        Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp->self_k_rot);
+    }
+    if (inp->self_v_rot) {
+        Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp->self_v_rot);
+    }
+
+    // v before k, as build_attn expands them
+    ggml_build_forward_expand(gf, Vcur);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, inp->mctx->cpy_k(ctx0, Kcur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, inp->mctx->cpy_v(ctx0, Vcur, inp->get_v_idxs(), il));
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
