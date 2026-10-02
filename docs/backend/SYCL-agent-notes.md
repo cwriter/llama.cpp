@@ -98,7 +98,7 @@ Server results after mode 3 became the default, all defaults, 131k context:
   - bit 2 allocates only the packed size (takes precedence over bit 1).
 - Compaction is chosen only when all of these hold:
   - the mask was shown to `graph_optimize` by a scheduled graph;
-  - every reader is taught (ADD, the f32 cast, the cast+add and QSA fusions, FA);
+  - every reader is taught (ADD, copies, the QSA mask fusion, FA);
   - no attention op uses ALiBi.
 - A non-binary upload switches it off for good.
 - Core changes, both in `ggml-backend.*`:
@@ -114,6 +114,17 @@ Server results after mode 3 became the default, all defaults, 131k context:
 - **Kernel:** -17..-23% at every depth; the mode 3 union path is -12..-18%.
 - **Server:** +7.5% prefill at 123k; prefill energy per token -1.7/-3.5/-7.8% at 15k/65k/123k; decode unchanged; memory +5 MiB.
 
+**Upstream k-pool QSA (#29751) and MTP (#29761).** The branch follows upstream qwen4exp since 2026-10-02.
+- The indexer now caches pooled block keys and selects blocks; MTP-off decode at 100k went from 54 to 33 ms/token.
+- Still needed on this graph, measured at 131k with pipeline mode and MTP (2 rounds each):
+  - QSA indexer score fusion: -463 MiB compute per card; without it card 0 pages (pp32k 1487 -> 956).
+  - QSA mask fusion, flash attention reads the selection list (`GGML_SYCL_FUSE_QSA_FA_MASK`, now 0 or 1): -334 MiB per card, pp32k +2.6%.
+  - `GGML_SYCL_QSA_FA_NO_READBACK=1`: pp32k 697 -> 1487, fill to 100k 575 -> 1258.
+  - Compact KQ mask: +960 MiB per card without it, which pages.
+- Gone with the old graph: the gather, top-k, cast+add and cont+add fusions, bitmap modes 1 and 2, `GGML_SYCL_FUSE_QSA_MASK`.
+- The shared-tensor MTP heads load through ctx_other. Their block is dense (compress ratio 0), so the draft stores only K/V for a catch-up decode and has no indexer cache.
+- MTP drops rejected tokens with seq_rm every step; the k-pool layout now keeps everything before the edit (it was rebuilt from a std::set, ~27 ms per step at 100k).
+
 ## Evaluated and not adopted (do not redo without a new idea)
 
 - **iq4_nl permuted table layout:** -7.7%. A 256-entry LUT for the iq4 grouped-GEMM A stage: -6%.
@@ -126,7 +137,6 @@ Server results after mode 3 became the default, all defaults, 131k context:
   - Its NaN is fixed.
   - Span 256 fits only head dim 256.
 - **Per-token scalar-gather sparse FA:** slower than dense at every depth.
-- **`GGML_SYCL_FUSE_QSA_MASK=1` alone:** a speed win, but superseded by mode 3. No memory saving.
 - **Removing host waits at decode:** flat. The cost is per dispatch.
 - **KQ GEMM writing f16 scores:** would halve softmax traffic, but f16 at |s| 20-30 costs ~1.5% in exp(). Rejected as not exact.
 - **oneDNN flash attention at long context (`GGML_SYCL_FA_MAX_MEM_MIB=1024`):** kept at default 256.
