@@ -4,7 +4,7 @@
 #include "common.hpp"
 
 // Flash attention for a QSA layer without the dense [n_kv, n_tps] mask the graph builds: the
-// node takes the top-k list and the causal mask instead, and attends to the listed cells that
+// node takes the selection list and the causal mask instead, and attends to the listed cells that
 // the mask does not hide. A row with no visible cell gives 0, as the CPU reference does.
 // Prefill runs XMX GEMMs over the union of a query tile's lists (fattn-qsa.cpp); everything
 // else writes the mask at its real size into pool scratch and runs the dense kernels.
