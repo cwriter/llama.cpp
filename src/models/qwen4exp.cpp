@@ -1,6 +1,4 @@
 #include "models.h"
-
-#include <cstdlib>
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
@@ -181,7 +179,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int trunk_flags = nf.trunk;
     const int mtp_flags   = nf.mtp;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
     // there is no output_norm: the final hyper-connection mixer carries it
     // the gammas load as [n_embd, hc] so the grouped norm multiplies them without a graph reshape
@@ -190,7 +188,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    if (output == NULL) {
+    if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -554,12 +552,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_input(inp->h);
     ggml_set_name(inp->h, "mtp_h_input");
 
-    ggml_tensor * tok_embd;
-    if (ubatch.token) {
-        tok_embd = ggml_get_rows(ctx0, model.tok_embd, inp->tokens);
-    } else {
-        tok_embd = inp->embd;
-    }
+    // a draft without its own embeddings and LM head uses the target's
+    const llama_model * model_tgt = cparams.ctx_other ? llama_get_model(cparams.ctx_other) : nullptr;
+    ggml_tensor * w_embd = model.tok_embd ? model.tok_embd : model_tgt ? model_tgt->tok_embd : nullptr;
+    ggml_tensor * w_out  = model.output   ? model.output   : model_tgt ? model_tgt->output   : nullptr;
+    ggml_tensor * s_out  = model.output   ? model.output_s : model_tgt ? model_tgt->output_s : nullptr;
+    GGML_ASSERT(w_embd && w_out && "MTP block without embeddings or LM head, load it as the draft of its target model");
+
+    ggml_tensor * tok_embd = ubatch.token ? ggml_get_rows(ctx0, w_embd, inp->tokens) : inp->embd;
     cb(tok_embd, "mtp_tok_embd", il);
 
     ggml_tensor * h = inp->h;
@@ -614,7 +614,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    cur = build_lora_mm(w_out, cur, s_out);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
