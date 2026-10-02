@@ -26,9 +26,10 @@
 // bounded. Override with GGML_SYCL_MKL_FA_Q_TILE.
 #define MKL_FA_Q_TILE 8192
 
-// Without GGML_SYCL_MKL_FA_Q_TILE, a tile's f32 scores are capped to this size, so the scores and
-// S mostly stay in L2 between the KQ GEMM, the softmax and the VKQ GEMM (256 rows at 8192 cells).
-#define MKL_FA_Q_TILE_L2_BYTES (8 << 20)
+// Without GGML_SYCL_MKL_FA_Q_TILE, a tile's f32 scores are capped to this size (768 rows at 8192 cells).
+// Each tile and chunk costs three host launches. With 8 MiB tiles the scores stayed in L2, but at long
+// context the launches, not the GPU, set the pace of a pipelined prefill.
+#define MKL_FA_Q_TILE_L2_BYTES (24 << 20)
 
 #define MKL_FA_WG_SIZE 256
 
