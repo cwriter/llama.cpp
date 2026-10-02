@@ -166,31 +166,20 @@ static bool qsa_mask_chain_from_fa(const ggml_cgraph * cgraph, const ggml_tensor
 
     // the fills are seeded from a scalar that only the chain reads (one element of the list, cast
     // to the mask type), so that the dense mask is built after the list; those nodes go too
-    const ggml_tensor * seeds[4] = { fill_inf->src[0], fill_zero->src[0], nullptr, nullptr };
-    for (int pass = 0; pass < 3; ++pass) {
-        for (int k = 0; k < 4; ++k) {
-            const ggml_tensor * s = seeds[k];
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < c.n_nodes; ++i) {
+            const ggml_tensor * s = c.nodes[i]->src[0];
             if (!s || s->op == GGML_OP_NONE || ggml_nelements(s) != 1) {
                 continue;
             }
             int32_t uses = 0;
-            for (int i = 0; i < c.n_nodes; ++i) {
+            for (int k = 0; k < c.n_nodes; ++k) {
                 for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                    uses += c.nodes[i]->src[j] == s;
+                    uses += c.nodes[k]->src[j] == s;
                 }
             }
-            if (!qsa_private(cgraph, s, uses)) {
-                continue;
-            }
-            qsa_add_node(c, s);
-            seeds[k] = nullptr;
-            if (s->src[0] && (s->src[0] == seeds[0] || s->src[0] == seeds[1])) {
-                continue;
-            }
-            if (!seeds[2]) {
-                seeds[2] = s->src[0];
-            } else if (!seeds[3] && s->src[0] != seeds[2]) {
-                seeds[3] = s->src[0];
+            if (qsa_private(cgraph, s, uses)) {
+                qsa_add_node(c, s);
             }
         }
     }
@@ -199,7 +188,7 @@ static bool qsa_mask_chain_from_fa(const ggml_cgraph * cgraph, const ggml_tensor
 
 // The flash attention node whose chain holds node i, or -1. Shared by fusion_absorbs and the
 // compute loop, so both see the same chains.
-static int qsa_mask_reader_of(const ggml_cgraph * cgraph, int i, qsa_mask_chain * out) {
+static int qsa_mask_reader_of(const ggml_cgraph * cgraph, int i) {
     if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_qsa_fa_mask) {
         return -1;
     }
@@ -227,9 +216,6 @@ static int qsa_mask_reader_of(const ggml_cgraph * cgraph, int i, qsa_mask_chain 
         }
         for (int k = 0; k < c.n_nodes; ++k) {
             if (c.nodes[k] == n) {
-                if (out) {
-                    *out = c;
-                }
                 return j;
             }
         }
@@ -238,7 +224,7 @@ static int qsa_mask_reader_of(const ggml_cgraph * cgraph, int i, qsa_mask_chain 
 }
 
 int ggml_sycl_qsa_mask_absorbs(const ggml_cgraph * cgraph, int node_idx) {
-    return qsa_mask_reader_of(cgraph, node_idx, nullptr) >= 0 ? 1 : 0;
+    return qsa_mask_reader_of(cgraph, node_idx) >= 0 ? 1 : 0;
 }
 
 bool ggml_sycl_qsa_fa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
@@ -257,7 +243,7 @@ bool ggml_sycl_qsa_fa_mask(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph
             break;
         }
     }
-    if (i_add < 0 || qsa_mask_reader_of(cgraph, i_add, nullptr) != i) {
+    if (i_add < 0 || qsa_mask_reader_of(cgraph, i_add) != i) {
         return false;
     }
 
