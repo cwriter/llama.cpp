@@ -631,11 +631,13 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
         GGML_LOG_INFO("  GGML_SYCL_TOPK_MOE_RADIX: %d\n", g_ggml_sycl_topk_moe_radix);
-        GGML_LOG_INFO("  GGML_SYCL_REORDER_TYPES: 0x%x (iq3_s=%d iq4_nl=%d q8_0=%d)\n",
+        GGML_LOG_INFO("  GGML_SYCL_REORDER_TYPES: 0x%x (iq3_s=%d iq4_nl=%d q8_0=%d iq3_xxs=%d iq4_xs=%d)\n",
                       g_ggml_sycl_reorder_types,
                       (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S)  != 0,
                       (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_NL) != 0,
-                      (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0)   != 0);
+                      (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0)   != 0,
+                      (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_XXS) != 0,
+                      (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_XS) != 0);
         GGML_LOG_INFO("  GGML_SYCL_FA_MAX_MEM_MIB: %d\n", g_ggml_sycl_fa_max_mem_mib);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
@@ -896,13 +898,24 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
         // set reorder extra buffer based on supported type
         switch (tensor->type) {
             case GGML_TYPE_IQ3_XXS:
+                if (!(g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S) &&
+                    !(tensor->ne[2] > 1 && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_XXS))) {
+                    break;
+                }
+                [[fallthrough]];
             case GGML_TYPE_IQ3_S:
-                if (!(g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S)) {
+                if (tensor->type == GGML_TYPE_IQ3_S && !(g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S)) {
                     break;
                 }
                 [[fallthrough]];
             case GGML_TYPE_IQ4_NL:
                 if (tensor->type == GGML_TYPE_IQ4_NL && !(g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_NL)) {
+                    break;
+                }
+                [[fallthrough]];
+            case GGML_TYPE_IQ4_XS:
+                if (tensor->type == GGML_TYPE_IQ4_XS &&
+                    (tensor->ne[2] <= 1 || !(g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_XS))) {
                     break;
                 }
                 [[fallthrough]];
@@ -956,6 +969,72 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+static const ggml_tensor * ggml_sycl_moe_reordered_owner(const ggml_tensor * tensor) {
+    while (tensor->view_src) {
+        tensor = tensor->view_src;
+    }
+    if ((tensor->type != GGML_TYPE_IQ3_XXS && tensor->type != GGML_TYPE_IQ4_XS) || !tensor->buffer || !ggml_backend_buffer_is_sycl(tensor->buffer)) {
+        return nullptr;
+    }
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(tensor->extra);
+    return extra && extra->optimized_feature.is_reordered() ? tensor : nullptr;
+}
+
+static void ggml_sycl_moe_weight_transfer(const ggml_tensor * tensor, void * data, size_t offset, size_t size, bool write) {
+    const ggml_tensor * owner = ggml_sycl_moe_reordered_owner(tensor);
+    GGML_ASSERT(owner);
+    const size_t view_offset = (const char *) tensor->data - (const char *) owner->data;
+    const size_t nbytes = ggml_nbytes(owner);
+    GGML_ASSERT(view_offset <= nbytes && offset <= nbytes - view_offset && size <= nbytes - view_offset - offset);
+    offset += view_offset;
+    if (size == 0) {
+        return;
+    }
+    const size_t slice_bytes = owner->ne[2] > 1 ? owner->nb[2] : nbytes;
+    const bool iq4_xs = owner->type == GGML_TYPE_IQ4_XS;
+    const size_t block_bytes = ggml_type_size(owner->type);
+    GGML_ASSERT(slice_bytes > 0 && slice_bytes % block_bytes == 0);
+    const size_t nblocks = slice_bytes / block_bytes;
+    const size_t sizes[] = {iq4_xs ? QK_K / 2 : 3 * QK_K / 8, sizeof(ggml_half), iq4_xs ? 2u : 0u, iq4_xs ? 4u : 0u};
+    const size_t offsets[] = {iq4_xs ? offsetof(block_iq4_xs, qs) : offsetof(block_iq3_xxs, qs), 0, offsetof(block_iq4_xs, scales_h), offsetof(block_iq4_xs, scales_l)};
+    auto * ctx = static_cast<ggml_backend_sycl_buffer_context *>(owner->buffer->context);
+    ggml_sycl_set_device(ctx->device);
+    std::vector<uint8_t> packed(slice_bytes);
+    std::vector<uint8_t> canonical(slice_bytes);
+    auto permute = [&](bool to_soa) {
+        size_t plane = 0;
+        for (int f = 0; f < 4; ++f) {
+            if (sizes[f] == 0) {
+                continue;
+            }
+            for (size_t b = 0; b < nblocks; ++b) {
+                auto * soa = packed.data() + plane + b * sizes[f];
+                auto * block = canonical.data() + b * block_bytes + offsets[f];
+                memcpy(to_soa ? soa : block, to_soa ? block : soa, sizes[f]);
+            }
+            plane += nblocks * sizes[f];
+        }
+        GGML_ASSERT(plane == slice_bytes);
+    };
+    for (size_t start = offset - offset % slice_bytes; start < offset + size; start += slice_bytes) {
+        GGML_ASSERT(slice_bytes <= nbytes - start);
+        auto * device = (uint8_t *) owner->data + start;
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream->memcpy(packed.data(), device, slice_bytes).wait()));
+        permute(false);
+        const size_t begin = std::max(start, offset);
+        const size_t end = std::min(start + slice_bytes, offset + size);
+        auto * host = (uint8_t *) data + begin - offset;
+        auto * bytes = (uint8_t *) canonical.data() + begin - start;
+        if (write) {
+            memcpy(bytes, host, end - begin);
+            permute(true);
+            SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream->memcpy(device, packed.data(), slice_bytes).wait()));
+        } else {
+            memcpy(host, bytes, end - begin);
+        }
+    }
+}
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -963,6 +1042,10 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+    if (ggml_sycl_moe_reordered_owner(tensor)) {
+        ggml_sycl_moe_weight_transfer(tensor, const_cast<void *>(data), offset, size, true);
+        return;
+    }
     // A caller always hands over canonical bytes (a session file has to be readable by any build),
     // so permute into span order here rather than making every writer aware of the layout. The
     // staging loop below memcpy()s out of this buffer on the host, so the local outlives the copy.
@@ -1182,6 +1265,10 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
+    if (ggml_sycl_moe_reordered_owner(tensor)) {
+        ggml_sycl_moe_weight_transfer(tensor, data, offset, size, false);
+        return;
+    }
     // Hand back canonical bytes whatever the device holds, so a session file stays portable.
     const bool soa  = ggml_sycl_kv_is_soa(tensor);
     const bool bits = ggml_sycl_kq_mask_is_bits(tensor);
@@ -1374,6 +1461,9 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                     const ggml_tensor *src,
                                     ggml_tensor *dst) try {
     bool is_cpy_supported = ggml_backend_buffer_is_sycl(src->buffer);
+    if (ggml_sycl_moe_reordered_owner(src) || ggml_sycl_moe_reordered_owner(dst)) {
+        return false;
+    }
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": dst", dst).c_str());
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(" src", src).c_str());
@@ -5129,8 +5219,9 @@ static bool reorder_qw_soa2_moe(uint8_t * data_device, size_t expert_bytes, int6
                                 dpct::queue_ptr stream, uint8_t * tmp_buf) {
     static_assert(qs_bytes + sizeof(ggml_half) == sizeof(block_t),
                   "this reorder only fits a block of one half scale followed by flat quants");
-    GGML_ASSERT(expert_bytes % sizeof(block_t) == 0);
-    const int    blocks_per_expert = (int) (expert_bytes / sizeof(block_t));
+    GGML_ASSERT(expert_bytes > 0 && expert_bytes % sizeof(block_t) == 0);
+    GGML_ASSERT(n_expert > 0 && expert_bytes <= SIZE_MAX / (size_t) n_expert);
+    const size_t blocks_per_expert = expert_bytes / sizeof(block_t);
     const size_t total_bytes       = expert_bytes * (size_t) n_expert;
 
     sycl::event copy_event;
@@ -5139,11 +5230,11 @@ static bool reorder_qw_soa2_moe(uint8_t * data_device, size_t expert_bytes, int6
         copy_event.wait();
     }
 
-    const int total_blocks = blocks_per_expert * (int) n_expert;
+    const size_t total_blocks = blocks_per_expert * (size_t) n_expert;
     auto reorder_event = stream->parallel_for(total_blocks, [=](auto gb_) {
-        const int       gb   = gb_;
-        const int       e    = gb / blocks_per_expert;
-        const int       ib   = gb % blocks_per_expert;
+        const size_t    gb   = gb_;
+        const size_t    e    = gb / blocks_per_expert;
+        const size_t    ib   = gb % blocks_per_expert;
         const block_t * x    = (const block_t *) (tmp_buf + (size_t) e * expert_bytes);
         uint8_t *       base = data_device + (size_t) e * expert_bytes;
 
@@ -5157,6 +5248,33 @@ static bool reorder_qw_soa2_moe(uint8_t * data_device, size_t expert_bytes, int6
     });
     if (!g_ggml_sycl_use_async_mem_op) {
         reorder_event.wait_and_throw();
+    }
+    return true;
+}
+
+static bool reorder_qw_iq4_xs_moe(uint8_t * data_device, size_t expert_bytes, int64_t n_expert,
+                                  dpct::queue_ptr stream, uint8_t * tmp_buf) {
+    static_assert(sizeof(block_iq4_xs) == 136);
+    GGML_ASSERT(expert_bytes > 0 && expert_bytes % sizeof(block_iq4_xs) == 0);
+    GGML_ASSERT(n_expert > 0 && expert_bytes <= SIZE_MAX / (size_t) n_expert);
+    const size_t nb = expert_bytes / sizeof(block_iq4_xs);
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp_buf, data_device, expert_bytes * (size_t) n_expert)));
+    auto event = stream->parallel_for(nb * (size_t) n_expert, [=](sycl::id<1> id) {
+        const size_t e = id[0] / nb;
+        const size_t b = id[0] % nb;
+        const auto * x = (const block_iq4_xs *) (tmp_buf + e * expert_bytes);
+        auto * base = data_device + e * expert_bytes;
+        for (int j = 0; j < 128; ++j) {
+            base[128 * b + j] = x[b].qs[j];
+        }
+        *(ggml_half *) (base + 128 * nb + 2 * b) = x[b].d;
+        *(uint16_t *) (base + 130 * nb + 2 * b) = x[b].scales_h;
+        for (int j = 0; j < 4; ++j) {
+            base[132 * nb + 4 * b + j] = x[b].scales_l[j];
+        }
+    });
+    if (!g_ggml_sycl_use_async_mem_op) {
+        event.wait_and_throw();
     }
     return true;
 }
@@ -5564,6 +5682,10 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
                     return reorder_qw_soa2_moe<block_iq4_nl, QK4_NL / 2>(data, expert_bytes, n, stream, tmp_buf);
                 case GGML_TYPE_Q8_0:
                     return reorder_qw_soa2_moe<block_q8_0, QK8_0>(data, expert_bytes, n, stream, tmp_buf);
+                case GGML_TYPE_IQ3_XXS:
+                    return reorder_qw_soa2_moe<block_iq3_xxs, 3 * (QK_K / 8)>(data, expert_bytes, n, stream, tmp_buf);
+                case GGML_TYPE_IQ4_XS:
+                    return reorder_qw_iq4_xs_moe(data, expert_bytes, n, stream, tmp_buf);
                 default:
                     return false;
             }
@@ -5575,6 +5697,8 @@ static bool reorder_qw(const ggml_tensor * src0, dpct::queue_ptr stream) {
             case GGML_TYPE_IQ3_S:
             case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_Q8_0:
+            case GGML_TYPE_IQ3_XXS:
+            case GGML_TYPE_IQ4_XS:
                 break;
             default:
                 return false;
@@ -5637,7 +5761,8 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     }
 
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
-    if (!extra || extra->optimized_feature.is_reordered()) {
+    if (!extra || extra->optimized_feature.is_reordered() ||
+        (src0->type == GGML_TYPE_IQ3_XXS && !extra->optimized_feature.reorder_allowed)) {
         return;  // Skip permutations and already reordered tensors
     }
 
@@ -5671,7 +5796,9 @@ static inline bool ggml_sycl_mul_mat_id_reorders_type(enum ggml_type type) {
     return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
            (type == GGML_TYPE_IQ3_S  && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S)) ||
            (type == GGML_TYPE_IQ4_NL && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_NL)) ||
-           (type == GGML_TYPE_Q8_0   && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0));
+           (type == GGML_TYPE_Q8_0   && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0)) ||
+           (type == GGML_TYPE_IQ3_XXS && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_XXS)) ||
+           (type == GGML_TYPE_IQ4_XS && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_XS));
 }
 
 static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
@@ -5681,8 +5808,16 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (!ggml_sycl_mul_mat_id_reorders_type(src0->type)) {
         return;
     }
+    if ((src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_XS) &&
+        (src0->view_src || !ggml_is_contiguous(src0) || src0->ne[3] != 1 ||
+         src0->nb[2] > INT_MAX || ggml_backend_buffer_is_sycl_split(src0->buffer))) {
+        return;
+    }
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (!extra || extra->optimized_feature.is_reordered()) {
+        return;
+    }
+    if ((src0->type == GGML_TYPE_IQ3_XXS || src0->type == GGML_TYPE_IQ4_XS) && !extra->optimized_feature.reorder_allowed) {
         return;
     }
     if (reorder_qw(src0, ctx->stream())) {
@@ -5752,6 +5887,10 @@ static bool ggml_sycl_esimd_ncols_ready(ggml_backend_sycl_context & ctx, const g
 }
 
 static bool can_use_mul_mat_vec_q(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+    if (src0->type == GGML_TYPE_IQ4_XS && extra && extra->optimized_feature.is_reordered()) {
+        return false;
+    }
     return ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
            src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
 }
@@ -7276,7 +7415,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    if (ggml_sycl_kq_mask_is_bits(tensor) || ggml_sycl_kv_is_soa(tensor)) {
+    if (ggml_sycl_kq_mask_is_bits(tensor) || ggml_sycl_kv_is_soa(tensor) || ggml_sycl_moe_reordered_owner(tensor)) {
         // packing and permuting work on a host copy, which the staged upload takes care of
         ggml_backend_sycl_buffer_set_tensor(buf, tensor, data, offset, size);
         return;
@@ -7302,7 +7441,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
-    if (ggml_sycl_kq_mask_is_bits(tensor) || ggml_sycl_kv_is_soa(tensor)) {
+    if (ggml_sycl_kq_mask_is_bits(tensor) || ggml_sycl_kv_is_soa(tensor) || ggml_sycl_moe_reordered_owner(tensor)) {
         // unpacking and unpermuting need the bytes in hand, so this one copy has to be synchronous
         ggml_backend_sycl_buffer_get_tensor(buf, tensor, data, offset, size);
         return;
@@ -7403,6 +7542,9 @@ static bool sycl_copy_via_src_ring(int device_src, sycl::queue & q_src, sycl::qu
 static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
                                                const ggml_tensor * src, ggml_tensor * dst) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
+    if (ggml_sycl_moe_reordered_owner(src) || ggml_sycl_moe_reordered_owner(dst)) {
+        return false;
+    }
     if (!g_ggml_sycl_async_copy || !ggml_backend_is_sycl(backend_dst)) {
         return false;
     }
@@ -8501,8 +8643,48 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 }
 #endif
 
+static void ggml_sycl_moe_check_consumers(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * src = node->src[j];
+            if (!src || (src->type != GGML_TYPE_IQ3_XXS && src->type != GGML_TYPE_IQ4_XS)) {
+                continue;
+            }
+            const ggml_tensor * owner = src;
+            while (owner->view_src) {
+                owner = owner->view_src;
+            }
+            if (owner->ne[2] <= 1 || !owner->buffer || !ggml_backend_buffer_is_sycl(owner->buffer)) {
+                continue;
+            }
+            auto * extra = static_cast<ggml_tensor_extra_gpu *>(owner->extra);
+            if (!extra || (node->op == GGML_OP_MUL_MAT_ID && j == 0 && src == owner)) {
+                continue;
+            }
+            extra->optimized_feature.reorder_allowed = false;
+            if (!extra->optimized_feature.is_reordered()) {
+                continue;
+            }
+            // A view or another reader needs canonical bytes; do this before graph recording.
+            const size_t slice_bytes = owner->nb[2];
+            std::vector<uint8_t> canonical(slice_bytes);
+            for (int64_t e = 0; e < owner->ne[2]; ++e) {
+                const size_t offset = (size_t) e * slice_bytes;
+                ggml_sycl_moe_weight_transfer(owner, canonical.data(), offset, slice_bytes, false);
+                SYCL_CHECK(CHECK_TRY_ERROR(ctx.stream()->memcpy((char *) owner->data + offset, canonical.data(), slice_bytes).wait()));
+            }
+            extra->optimized_feature.layout = {};
+#ifdef GGML_SYCL_GRAPH
+            ctx.sycl_graphs.clear();
+#endif
+        }
+    }
+}
+
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    ggml_sycl_moe_check_consumers(*sycl_ctx, cgraph);
     static int trace_seq[GGML_SYCL_MAX_DEVICES] = {};
     const bool trace = ggml_sycl_pipe_trace_on();
     const int  seq   = trace ? trace_seq[sycl_ctx->device]++ : 0;

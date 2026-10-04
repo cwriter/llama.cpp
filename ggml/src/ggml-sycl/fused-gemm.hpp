@@ -79,7 +79,8 @@ inline bool ggml_sycl_xmx_gather_type_enabled(ggml_type src0_type) {
 constexpr bool ggml_sycl_fused_dequant_gemm_reorder_ok(ggml_type src0_type) {
     return src0_type == GGML_TYPE_IQ3_S || src0_type == GGML_TYPE_IQ4_NL ||
            src0_type == GGML_TYPE_Q8_0 || src0_type == GGML_TYPE_Q4_K ||
-           src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K;
+           src0_type == GGML_TYPE_Q5_K || src0_type == GGML_TYPE_Q6_K ||
+           src0_type == GGML_TYPE_IQ3_XXS || src0_type == GGML_TYPE_IQ4_XS;
 }
 
 constexpr bool ggml_sycl_fused_dequant_gemm_shape_ok(ggml_type src0_type, int64_t M, int64_t N, int64_t K,

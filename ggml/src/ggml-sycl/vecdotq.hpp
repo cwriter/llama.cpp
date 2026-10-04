@@ -1914,4 +1914,28 @@ vec_dot_iq4_xs_q8_1(const void *__restrict__ vbq,
 #endif
 }
 
+template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS> {
+    static constexpr ggml_type gtype = GGML_TYPE_IQ4_XS;
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, std::pair<int, int> bx,
+                                    std::pair<int, int> ds, const int8_t * q8, const sycl::half2 * q8_ds, int iqs) {
+        const auto * base = static_cast<const uint8_t *>(vbq);
+        const auto * q4 = (const uint32_t *) (base + bx.first + 16 * iqs);
+        const auto * scales_l = base + bx.second;
+        const uint16_t scales_h = *(const uint16_t *) (base + ds.second);
+        const int scale = ((scales_l[iqs / 2] >> (4 * (iqs % 2))) & 15) | (((scales_h >> (2 * iqs)) & 3) << 4);
+        const float d = (float) *(const ggml_half *) (base + ds.first) * (scale - 32) * q8_ds[iqs][0];
+        const auto * y = (const int32_t *) (q8 + iqs * QK8_1);
+        int sum_lo = 0;
+        int sum_hi = 0;
+        for (int j = 0; j < 4; ++j) {
+            int lo, hi;
+            get_int_from_table_16(q4[j], (const uint8_t *) kvalues_iq4nl, lo, hi);
+            sum_lo = dpct::dp4a(lo, y[j], sum_lo);
+            sum_hi = dpct::dp4a(hi, y[j + 4], sum_hi);
+        }
+        return d * (sum_lo + sum_hi);
+    }
+};
+
 #endif // GGML_SYCL_VECDOTQ_HPP
