@@ -2852,7 +2852,10 @@ env read next to `ggml-sycl.cpp:454`, startup print next to `ggml-sycl.cpp:623`)
 | 2 | sub-group shuffle lookup | correct |
 | 3 | one 16-byte load for the nibbles, memory lookup | correct (alignment test) |
 
-A second flag, `GGML_SYCL_IQ4_XS_ESIMD`, default 0, selects the ESIMD kernel of I.6.
+Two more flags, both default 0:
+- `GGML_SYCL_MOE_MV_2ROW` selects the two-rows-per-sub-group kernels of I.3 for IQ4_XS. Mode 2
+  always uses them.
+- `GGML_SYCL_IQ4_XS_ESIMD` selects the ESIMD kernel of I.6.
 
 ### I.2 The functor, all variants in one template
 
@@ -2883,7 +2886,7 @@ static __dpct_inline__ int iq4_standin4(uint32_t nib4) {
 // MODE: 1 stand-in, 2 sub-group shuffle, 3 one 16-byte nibble load + memory table.
 template <int MODE> struct reorder_vec_dot_iq4_xs_lut {
     static constexpr ggml_type gtype = GGML_TYPE_IQ4_XS;
-    // mode 2 uses a sub-group shuffle, so its caller must keep the whole sub-group converged
+    // mode 2 uses a sub-group shuffle, so only the _2r kernels of I.3 may call it
     static constexpr bool converged_sg = MODE == 2;
 
     __dpct_inline__ float operator()(const void * __restrict__ vbq, std::pair<int, int> bx,
@@ -2954,103 +2957,273 @@ Notes:
   of 16. Add `GGML_ASSERT(expert_weight_stride % 16 == 0)` in the mode-3 dispatch and fall back to
   mode 0 when it fails.
 
-### I.3 Keep the sub-group converged (needed for mode 2 only)
+### I.3 Two rows per sub-group: no tail on K, no masking (needed for mode 2, useful for all)
 
-`select_from_group` is a group function: every lane of the sub-group must reach it. The two kernels
-loop with `for (int i = lane / 8; i < blocks_per_row; i += 2)` (`mmvq.cpp:3866` and the same loop
-in the GLU kernel near `mmvq.cpp:3926`). For `ffn_down_exps` (K=768, 3 superblocks per row), lanes
-8..15 leave the loop one pass before lanes 0..7. Calling a shuffle there is undefined behaviour.
+#### I.3.1 The problem
 
-Change the loop in `mul_mat_vec_q_moe_reorder` (`mmvq.cpp:3860-3874`) to this. The old loop stays
-for every other functor:
+`select_from_group` is a group function: every lane of the sub-group must reach it. The current
+kernels (`mul_mat_vec_q_moe_reorder`, loop at `mmvq.cpp:3859`, and the same loop in
+`mul_mat_vec_q_moe_reorder_glu` near `mmvq.cpp:3926`) give each sub-group one row and cover 2
+superblocks per pass: `for (int i = lane / 8; i < blocks_per_row; i += 2)`. For `ffn_down_exps`
+(K=768, 3 superblocks per row) lanes 8..15 leave the loop one pass before lanes 0..7. A shuffle
+there is undefined behaviour, and the same tail leaves 8 of 16 lanes idle in the last pass.
+
+#### I.3.2 The design: pick the work split so real shapes are always whole
+
+Do not handle the tail in the kernel, and do not pad K: padding 3 superblocks to 4 would read 33%
+more weight bytes on the down projection, in a memory-bound decode.
+
+Instead, one sub-group (16 lanes) computes **two rows**, and lanes take 32-value chunks across both:
+- chunks per row: `nchunk = ncols / 32` (8 per superblock);
+- chunks per sub-group: `2 * nchunk = ncols / 16`;
+- passes per lane: `2 * nchunk / 16 = ncols / 256`, which is a whole number for every IQ4_XS
+  weight, because IQ4_XS already requires `ncols % 256 == 0`.
+
+So every lane runs the same number of passes for every valid shape: K=768 gives 3 passes, K=2048
+gives 8. Nothing is masked, no lane idles, and the shuffle is always reached by the whole sub-group.
+
+The only remaining edge is an odd row count, where the second row of the last sub-group does not
+exist. It is handled by a **clamp**, which acts like a padded row without changing the layout:
+- the missing row reads row `nrows - 1` (valid data, so loads stay in bounds and every lane still
+  runs every pass);
+- its result is not written.
+
+Real padding of the weight rows does not fit here. The reordered layout puts each plane at an offset
+computed from `nb = nrows * ncols / 256` (`block_q_t<GGML_TYPE_IQ4_XS>::get_d_offset`,
+`quants.hpp`), so extra rows would move every plane and every reader would have to know.
+
+This is one kernel for every shape. The odd test shapes run the same code as the model.
+
+#### I.3.3 Kernel (plain)
+
+Add to `mmvq.cpp`, after `mul_mat_vec_q_moe_reorder`. It reuses the dot functors unchanged (mode 0
+is the existing `reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>`, modes 1..3 are I.2's
+`reorder_vec_dot_iq4_xs_lut<N>`).
 
 ```cpp
-    float partial_sum = 0.0f;
-    if constexpr (ggml_sycl_dot_needs_converged_sg<reorder_vec_dot_q_sycl>::value) {
-        // every lane runs the same number of passes; a lane past the row end reads an in-range
-        // block and drops its result, so the shuffle inside the dot sees the whole sub-group
-        for (int i0 = 0; i0 < blocks_per_row; i0 += blocks_per_subgroup) {
-            const int  i      = i0 + sg.get_local_linear_id() / block_elements_per_subgroup;
-            const bool active = i < blocks_per_row;
-            const int  ic     = active ? i : blocks_per_row - 1;
-            const int  ibx    = row * blocks_per_row + ic;
+// MoE mat-vec over a reordered QK_K-superblock weight with 32-value sub-blocks (vdr 1).
+// One sub-group computes rows r0 and r0+1 of one (token, expert slot). Lanes take 32-value chunks
+// across both rows, so every lane runs ncols / QK_K passes for every valid shape: no K tail, no
+// masking, and group functions inside the dot functor are reached by the whole sub-group.
+template <typename dot_t>
+static void mul_mat_vec_q_moe_reorder_2r(
+    const void * __restrict__ vx_base, const void * __restrict__ vy_base,
+    float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
+    const int ncols, const int nrows,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride,
+    const size_t ids_token_stride, const size_t dst_token_stride,
+    const size_t src1_token_stride,
+    const sycl::nd_item<3> & item_ct1) {
+    using block_type = ggml_sycl_reordered::block_q_t<dot_t::gtype>;
+    static_assert(block_type::traits::qk == QK_K, "superblock formats only");
+    static_assert(block_type::traits::vdr_mmvq == 1, "one 32-value sub-block per dot call");
+    static_assert(WARP_SIZE == 16, "16 lanes x passes must equal 2 rows x 8 chunks x superblocks");
 
-            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
-            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+    const int token_idx  = item_ct1.get_group(0);
+    const int expert_idx = item_ct1.get_group(1);
+    const int32_t * ids_token = (const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride);
+    const int i02 = ids_token[expert_idx];
 
-            const int           iby            = ic * block_type::block_to_q8_1_ratio();
-            const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
-            const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+    const char * vx  = (const char *) vx_base + (size_t) i02 * expert_weight_stride;
+    const char * vy  = (const char *) vy_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride;
+    float *      dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
 
-#pragma unroll
-            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
-                const int   iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
-                const float v   = reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
-                partial_sum += active ? v : 0.0f;
-            }
+    // sub-group index inside the grid; same value for every lane of the sub-group
+    const int sg_global = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
+    const int r0        = 2 * sg_global;
+    if (r0 >= nrows) {
+        return;  // uniform per sub-group
+    }
+    const bool has_r1 = r0 + 1 < nrows;
+    const int  r1     = has_r1 ? r0 + 1 : nrows - 1;  // clamp: read a valid row, drop the result
+
+    const auto sg   = item_ct1.get_sub_group();
+    const int  lane = sg.get_local_linear_id();
+
+    const int blocks_per_row = ncols / QK_K;
+    const int nchunk         = blocks_per_row * (QK_K / QK8_1);  // 32-value chunks per row
+    const int nblocks        = nrows * blocks_per_row;
+    const int npass          = blocks_per_row;                   // = 2 * nchunk / WARP_SIZE
+
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+    for (int p = 0; p < npass; ++p) {
+        const int  c      = lane + WARP_SIZE * p;   // chunk index over both rows, 0 .. 2*nchunk-1
+        const bool second = c >= nchunk;
+        const int  k32    = second ? c - nchunk : c;
+        const int  row    = second ? r1 : r0;
+        const int  ib     = k32 / (QK_K / QK8_1);   // superblock inside the row
+        const int  iqs    = k32 % (QK_K / QK8_1);   // 32-value sub-block inside the superblock
+        const int  ibx    = row * blocks_per_row + ib;
+
+        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+
+        const int           iby            = ib * block_type::block_to_q8_1_ratio();
+        const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+        const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+
+        const float v = dot_t()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        if (second) {
+            sum1 += v;
+        } else {
+            sum0 += v;
         }
-    } else {
-        // existing loop, unchanged
-        for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
-            // ... as today ...
+    }
+
+    sum0 = sycl::reduce_over_group(sg, sum0, std::plus<>());
+    sum1 = sycl::reduce_over_group(sg, sum1, std::plus<>());
+    if (sg.leader()) {
+        dst[r0] = sum0;
+        if (has_r1) {
+            dst[r0 + 1] = sum1;
+        }
+    }
+}
+
+template <typename dot_t>
+static void launch_mul_mat_vec_q_moe_reorder_2r(
+    const void * vx_base, const void * vy, const int32_t * ids_dev,
+    float * dst_base, const int ncols, const int nrows, const int n_experts_used, const int n_tokens,
+    const size_t expert_weight_stride, const size_t dst_row_stride,
+    const size_t src1_row_stride, const size_t ids_token_stride,
+    const size_t dst_token_stride, const size_t src1_token_stride,
+    dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int            rows_per_wg = 2 * GGML_SYCL_MMV_Y;
+    const int            block_num_y = (nrows + rows_per_wg - 1) / rows_per_wg;
+    const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                mul_mat_vec_q_moe_reorder_2r<dot_t>(
+                    vx_base, vy, dst_base, ids_dev, ncols, nrows,
+                    expert_weight_stride, dst_row_stride, src1_row_stride,
+                    ids_token_stride, dst_token_stride, src1_token_stride, item);
+            });
+    });
+}
+```
+
+Index checks for the implementer:
+- Pass `p` of lane `l` is chunk `c = l + 16p`. Over `npass = ncols/256` passes, the 16 lanes cover
+  `16 * ncols/256 = ncols/16 = 2 * nchunk` chunks, exactly both rows, each chunk once.
+- `(ib, iqs)` addresses the same 32 values as the old kernel's `(i, iqs)` pair, and the activation
+  pointers are built the same way as at `mmvq.cpp:3866-3868`.
+- K=768: `nchunk = 24`, 3 passes. Pass 0 is row 0 chunks 0..15. Pass 1 is row 0 chunks 16..23 and
+  row 1 chunks 0..7. Pass 2 is row 1 chunks 8..23.
+
+#### I.3.4 Kernel (GLU)
+
+Same kernel with two weight bases and four sums. Copy `mul_mat_vec_q_moe_reorder_2r` to
+`mul_mat_vec_q_moe_reorder_glu_2r`, add `const void * vx_up_base` and `const ggml_glu_op glu_op`
+parameters as in `mul_mat_vec_q_moe_reorder_glu` (`mmvq.cpp:3885`), and replace the body of the
+pass loop and the epilogue with:
+
+```cpp
+        // vx_gate / vx_up: the two expert bases, built like vx above
+        const float g = dot_t()(vx_gate, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        const float u = dot_t()(vx_up,   bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        if (second) {
+            gate1 += g;
+            up1   += u;
+        } else {
+            gate0 += g;
+            up0   += u;
+        }
+    }
+
+    gate0 = sycl::reduce_over_group(sg, gate0, std::plus<>());
+    up0   = sycl::reduce_over_group(sg, up0,   std::plus<>());
+    gate1 = sycl::reduce_over_group(sg, gate1, std::plus<>());
+    up1   = sycl::reduce_over_group(sg, up1,   std::plus<>());
+    if (sg.leader()) {
+        dst[r0] = up0 * (glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate0) : op_gelu(gate0));
+        if (has_r1) {
+            dst[r0 + 1] = up1 * (glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate1) : op_gelu(gate1));
         }
     }
 ```
 
-Do the same in `mul_mat_vec_q_moe_reorder_glu` with both `partial_gate` and `partial_up` masked by
-`active`. The `if (row >= nrows) return;` before the loop is fine: `row` is the same for every lane
-of a sub-group.
+Its launcher is `launch_mul_mat_vec_q_moe_reorder_glu_2r`, a copy of `launch_mul_mat_vec_q_moe_reorder_2r`
+with the two weight bases and `glu_op` passed through.
 
-The ordered-route kernel (`launch_mul_mat_vec_q_moe_reorder_ordered`, call at `mmvq.cpp:4046`) is not
-converted. Mode 2 therefore always takes the plain kernel (I.4 passes `route_order = nullptr`).
+#### I.3.5 Guard the old kernels
+
+Mode 2's functor must never reach the old one-row kernels. Add one line at the top of
+`mul_mat_vec_q_moe_reorder`, `mul_mat_vec_q_moe_reorder_glu` and the ordered-route kernel (the one
+with the call at `mmvq.cpp:4046`):
+
+```cpp
+    static_assert(!ggml_sycl_dot_needs_converged_sg<reorder_vec_dot_q_sycl>::value,
+                  "this functor uses a sub-group shuffle; use the _2r kernels");
+```
+
+`ggml_sycl_dot_needs_converged_sg` is defined in I.2.
+
+#### I.3.6 Not needed here: route-tile padding
+
+These decode kernels have no route tiles: the grid is one work-group per (token, expert slot, row
+pair), so there is no partial tile of activation columns. Route-tile padding (pad each expert's
+route list to a multiple of 16 in the schedule builder, pointing the padding at a zeroed activation
+row and a throw-away output row) belongs to Part A's tiled kernel, not to Part I.
 
 ### I.4 Dispatch
+
+Add a second flag, `GGML_SYCL_MOE_MV_2ROW`, default 0, with the same four-place pattern as
+`GGML_SYCL_IQ4_XS_LUT`. It selects the I.3 kernels for IQ4_XS. Mode 2 always uses them, whatever
+this flag says. Keeping the two flags separate lets I.5 measure the kernel change (2 rows, no idle
+lanes) apart from the lookup change.
 
 In `ggml_sycl_mul_mat_vec_q_id_reorder` (`mmvq.cpp`, `case GGML_TYPE_IQ4_XS:`), replace the single
 launch with:
 
 ```cpp
-        case GGML_TYPE_IQ4_XS:
-            switch (g_ggml_sycl_iq4_xs_lut) {
-                case 1:
-                    launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_iq4_xs_lut<1>>(
-                        vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
-                        expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
-                        dst_token_stride, src1_token_stride, route_order, stream);
-                    return true;
-                case 2:
-                    // the ordered-route kernel is not converged-safe, so always the plain one
-                    launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_iq4_xs_lut<2>>(
-                        vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
-                        expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
-                        dst_token_stride, src1_token_stride, nullptr, stream);
-                    return true;
-                case 3:
-                    if (expert_weight_stride % 16 == 0) {
-                        launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_iq4_xs_lut<3>>(
-                            vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
-                            expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
-                            dst_token_stride, src1_token_stride, route_order, stream);
-                        return true;
-                    }
-                    break;
-                default:
-                    break;
+        case GGML_TYPE_IQ4_XS: {
+            const int  lut   = g_ggml_sycl_iq4_xs_lut;
+            const bool two_r = g_ggml_sycl_moe_mv_2row || lut == 2;
+            // mode 3 loads 16 bytes at once and needs a 16-byte aligned expert base
+            const int  mode  = (lut == 3 && expert_weight_stride % 16 != 0) ? 0 : lut;
+
+#define IQ4_XS_ARGS vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens, \
+                    expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride, \
+                    dst_token_stride, src1_token_stride
+            if (two_r) {
+                switch (mode) {
+                    case 1:  launch_mul_mat_vec_q_moe_reorder_2r<reorder_vec_dot_iq4_xs_lut<1>>(IQ4_XS_ARGS, stream); break;
+                    case 2:  launch_mul_mat_vec_q_moe_reorder_2r<reorder_vec_dot_iq4_xs_lut<2>>(IQ4_XS_ARGS, stream); break;
+                    case 3:  launch_mul_mat_vec_q_moe_reorder_2r<reorder_vec_dot_iq4_xs_lut<3>>(IQ4_XS_ARGS, stream); break;
+                    default: launch_mul_mat_vec_q_moe_reorder_2r<reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>>(IQ4_XS_ARGS, stream); break;
+                }
+            } else {
+                switch (mode) {
+                    case 1:  launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_iq4_xs_lut<1>>(IQ4_XS_ARGS, route_order, stream); break;
+                    case 3:  launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_iq4_xs_lut<3>>(IQ4_XS_ARGS, route_order, stream); break;
+                    default: launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>>(IQ4_XS_ARGS, route_order, stream); break;
+                }
             }
-            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>>(
-                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
-                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
-                dst_token_stride, src1_token_stride, route_order, stream);
+#undef IQ4_XS_ARGS
             return true;
+        }
 ```
 
-Make the same switch in `ggml_sycl_mul_mat_vec_q_id_reorder_glu` (`case GGML_TYPE_IQ4_XS:`) with
-`launch_mul_mat_vec_q_moe_reorder_glu<reorder_vec_dot_iq4_xs_lut<N>>`; that launcher has no route
-order argument. Decode runs `ffn_gate_exps` and `ffn_up_exps` through the GLU kernel, so without this
-change only `ffn_down_exps` sees the new variant.
+Notes:
+- The `_2r` kernels ignore `route_order`: their grid is (token, expert slot, row pair), which is the
+  layout of the plain kernel. The ordered-route kernel is a separate design and stays one-row.
+- `WARP_SIZE == 16` is a `static_assert` in the `_2r` kernel. Builds for other sub-group sizes
+  (non-Intel targets) must not instantiate it: wrap the `if (two_r)` branch in
+  `#if GGML_SYCL_WARP_SIZE == 16 ... #endif` and fall through to the one-row branch otherwise.
 
-`g_ggml_sycl_iq4_xs_lut` is defined in `ggml-sycl.cpp` and declared in `common.hpp`, which
-`mmvq.cpp` includes.
+Make the same change in `ggml_sycl_mul_mat_vec_q_id_reorder_glu` (`case GGML_TYPE_IQ4_XS:`) with
+the `_glu_2r` and `_glu` launchers. That launcher has no route-order argument. Decode runs
+`ffn_gate_exps` and `ffn_up_exps` through the GLU kernel, so without this change only
+`ffn_down_exps` sees the new code.
+
+`g_ggml_sycl_iq4_xs_lut` and `g_ggml_sycl_moe_mv_2row` are defined in `ggml-sycl.cpp` and declared
+in `common.hpp`, which `mmvq.cpp` includes.
 
 ### I.5 Measure in this order
 
@@ -3065,16 +3238,22 @@ Build with `source /opt/intel/oneapi/setvars.sh` first (H.1.7).
    Compare the n=1 cases with M=768, K=2048 and with M=2048, K=768 (H.8 uses the first). If mode 1
    is not clearly faster (less than about 10%), the lookup is not the limit: stop Part I here and
    record the numbers.
-2. **Correctness of modes 2 and 3:**
+2. **Correctness of the two-row kernel and of modes 2 and 3:**
 
    ```sh
-   for m in 2 3; do GGML_SYCL_IQ4_XS_LUT=$m ./build/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p type_a=iq4_xs; done
+   GGML_SYCL_MOE_MV_2ROW=1 ./build/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p type_a=iq4_xs
+   for m in 2 3; do GGML_SYCL_MOE_MV_2ROW=1 GGML_SYCL_IQ4_XS_LUT=$m ./build/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p type_a=iq4_xs; done
    ```
 
-   Both must pass at the existing tolerance. Include a K=768 case, where the down-projection tail
-   of I.3 is hit. Mode 2 without the I.3 loop change may pass by luck and still be wrong. Do not
-   skip I.3.
-3. **Speed of modes 2 and 3:** repeat the `perf` loop of step 1 with `m in 0 2 3`.
+   All must pass at the existing tolerance. The cases must include K=768 (3 passes, both rows
+   share pass 1), K=256 (1 pass), and an odd row count (the clamp of I.3.2). If the existing
+   `MUL_MAT_ID` cases do not cover an odd row count for iq4_xs, add one next to Codex's
+   reused-weight cases in `tests/test-backend-ops.cpp`. The test must reach the reordered path, so
+   use a reused-weight case (decode after a first run), not a fresh weight.
+3. **Speed, one change at a time:** repeat the `perf` loop of step 1 in this order:
+   - `GGML_SYCL_MOE_MV_2ROW=0` vs `=1`, both with `LUT=0`: the kernel change alone (no idle lanes on
+     K=768; on K=2048 this checks that two rows per sub-group is not slower);
+   - then `GGML_SYCL_MOE_MV_2ROW=1` with `m in 0 2 3`: the lookup change on top.
 4. **Generated code.** Confirm that mode 2 really uses indirect register moves and mode 3 one
    16-byte load:
 
@@ -3089,15 +3268,18 @@ Build with `source /opt/intel/oneapi/setvars.sh` first (H.1.7).
 5. **Model.** On the H.1.5 command, interleaved fresh processes as in H.9.2, `tg128`:
 
    ```sh
-   for m in 0 2 0 2 0 2; do GGML_SYCL_IQ4_XS_LUT=$m ./build/bin/llama-bench -m <IQ4_XS model> \
+   for m in 0 2 0 2 0 2; do GGML_SYCL_MOE_MV_2ROW=1 GGML_SYCL_IQ4_XS_LUT=$m ./build/bin/llama-bench -m <IQ4_XS model> \
        -dev SYCL0 -ngl 99 -fa on -ub 512 -t 8 -p 0 -n 128 -r 1; done
    ```
 
    Use a model whose expert tensors are mostly IQ4_XS (check with the H.1.5 inventory method). On
    the H.1.5 model only 9% of the expert tensors are IQ4_XS, so the effect would be hidden.
 
-Accept a variant only if it is correct and beats mode 0 at model level. Make it the default by
-changing the flag default, and keep mode 0 available.
+   Also run the same loop with `GGML_SYCL_MOE_MV_2ROW=0 GGML_SYCL_IQ4_XS_LUT=0` once per round, so
+   the old kernel stays in the comparison.
+
+Accept a variant only if it is correct and beats the old kernel (`MOE_MV_2ROW=0`, `LUT=0`) at model
+level. Make it the default by changing the flag defaults, and keep the old path available.
 
 ### I.6 ESIMD variant with `iselect` (only if I.5 shows the lookup is the limit)
 
@@ -3236,11 +3418,9 @@ Notes for the implementer:
 
 ### I.7 Other IQ4_XS decode items (smaller, no example code yet)
 
-- **Idle lanes on `ffn_down_exps`.** K=768 is 3 superblocks per row, and a sub-group covers 2 per
-  pass, so the second pass leaves 8 of 16 lanes idle: 25% waste on about a third of the expert
-  bytes. Fix: when `blocks_per_row % blocks_per_subgroup != 0`, give a sub-group two rows and let
-  idle lanes take the second row's blocks. Measure with the K=768 `perf` case from I.5.
-- **Loads in flight.** A 2048-wide row is 4 passes per lane. Unrolling by 2, with both passes'
+- **Idle lanes on `ffn_down_exps`.** Solved by the two-row kernel of I.3: no lane idles for any
+  valid IQ4_XS shape. Measured by I.5 step 3.
+- **Loads in flight.** With the two-row kernel a 2048-wide row pair is 8 passes per lane. Unrolling by 2, with both passes'
   nibble and activation loads issued before either pass's math, gives the memory system more to
   overlap. Measure with the K=2048 case.
 - **Scale loads.** Each lane rebuilds its 6-bit scale from three loads. Loading `scales_l` as one
