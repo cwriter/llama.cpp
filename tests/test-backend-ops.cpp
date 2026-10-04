@@ -1292,6 +1292,7 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    virtual bool check_backend(ggml_backend_t) { return true; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1559,7 +1560,7 @@ struct test_case {
                                                                fused_nodes_to_verify.size());
 
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
+        bool        test_passed = ud.ok && cmp_ok && check_backend(backend1);
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
@@ -5366,6 +5367,120 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+struct test_mul_mat_id_reused_weight : public test_mul_mat_id {
+    std::vector<ggml_tensor *> outputs;
+    std::vector<uint8_t> weight_bytes;
+
+    test_mul_mat_id_reused_weight(ggml_type type, int64_t k, int64_t n, int n_used, int64_t m = 33)
+        : test_mul_mat_id(type, GGML_TYPE_F32, 5, n_used, false, m, n, k) {}
+
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_REUSED_WEIGHT"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        outputs.clear();
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+        for (int64_t tokens : {int64_t(1), n, int64_t(1)}) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, tokens);
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, tokens);
+            ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+            outputs.push_back(out);
+            ggml_build_forward_expand(gf, out);
+        }
+        sentinels.push_back(as);
+        outputs.push_back(as);
+        return outputs[outputs.size() - 2];
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_mul_mat_id::initialize_tensors(ctx);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> ids(ggml_nelements(t));
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    ids[i] = (i / n_used) % 2;
+                }
+                ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int32_t));
+            }
+        }
+        ggml_tensor * as = outputs.back();
+        weight_bytes.resize(ggml_nbytes(as));
+        ggml_backend_tensor_get(as, weight_bytes.data(), 0, weight_bytes.size());
+    }
+
+    bool check_backend(ggml_backend_t backend) override {
+        if (n == 1) {
+            std::vector<uint8_t> before(ggml_nbytes(outputs.front()));
+            std::vector<uint8_t> after(before.size());
+            ggml_backend_tensor_get(outputs.front(), before.data(), 0, before.size());
+            for (int repeat = 0; repeat < 2; ++repeat) {
+                if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+                    return false;
+                }
+                ggml_backend_tensor_get(outputs.front(), after.data(), 0, after.size());
+                if (before != after) {
+                    return false;
+                }
+            }
+        }
+
+        ggml_tensor * as = outputs.back();
+        const size_t size = weight_bytes.size();
+        std::vector<uint8_t> bytes(size);
+        ggml_backend_tensor_get(as, bytes.data(), 0, size);
+        if (bytes != weight_bytes) {
+            return false;
+        }
+        for (size_t offset : {size_t(1), as->nb[2] - 1, size - 17}) {
+            ggml_backend_tensor_get_async(backend, as, bytes.data(), offset, 17);
+            ggml_backend_synchronize(backend);
+            if (memcmp(bytes.data(), weight_bytes.data() + offset, 17) != 0) {
+                return false;
+            }
+        }
+
+        ggml_context_ptr copy_ctx(ggml_init({8 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true}));
+        ggml_tensor * copy = ::ggml_new_tensor(copy_ctx.get(), type_a, 3, as->ne);
+        ggml_tensor * view = ggml_view_3d(copy_ctx.get(), as, k, m - 1, n_mats, as->nb[1], as->nb[2], as->nb[1]);
+        ggml_tensor * dup = ggml_dup(copy_ctx.get(), view);
+        ggml_cgraph * graph = ggml_new_graph(copy_ctx.get());
+        ggml_build_forward_expand(graph, dup);
+        ggml_backend_buffer_ptr copy_buf(ggml_backend_alloc_ctx_tensors(copy_ctx.get(), backend));
+        if (!copy_buf) {
+            return false;
+        }
+        ggml_backend_tensor_copy(as, copy);
+        ggml_backend_tensor_get(copy, bytes.data(), 0, size);
+        if (bytes != weight_bytes) {
+            return false;
+        }
+        ggml_backend_tensor_copy(copy, as);
+
+        const uint8_t patch[] = {1, 2, 3};
+        ggml_backend_tensor_set_async(backend, as, patch, 2, sizeof(patch));
+        ggml_backend_synchronize(backend);
+        ggml_backend_tensor_get(as, bytes.data(), 0, size);
+        std::vector<uint8_t> expected = weight_bytes;
+        memcpy(expected.data() + 2, patch, sizeof(patch));
+        const bool patched = bytes == expected;
+        ggml_backend_tensor_set(as, weight_bytes.data(), 0, size);
+        ggml_backend_tensor_get(as, bytes.data(), 0, size);
+        if (!patched || bytes != weight_bytes || ggml_backend_graph_compute(backend, graph) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        bytes.resize(ggml_nbytes(dup));
+        ggml_backend_tensor_get(dup, bytes.data(), 0, bytes.size());
+        for (int e = 0; e < n_mats; ++e) {
+            if (memcmp(bytes.data() + e * dup->nb[2], weight_bytes.data() + e * as->nb[2] + as->nb[1], dup->nb[2]) != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 };
 
@@ -10733,6 +10848,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 8, 256, {1, 1}, {1, 1}));
 
+    for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+        for (int64_t k : {256, 512, 768}) {
+            for (int n : {1, 2, 8, 9, 64, 256}) {
+                for (int n_used : {1, 2}) {
+                    test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 5, n_used, false, 33, n, k));
+                }
+            }
+            for (int n_used : {1, 2}) {
+                test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, k, 64, n_used));
+            }
+        }
+    }
+
+    for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+        test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, 256, 1, 2));
+        test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, 256, 256, 2));
+        test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, 2048, 64, 2, 768));
+    }
+
     // token-tile boundary coverage. With n_used == n_mats every token routes to every expert, so
     // each expert receives exactly n rows, with no dependence on the random draw. mul_mm_id is used
     // from 32 tokens up: n = 32, 33, 47, 48, 49 reach it, leaving a last tile of 32, 1, 15, 16 and
@@ -11720,6 +11854,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
 
+    for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+        for (ggml_glu_op op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+            for (int tokens : {1, 2, 8, 9}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, op, tokens, 33, 512,
+                    true, 5, 2, false, false, true, false, {1, 1}));
+            }
+        }
+    }
+
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {
             for (bool use_id : {false, true}) {
@@ -12132,7 +12275,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_XS}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));

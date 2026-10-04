@@ -98,12 +98,15 @@ enum ggml_sycl_reorder_type {
     GGML_SYCL_REORDER_IQ3_S  = 1 << 0,
     GGML_SYCL_REORDER_IQ4_NL = 1 << 1,
     GGML_SYCL_REORDER_Q8_0   = 1 << 2,
+    // These bits control MoE reorder. Dense IQ3_XXS still uses the IQ3_S bit.
+    GGML_SYCL_REORDER_IQ3_XXS = 1 << 3,
+    GGML_SYCL_REORDER_IQ4_XS  = 1 << 4,
 };
 
 // Every type; a new bit is on by default. Q8_0 was left out after an early A/B measured flat, but
 // the reordered q8_0 MoE mat-vec is 5.1x faster and an interleaved llama-bench A/B on qwen4exp
 // measured tg128 +2.5% and pp2048 +1.0%.
-static constexpr int GGML_SYCL_REORDER_DEFAULT = ~0;
+static constexpr int GGML_SYCL_REORDER_DEFAULT = -1;
 
 extern int g_ggml_sycl_reorder_types;
 
@@ -478,6 +481,7 @@ struct ggml_sycl_layout {
 // same idea at different spans, so they share one descriptor rather than a bool beside it.
 struct optimize_feature {
     ggml_sycl_layout layout;
+    bool reorder_allowed = true;
 
     // the whole-tensor SoA that reorder_qw() produces
     bool is_reordered() const { return layout.kind == GGML_SYCL_LAYOUT_SOA_WHOLE; }
