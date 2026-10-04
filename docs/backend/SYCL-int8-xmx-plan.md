@@ -2805,3 +2805,445 @@ The readers are complete and validated on this B60 workload. Both MoE bits remai
 At the contributor's request, IQ3_XXS and IQ4_XS MoE reorder are enabled by default after the H.9 correctness and performance checks. `GGML_SYCL_REORDER_DEFAULT` is now -1, retaining the all-types policy. Set `GGML_SYCL_REORDER_TYPES=7` to disable both or 15 to enable IQ3_XXS alone. Earlier default-off statements describe the experimental validation period. No integer-XMX defaults change.
 
 The native targets rebuild successfully with the new default. With `GGML_SYCL_REORDER_TYPES` unset, the full B60 candidate suite passes 114/114, and diagnostics report `0xffffffff` with both new bits set. The three-card model smoke passes initial pp64, tg16 and later pp64+tg16 with two repetitions and graphs enabled. Logs are `/tmp/sycl-reorder-default-build.log`, `/tmp/sycl-reorder-default-candidate.log` and `/tmp/sycl-reorder-default-three-gpu.{out,err}`.
+
+## Part I: IQ4_XS decode, table lookup in registers (design and example code, nothing built)
+
+Status: plan only. None of the code in this part has been compiled or run. Line numbers refer to
+`fc2542a`. Search for the quoted code if lines moved.
+
+Scope: the reordered IQ4_XS MoE mat-vec used for decode (`mul_mat_vec_q_moe_reorder` and
+`mul_mat_vec_q_moe_reorder_glu` in `mmvq.cpp`), with the dot product
+`reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>` (`vecdotq.hpp:1917-1940`). The same ideas apply to the
+canonical `vec_dot_iq4_xs_q8_1` (`vecdotq.hpp:1907`) and to IQ4_NL, but do this one first.
+
+### I.0 Why
+
+Per 32 weights, one lane of the reordered IQ4_XS dot product does:
+- 4 x 32-bit loads of nibbles, 3 scalar scale loads (`d`, `scales_h`, `scales_l`), 8 x 32-bit loads of
+  q8_1 activations, 1 load of the activation scale;
+- **32 indexed loads from `kvalues_iq4nl`**: the byte-indexed `get_int_from_table_16`
+  (`vecdotq.hpp:114-127`) reads the table once per nibble.
+
+So most load instructions are table reads, not data reads. H.8 measured this op at 30.76 us for
+M=768, K=2048, 8 experts, n=1. That is about 6.7 MB in 30.76 us, roughly 220 GB/s, about half of the
+B60's bandwidth. E.5 measured the same effect on the dense int8 path: an arithmetic stand-in for the
+lookup gave +36%, a register-cached exact table gave +15%. That helper (`iq4nl_grid`) is not on the
+branch.
+
+The vector engines (not XMX itself, which only does matrix multiply-add) can read registers through
+per-lane computed addresses. Two ways to reach that from SYCL:
+- a sub-group shuffle with a variable index (`sycl::select_from_group`), which the compiler lowers
+  to an indirect register move; or
+- ESIMD `simd::iselect`, which reads a vector of indices from a table held in a register.
+
+Neither is free: an indirect register read with a different address per lane runs at reduced rate.
+Measure first (I.2), then build.
+
+### I.1 One flag, four variants
+
+Add one env flag, `GGML_SYCL_IQ4_XS_LUT`, default 0, with the usual four-place pattern
+(definition next to `g_ggml_sycl_moe_xmx` at `ggml-sycl.cpp:127`, extern next to `common.hpp:85`,
+env read next to `ggml-sycl.cpp:454`, startup print next to `ggml-sycl.cpp:623`):
+
+| value | variant | results |
+|---|---|---|
+| 0 | current memory lookup | correct (baseline) |
+| 1 | arithmetic stand-in | **wrong on purpose**, timing only |
+| 2 | sub-group shuffle lookup | correct |
+| 3 | one 16-byte load for the nibbles, memory lookup | correct (alignment test) |
+
+A second flag, `GGML_SYCL_IQ4_XS_ESIMD`, default 0, selects the ESIMD kernel of I.6.
+
+### I.2 The functor, all variants in one template
+
+Add to `vecdotq.hpp`, after `reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>`. Leave that existing
+specialization unchanged: mode 0 dispatches to it.
+
+```cpp
+// 4 nibbles in, one per byte (low 4 bits), -> 4 int8 table values packed in an int.
+// Every lane of the sub-group holds kvalues_iq4nl[lane % 16] in `entry`; the shuffle reads the
+// entry from the lane named by the nibble. All lanes of the sub-group must call this together.
+static __dpct_inline__ int iq4_lookup4_sg(const sycl::sub_group & sg, int entry, uint32_t nib4) {
+    int r = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int idx = (nib4 >> (8 * k)) & 0xF;
+        const int v   = sycl::select_from_group(sg, entry, idx);
+        r |= (v & 0xFF) << (8 * k);
+    }
+    return r;
+}
+
+// Timing stand-in, NOT the IQ4_NL table: byte n -> (n << 4) - 128. Bytes stay 0..15 before the
+// shift, so no carry crosses a byte, and xor 0x80 is the per-byte -128.
+static __dpct_inline__ int iq4_standin4(uint32_t nib4) {
+    return (int) ((nib4 << 4) ^ 0x80808080u);
+}
+
+// MODE: 1 stand-in, 2 sub-group shuffle, 3 one 16-byte nibble load + memory table.
+template <int MODE> struct reorder_vec_dot_iq4_xs_lut {
+    static constexpr ggml_type gtype = GGML_TYPE_IQ4_XS;
+    // mode 2 uses a sub-group shuffle, so its caller must keep the whole sub-group converged
+    static constexpr bool converged_sg = MODE == 2;
+
+    __dpct_inline__ float operator()(const void * __restrict__ vbq, std::pair<int, int> bx,
+                                     std::pair<int, int> ds, const int8_t * q8, const sycl::half2 * q8_ds, int iqs) {
+        const auto *   base     = static_cast<const uint8_t *>(vbq);
+        const auto *   scales_l = base + bx.second;
+        const uint16_t scales_h = *(const uint16_t *) (base + ds.second);
+        const int      scale    = ((scales_l[iqs / 2] >> (4 * (iqs % 2))) & 15) | (((scales_h >> (2 * iqs)) & 3) << 4);
+        const float    d        = (float) *(const ggml_half *) (base + ds.first) * (scale - 32) * q8_ds[iqs][0];
+        const auto *   y        = (const int32_t *) (q8 + iqs * QK8_1);
+
+        uint32_t w[4];
+        if constexpr (MODE == 3) {
+            // the reordered nibble plane puts sub-block iqs of block b at 128*b + 16*iqs: 16-byte aligned
+            const sycl::vec<uint32_t, 4> v = *(const sycl::vec<uint32_t, 4> *) (base + bx.first + 16 * iqs);
+            w[0] = v[0]; w[1] = v[1]; w[2] = v[2]; w[3] = v[3];
+        } else {
+            const auto * q4 = (const uint32_t *) (base + bx.first + 16 * iqs);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                w[j] = q4[j];
+            }
+        }
+
+        int entry = 0;
+        if constexpr (MODE == 2) {
+            const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+            entry = kvalues_iq4nl[sg.get_local_linear_id() % 16];
+        }
+
+        int sum_lo = 0;
+        int sum_hi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            int lo, hi;
+            if constexpr (MODE == 1) {
+                lo = iq4_standin4(w[j] & 0x0F0F0F0F);
+                hi = iq4_standin4((w[j] >> 4) & 0x0F0F0F0F);
+            } else if constexpr (MODE == 2) {
+                const auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+                lo = iq4_lookup4_sg(sg, entry, w[j] & 0x0F0F0F0F);
+                hi = iq4_lookup4_sg(sg, entry, (w[j] >> 4) & 0x0F0F0F0F);
+            } else {
+                get_int_from_table_16(w[j], (const uint8_t *) kvalues_iq4nl, lo, hi);
+            }
+            sum_lo = dpct::dp4a(lo, y[j], sum_lo);
+            sum_hi = dpct::dp4a(hi, y[j + 4], sum_hi);
+        }
+        return d * (sum_lo + sum_hi);
+    }
+};
+
+// true when a dot functor needs the whole sub-group to call it together
+template <typename T, typename = void> struct ggml_sycl_dot_needs_converged_sg : std::false_type {};
+template <typename T>
+struct ggml_sycl_dot_needs_converged_sg<T, std::void_t<decltype(T::converged_sg)>>
+    : std::bool_constant<T::converged_sg> {};
+```
+
+Notes:
+- `lo` and `hi` must match the byte-indexed `get_int_from_table_16`: byte k of `lo` is
+  `table[low nibble of byte k]`, byte k of `hi` is `table[high nibble of byte k]`. The code above
+  does that. Mode 0 tests (`test-backend-ops`) are the check.
+- `sycl::ext::oneapi::this_work_item::get_sub_group()` is already used in this tree
+  (`common.hpp:842`).
+- Mode 3 needs the expert base 16-byte aligned. It is: the buffer alignment is 128
+  (`common.hpp:538`), and the expert stride for the H.1.5 shapes is 136 * 6144 = 835584, a multiple
+  of 16. Add `GGML_ASSERT(expert_weight_stride % 16 == 0)` in the mode-3 dispatch and fall back to
+  mode 0 when it fails.
+
+### I.3 Keep the sub-group converged (needed for mode 2 only)
+
+`select_from_group` is a group function: every lane of the sub-group must reach it. The two kernels
+loop with `for (int i = lane / 8; i < blocks_per_row; i += 2)` (`mmvq.cpp:3866` and the same loop
+in the GLU kernel near `mmvq.cpp:3926`). For `ffn_down_exps` (K=768, 3 superblocks per row), lanes
+8..15 leave the loop one pass before lanes 0..7. Calling a shuffle there is undefined behaviour.
+
+Change the loop in `mul_mat_vec_q_moe_reorder` (`mmvq.cpp:3860-3874`) to this. The old loop stays
+for every other functor:
+
+```cpp
+    float partial_sum = 0.0f;
+    if constexpr (ggml_sycl_dot_needs_converged_sg<reorder_vec_dot_q_sycl>::value) {
+        // every lane runs the same number of passes; a lane past the row end reads an in-range
+        // block and drops its result, so the shuffle inside the dot sees the whole sub-group
+        for (int i0 = 0; i0 < blocks_per_row; i0 += blocks_per_subgroup) {
+            const int  i      = i0 + sg.get_local_linear_id() / block_elements_per_subgroup;
+            const bool active = i < blocks_per_row;
+            const int  ic     = active ? i : blocks_per_row - 1;
+            const int  ibx    = row * blocks_per_row + ic;
+
+            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+
+            const int           iby            = ic * block_type::block_to_q8_1_ratio();
+            const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
+            const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
+
+#pragma unroll
+            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                const int   iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+                const float v   = reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                partial_sum += active ? v : 0.0f;
+            }
+        }
+    } else {
+        // existing loop, unchanged
+        for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
+            // ... as today ...
+        }
+    }
+```
+
+Do the same in `mul_mat_vec_q_moe_reorder_glu` with both `partial_gate` and `partial_up` masked by
+`active`. The `if (row >= nrows) return;` before the loop is fine: `row` is the same for every lane
+of a sub-group.
+
+The ordered-route kernel (`launch_mul_mat_vec_q_moe_reorder_ordered`, call at `mmvq.cpp:4046`) is not
+converted. Mode 2 therefore always takes the plain kernel (I.4 passes `route_order = nullptr`).
+
+### I.4 Dispatch
+
+In `ggml_sycl_mul_mat_vec_q_id_reorder` (`mmvq.cpp`, `case GGML_TYPE_IQ4_XS:`), replace the single
+launch with:
+
+```cpp
+        case GGML_TYPE_IQ4_XS:
+            switch (g_ggml_sycl_iq4_xs_lut) {
+                case 1:
+                    launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_iq4_xs_lut<1>>(
+                        vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                        expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                        dst_token_stride, src1_token_stride, route_order, stream);
+                    return true;
+                case 2:
+                    // the ordered-route kernel is not converged-safe, so always the plain one
+                    launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_iq4_xs_lut<2>>(
+                        vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                        expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                        dst_token_stride, src1_token_stride, nullptr, stream);
+                    return true;
+                case 3:
+                    if (expert_weight_stride % 16 == 0) {
+                        launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_iq4_xs_lut<3>>(
+                            vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                            expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                            dst_token_stride, src1_token_stride, route_order, stream);
+                        return true;
+                    }
+                    break;
+                default:
+                    break;
+            }
+            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                dst_token_stride, src1_token_stride, route_order, stream);
+            return true;
+```
+
+Make the same switch in `ggml_sycl_mul_mat_vec_q_id_reorder_glu` (`case GGML_TYPE_IQ4_XS:`) with
+`launch_mul_mat_vec_q_moe_reorder_glu<reorder_vec_dot_iq4_xs_lut<N>>`; that launcher has no route
+order argument. Decode runs `ffn_gate_exps` and `ffn_up_exps` through the GLU kernel, so without this
+change only `ffn_down_exps` sees the new variant.
+
+`g_ggml_sycl_iq4_xs_lut` is defined in `ggml-sycl.cpp` and declared in `common.hpp`, which
+`mmvq.cpp` includes.
+
+### I.5 Measure in this order
+
+Build with `source /opt/intel/oneapi/setvars.sh` first (H.1.7).
+
+1. **Ceiling (mode 1).** Results are wrong on purpose, so use `perf` mode only:
+
+   ```sh
+   for m in 0 1; do GGML_SYCL_IQ4_XS_LUT=$m ./build/bin/test-backend-ops perf -b SYCL0 -o MUL_MAT_ID -p type_a=iq4_xs; done
+   ```
+
+   Compare the n=1 cases with M=768, K=2048 and with M=2048, K=768 (H.8 uses the first). If mode 1
+   is not clearly faster (less than about 10%), the lookup is not the limit: stop Part I here and
+   record the numbers.
+2. **Correctness of modes 2 and 3:**
+
+   ```sh
+   for m in 2 3; do GGML_SYCL_IQ4_XS_LUT=$m ./build/bin/test-backend-ops -b SYCL0 -o MUL_MAT_ID -p type_a=iq4_xs; done
+   ```
+
+   Both must pass at the existing tolerance. Include a K=768 case, where the down-projection tail
+   of I.3 is hit. Mode 2 without the I.3 loop change may pass by luck and still be wrong. Do not
+   skip I.3.
+3. **Speed of modes 2 and 3:** repeat the `perf` loop of step 1 with `m in 0 2 3`.
+4. **Generated code.** Confirm that mode 2 really uses indirect register moves and mode 3 one
+   16-byte load:
+
+   ```sh
+   GGML_SYCL_IQ4_XS_LUT=2 IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=/tmp/igc-lut2 \
+       ./build/bin/test-backend-ops perf -b SYCL0 -o MUL_MAT_ID -p type_a=iq4_xs
+   grep -l "reorder_vec_dot_iq4_xs_lut" /tmp/igc-lut2/*.asm
+   ```
+
+   In that file look for `r[a0` (indirect register access) for mode 2, and `load.ugm.d32x4` for
+   mode 3. Write down what you see in this document.
+5. **Model.** On the H.1.5 command, interleaved fresh processes as in H.9.2, `tg128`:
+
+   ```sh
+   for m in 0 2 0 2 0 2; do GGML_SYCL_IQ4_XS_LUT=$m ./build/bin/llama-bench -m <IQ4_XS model> \
+       -dev SYCL0 -ngl 99 -fa on -ub 512 -t 8 -p 0 -n 128 -r 1; done
+   ```
+
+   Use a model whose expert tensors are mostly IQ4_XS (check with the H.1.5 inventory method). On
+   the H.1.5 model only 9% of the expert tensors are IQ4_XS, so the effect would be hidden.
+
+Accept a variant only if it is correct and beats mode 0 at model level. Make it the default by
+changing the flag default, and keep mode 0 available.
+
+### I.6 ESIMD variant with `iselect` (only if I.5 shows the lookup is the limit)
+
+Build this only if mode 1 shows a large ceiling and mode 2 recovers little of it. ESIMD lets one
+hardware thread hold the 16-byte table in a register and look up a whole vector of indices with
+`simd::iselect`, without a shuffle per value.
+
+This is a new kernel for the non-GLU path. It follows the shape of the existing ESIMD mat-vec in
+`dmmv.cpp:1880-1960`: one work-group of `GGML_SYCL_DMMV_ESIMD_WG_SIZE` (4) ESIMD threads per output
+row, threads stride over the superblocks, partial sums meet in SLM. Put it in `dmmv.cpp` next to the
+other ESIMD kernels, behind `#ifdef GGML_SYCL_DMMV_HAS_ESIMD`.
+
+Data layouts, from code on the branch:
+- weights, per expert (`reorder_qw_iq4_xs_moe`, `ggml-sycl.cpp`): `[qs: 128 * nb][d: 2 * nb][scales_h: 2 * nb][scales_l: 4 * nb]`
+  with `nb = nrows * ncols / 256`;
+- activations, per (token, slot) row (`quantize_and_reorder_q8_1_soa`, `quantize.hpp:70-90`):
+  `[qs: ncols int8][ds: (ncols / 32) half2]`, `ds[k][0]` is the scale of 32-value block k.
+
+```cpp
+template <int WG>
+static void mul_mat_vec_moe_iq4_xs_esimd(
+        const char * vx_base, const char * vy_base, char * dst_base, const char * ids_dev,
+        const int ncols, const int nrows,
+        const size_t expert_weight_stride, const size_t dst_row_stride, const size_t src1_row_stride,
+        const size_t ids_token_stride, const size_t dst_token_stride, const size_t src1_token_stride,
+        sycl::local_accessor<float, 1> lmem, const sycl::nd_item<3> & it) {
+    using namespace sycl::ext::intel::esimd;
+
+    const int token = it.get_group(0);
+    const int slot  = it.get_group(1);
+    const int row   = it.get_group(2);
+    const int tid   = it.get_local_id(2);
+
+    const int32_t  expert = ((const int32_t *) (ids_dev + (size_t) token * ids_token_stride))[slot];
+    const uint8_t * x     = (const uint8_t *) (vx_base + (size_t) expert * expert_weight_stride);
+    const int8_t *  yq    = (const int8_t *) (vy_base + (size_t) token * src1_token_stride + (size_t) slot * src1_row_stride);
+    const sycl::half2 * yds = (const sycl::half2 *) ((const char *) yq + ncols);
+
+    const int    nbr = ncols / QK_K;             // superblocks per row
+    const size_t nb  = (size_t) nrows * nbr;     // superblocks in this expert
+
+    // the 16-entry table, in one register
+    simd<int8_t, 16> table;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+        table[i] = kvalues_iq4nl[i];
+    }
+
+    float acc = 0.0f;
+    for (int ib = tid; ib < nbr; ib += WG) {
+        const size_t ibx = (size_t) row * nbr + ib;
+
+        const simd<uint8_t, 128> qs = block_load<uint8_t, 128>(x + 128 * ibx);
+        const float    d   = (float) *(const sycl::half *) (x + 128 * nb + 2 * ibx);
+        const uint16_t sh  = *(const uint16_t *) (x + 130 * nb + 2 * ibx);
+        const uint32_t sl4 = *(const uint32_t *) (x + 132 * nb + 4 * ibx);
+
+        // sub-block j: values 0..15 are the low nibbles of qs[16j .. 16j+15], 16..31 the high nibbles
+        simd<uint16_t, 256> idx;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const simd<uint16_t, 16> b = qs.select<16, 1>(16 * j);
+            idx.select<16, 1>(32 * j)      = b & 0xF;
+            idx.select<16, 1>(32 * j + 16) = b >> 4;
+        }
+        const simd<int8_t, 256> w = table.iselect(idx);   // the register-indirect lookup
+
+        const simd<int8_t, 256> a = block_load<int8_t, 256>(yq + (size_t) QK_K * ib);
+        const simd<int16_t, 256> p = convert<int16_t>(w) * convert<int16_t>(a);   // |p| <= 127 * 127
+
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int   s   = reduce<int>(convert<int>(p.select<32, 1>(32 * j)), std::plus<>{});
+            const int   sc6 = ((sl4 >> (8 * (j / 2) + 4 * (j % 2))) & 15) | (((sh >> (2 * j)) & 3) << 4);
+            const float da  = (float) yds[ib * (QK_K / QK8_1) + j][0];
+            acc += d * (float) (sc6 - 32) * da * (float) s;
+        }
+    }
+
+    lmem[tid] = acc;
+    it.barrier(sycl::access::fence_space::local_space);
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int p = 0; p < WG; ++p) {
+            sum += lmem[p];
+        }
+        float * dst = (float *) (dst_base + (size_t) token * dst_token_stride + (size_t) slot * dst_row_stride);
+        dst[row] = sum;
+    }
+}
+
+static void launch_mul_mat_vec_moe_iq4_xs_esimd(
+        const void * vx_base, const void * vy, const int32_t * ids_dev, float * dst_base,
+        int ncols, int nrows, int n_experts_used, int n_tokens,
+        size_t expert_weight_stride, size_t dst_row_stride, size_t src1_row_stride,
+        size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
+        dpct::queue_ptr stream) {
+    constexpr int WG = ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE;
+    GGML_ASSERT(ncols % QK_K == 0);
+    GGML_ASSERT(expert_weight_stride % 16 == 0);   // block_load of the nibble plane needs it
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG), h);
+        h.parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(n_tokens, n_experts_used, (size_t) nrows * WG),
+                              sycl::range<3>(1, 1, WG)),
+            [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+                mul_mat_vec_moe_iq4_xs_esimd<WG>(
+                    (const char *) vx_base, (const char *) vy, (char *) dst_base, (const char *) ids_dev,
+                    ncols, nrows, expert_weight_stride, dst_row_stride, src1_row_stride,
+                    ids_token_stride, dst_token_stride, src1_token_stride, lmem, it);
+            });
+    });
+}
+```
+
+Notes for the implementer:
+- Check the ESIMD spelling against the installed headers before writing more code: `iselect` is a
+  member of `simd` taking a `simd<uint16_t, N>` of element indices and returning `simd<T, N>`. If a
+  256-wide `iselect` does not compile or splits badly, do 8 calls of 32 indices each, one per
+  sub-block. Check `block_load` alignment rules too: the nibble plane is 16-byte aligned, the
+  activation quants are 32-byte aligned per superblock.
+- `sl4` reads the four `scales_l` bytes of one superblock with one 32-bit load. The plane offset is
+  `132 * nb + 4 * ibx`, which is 4-byte aligned.
+- The sub-scale math is the one from `reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_XS>`:
+  `((scales_l[j/2] >> 4*(j%2)) & 15) | (((scales_h >> 2*j) & 3) << 4)`, minus 32.
+- Dispatch: in `ggml_sycl_mul_mat_vec_q_id_reorder`, `case GGML_TYPE_IQ4_XS:`, before the I.4
+  switch, add
+  `if (g_ggml_sycl_iq4_xs_esimd) { launch_mul_mat_vec_moe_iq4_xs_esimd(...); return true; }`.
+  Export the launcher through `dmmv.hpp`, and guard it with `GGML_SYCL_DMMV_HAS_ESIMD` like
+  `ggml_sycl_supports_reorder_esimd` (`ggml-sycl.cpp:4851`).
+- A GLU version takes two weight bases, runs the same loop twice per superblock against the same
+  `a`, and applies `op_silu` / `op_gelu` in the `tid == 0` epilogue, exactly as
+  `mul_mat_vec_q_moe_reorder_glu` does. Write it only after the plain kernel is faster on the
+  `ffn_down_exps` shape.
+- Test and measure as in I.5, with `GGML_SYCL_IQ4_XS_ESIMD=1` in place of the LUT flag.
+
+### I.7 Other IQ4_XS decode items (smaller, no example code yet)
+
+- **Idle lanes on `ffn_down_exps`.** K=768 is 3 superblocks per row, and a sub-group covers 2 per
+  pass, so the second pass leaves 8 of 16 lanes idle: 25% waste on about a third of the expert
+  bytes. Fix: when `blocks_per_row % blocks_per_subgroup != 0`, give a sub-group two rows and let
+  idle lanes take the second row's blocks. Measure with the K=768 `perf` case from I.5.
+- **Loads in flight.** A 2048-wide row is 4 passes per lane. Unrolling by 2, with both passes'
+  nibble and activation loads issued before either pass's math, gives the memory system more to
+  overlap. Measure with the K=2048 case.
+- **Scale loads.** Each lane rebuilds its 6-bit scale from three loads. Loading `scales_l` as one
+  `uint32` (as the ESIMD sketch does) saves a little. Expect little.
+- **Rejected:** storing a precomputed scale per 32 values. It needs 16 bytes per superblock
+  instead of 8, so the reordered weights would grow, which breaks the same-size rule of Part G.
