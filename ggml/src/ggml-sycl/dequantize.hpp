@@ -1812,6 +1812,25 @@ dequantize_block_iq4_xs(const void *__restrict__ vx, dst_t *__restrict__ yy,
 }
 
 template<typename dst_t>
+static void dequantize_block_iq4_xs_reorder(const void * vx, dst_t * yy, const sycl::nd_item<3> & item, int64_t nb) {
+    const int64_t i = item.get_group(2);
+    const int64_t tid = item.get_local_id(2);
+    const int il = tid / 8;
+    const int ib = tid % 8;
+    const auto * base = static_cast<const uint8_t *>(vx);
+    const auto * qs = base + 128 * i + 16 * ib + 4 * il;
+    const auto * scales_l = base + 132 * nb + 4 * i;
+    const uint16_t scales_h = *(const uint16_t *) (base + 130 * nb + 2 * i);
+    const float d = (float) *(const ggml_half *) (base + 128 * nb + 2 * i) *
+                    ((((scales_l[ib / 2] >> (4 * (ib % 2))) & 15) | (((scales_h >> (2 * ib)) & 3) << 4)) - 32);
+    dst_t * y = yy + i * QK_K + 32 * ib + 4 * il;
+    for (int j = 0; j < 4; ++j) {
+        y[j] = d * kvalues_iq4nl[qs[j] & 15];
+        y[j + 16] = d * kvalues_iq4nl[qs[j] >> 4];
+    }
+}
+
+template<typename dst_t>
 static void dequantize_block_mxfp4(const void * __restrict__ vx, dst_t * __restrict__ yy,
                                    const sycl::nd_item<3> &item_ct1) {
     // auto                item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();

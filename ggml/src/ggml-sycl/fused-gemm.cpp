@@ -443,14 +443,7 @@ static __dpct_inline__ void fg_pack_quarter(const float * __restrict__ t, typena
 }
 
 template <typename E>
-static __dpct_inline__ void fg_stage_a(const block_iq4_xs * __restrict__ xrow, const int kb, typename E::pair * a) {
-    const block_iq4_xs * blk = xrow + kb / (QK_K / 32);
-    const int ib = kb % (QK_K / 32);
-    // low nibbles fill the first half of the step, high nibbles the second, so the two halves
-    // land at a[0..7] and a[8..15] and no quarter loop is needed
-    const float d = (float) blk->d *
-        ((((blk->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((blk->scales_h >> (2 * ib)) & 3) << 4)) - 32);
-    const uint8_t * q4 = blk->qs + 16 * ib;
+static __dpct_inline__ void fg_decode_iq4_xs(const uint8_t * __restrict__ q4, const float d, typename E::pair * a) {
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         a[j]     = E::make(d * kvalues_iq4nl[q4[2 * j] & 0xf], d * kvalues_iq4nl[q4[2 * j + 1] & 0xf]);
@@ -459,13 +452,17 @@ static __dpct_inline__ void fg_stage_a(const block_iq4_xs * __restrict__ xrow, c
 }
 
 template <typename E>
-static __dpct_inline__ void fg_stage_a(const block_iq3_xxs * __restrict__ xrow, const int kb, typename E::pair * a) {
-    const block_iq3_xxs * blk = xrow + kb / (QK_K / 32);
+static __dpct_inline__ void fg_stage_a(const block_iq4_xs * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_iq4_xs * blk = xrow + kb / (QK_K / 32);
     const int ib = kb % (QK_K / 32);
-    const uint8_t *  q3    = blk->qs + 8 * ib;
-    const uint16_t * gas   = (const uint16_t *) (blk->qs + QK_K / 4) + 2 * ib;
-    const uint32_t   aux32 = gas[0] | (gas[1] << 16);
-    const float      d     = (float) blk->d * (0.5f + (aux32 >> 28)) * 0.5f;
+    const float d = (float) blk->d *
+        ((((blk->scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((blk->scales_h >> (2 * ib)) & 3) << 4)) - 32);
+    fg_decode_iq4_xs<E>(blk->qs + 16 * ib, d, a);
+}
+
+template <typename E>
+static __dpct_inline__ void fg_decode_iq3_xxs(const uint8_t * __restrict__ q3, const uint32_t aux32,
+                                             const float d, typename E::pair * a) {
 #pragma unroll
     for (int il = 0; il < 4; ++il) {
         const uint8_t * grid1 = (const uint8_t *) (iq3xxs_grid + q3[2 * il + 0]);
@@ -479,6 +476,16 @@ static __dpct_inline__ void fg_stage_a(const block_iq3_xxs * __restrict__ xrow, 
         }
         fg_pack_quarter<E>(t, a, il);
     }
+}
+
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_iq3_xxs * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_iq3_xxs * blk = xrow + kb / (QK_K / 32);
+    const int ib = kb % (QK_K / 32);
+    const uint16_t * gas = (const uint16_t *) (blk->qs + QK_K / 4) + 2 * ib;
+    const uint32_t aux32 = gas[0] | (uint32_t(gas[1]) << 16);
+    const float d = (float) blk->d * (0.5f + (aux32 >> 28)) * 0.5f;
+    fg_decode_iq3_xxs<E>(blk->qs + 8 * ib, aux32, d, a);
 }
 
 template <typename E>
@@ -867,6 +874,121 @@ template <> struct fg_reorder_a<block_iq3_s> {
     }
 };
 
+template <> struct fg_reorder_a<block_iq3_xxs> {
+    static constexpr bool supported = true;
+    static constexpr bool lite      = true;
+
+    static_assert(3 * QK_K / 8 + sizeof(ggml_half) == sizeof(block_iq3_xxs),
+                  "the iq3_xxs reorder layout must cover the canonical block");
+
+    struct regs_lite {
+        float d;
+    };
+
+    static __dpct_inline__ regs_lite load_lite(const uint8_t * __restrict__ xb, const int ib, const int nblocks) {
+        return {(float) *(const ggml_half *) (xb + (size_t) nblocks * (3 * QK_K / 8) + (size_t) ib * sizeof(ggml_half))};
+    }
+
+    template <typename E>
+    static __dpct_inline__ void decode_payload(const uint8_t * __restrict__ qs, const float d,
+                                               const int ib8, typename E::pair * a) {
+        const uint16_t * gas = (const uint16_t *) (qs + QK_K / 4) + 2 * ib8;
+        const uint32_t aux32 = gas[0] | (uint32_t(gas[1]) << 16);
+        fg_decode_iq3_xxs<E>(qs + 8 * ib8, aux32, d * (0.5f + (aux32 >> 28)) * 0.5f, a);
+    }
+
+    template <typename E>
+    static __dpct_inline__ void decode_lite(const regs_lite & r, const uint8_t * __restrict__ xb, const int ib,
+                                            const int, const int ib8, typename E::pair * a) {
+        decode_payload<E>(xb + (size_t) ib * (3 * QK_K / 8), r.d, ib8, a);
+    }
+
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * __restrict__ xb, const int ib_row, const int nblocks,
+                                      const int kb, typename E::pair * a) {
+        const int ib = ib_row + kb / (QK_K / 32);
+        decode_lite<E>(load_lite(xb, ib, nblocks), xb, ib, nblocks, kb % (QK_K / 32), a);
+    }
+
+    struct regs {
+        // The payload also contains the sign and sub-scale bytes.
+        alignas(uint16_t) uint8_t qs[3 * QK_K / 8];
+        float d;
+    };
+
+    static __dpct_inline__ regs load(const uint8_t * __restrict__ xb, const int ib, const int nblocks) {
+        regs r;
+        fg_load_bytes<3 * QK_K / 8>(r.qs, xb + (size_t) ib * (3 * QK_K / 8));
+        r.d = load_lite(xb, ib, nblocks).d;
+        return r;
+    }
+
+    template <typename E>
+    static __dpct_inline__ void decode(const regs & r, const int ib8, typename E::pair * a) {
+        decode_payload<E>(r.qs, r.d, ib8, a);
+    }
+};
+
+template <> struct fg_reorder_a<block_iq4_xs> {
+    static constexpr bool supported = true;
+    static constexpr bool lite      = true;
+
+    static_assert(QK_K / 2 + 2 * sizeof(ggml_half) + 4 == sizeof(block_iq4_xs),
+                  "the iq4_xs reorder layout must cover the canonical block");
+
+    struct regs_lite {
+        float d;
+        uint16_t scales_h;
+        uint8_t scales_l[4];
+    };
+
+    static __dpct_inline__ regs_lite load_lite(const uint8_t * __restrict__ xb, const int ib, const int nblocks) {
+        regs_lite r;
+        r.d = (float) *(const ggml_half *) (xb + (size_t) nblocks * 128 + (size_t) ib * 2);
+        r.scales_h = *(const uint16_t *) (xb + (size_t) nblocks * 130 + (size_t) ib * 2);
+        fg_load_bytes<4>(r.scales_l, xb + (size_t) nblocks * 132 + (size_t) ib * 4);
+        return r;
+    }
+
+    template <typename E>
+    static __dpct_inline__ void decode_payload(const uint8_t * __restrict__ qs, const regs_lite & r,
+                                               const int ib8, typename E::pair * a) {
+        const float d = r.d *
+            ((((r.scales_l[ib8 / 2] >> (4 * (ib8 % 2))) & 0xf) | (((r.scales_h >> (2 * ib8)) & 3) << 4)) - 32);
+        fg_decode_iq4_xs<E>(qs + 16 * ib8, d, a);
+    }
+
+    template <typename E>
+    static __dpct_inline__ void decode_lite(const regs_lite & r, const uint8_t * __restrict__ xb, const int ib,
+                                            const int, const int ib8, typename E::pair * a) {
+        decode_payload<E>(xb + (size_t) ib * 128, r, ib8, a);
+    }
+
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * __restrict__ xb, const int ib_row, const int nblocks,
+                                      const int kb, typename E::pair * a) {
+        const int ib = ib_row + kb / (QK_K / 32);
+        decode_lite<E>(load_lite(xb, ib, nblocks), xb, ib, nblocks, kb % (QK_K / 32), a);
+    }
+
+    struct regs {
+        uint8_t qs[QK_K / 2];
+        regs_lite scales;
+    };
+
+    static __dpct_inline__ regs load(const uint8_t * __restrict__ xb, const int ib, const int nblocks) {
+        regs r;
+        fg_load_bytes<QK_K / 2>(r.qs, xb + (size_t) ib * (QK_K / 2));
+        r.scales = load_lite(xb, ib, nblocks);
+        return r;
+    }
+
+    template <typename E>
+    static __dpct_inline__ void decode(const regs & r, const int ib8, typename E::pair * a) {
+        decode_payload<E>(r.qs, r.scales, ib8, a);
+    }
+};
+
 template <> struct fg_reorder_a<block_q8_0> {
     static constexpr bool supported = true;
     static constexpr bool lite      = false;  // one block is one k step
@@ -1204,7 +1326,7 @@ template <typename block_q_t> struct fg_regs_policy<block_q_t, true> {
 // The image is laid out so the A stages above decode it UNCHANGED: the SoA image is the same
 // stream layout with the slice's block count replaced by SG_ROWS and the block index by the local
 // row, and the canonical image is simply SG_ROWS consecutive blocks. Only the base pointer and
-// its address space change, so all 13 fg_stage_a() overloads and all 6 fg_reorder_a<>
+// its address space change, so all 13 fg_stage_a() overloads and all fg_reorder_a<>
 // specializations stay exactly as they are.
 // ---------------------------------------------------------------------------------------------
 
@@ -1225,6 +1347,16 @@ template <> struct fg_soa_layout<block_iq4_nl> {
 template <> struct fg_soa_layout<block_iq3_s> {
     static constexpr int nstreams  = 4;
     static constexpr int stream[4] = { QK_K / 4, QK_K / 32, QK_K / 8, (int) sizeof(ggml_half) + IQ3S_N_SCALE };
+};
+
+template <> struct fg_soa_layout<block_iq3_xxs> {
+    static constexpr int nstreams  = 2;
+    static constexpr int stream[2] = { 3 * QK_K / 8, (int) sizeof(ggml_half) };
+};
+
+template <> struct fg_soa_layout<block_iq4_xs> {
+    static constexpr int nstreams  = 4;
+    static constexpr int stream[4] = { QK_K / 2, (int) sizeof(ggml_half), (int) sizeof(uint16_t), 4 };
 };
 
 template <> struct fg_soa_layout<block_q8_0> {
@@ -1259,6 +1391,8 @@ template <typename block_q_t> static constexpr int fg_soa_total() {
 
 static_assert(fg_soa_total<block_iq4_nl>() == (int) sizeof(block_iq4_nl), "iq4_nl SoA streams must cover the block");
 static_assert(fg_soa_total<block_iq3_s>()  == (int) sizeof(block_iq3_s),  "iq3_s SoA streams must cover the block");
+static_assert(fg_soa_total<block_iq3_xxs>() == (int) sizeof(block_iq3_xxs), "iq3_xxs SoA streams must cover the block");
+static_assert(fg_soa_total<block_iq4_xs>()  == (int) sizeof(block_iq4_xs),  "iq4_xs SoA streams must cover the block");
 static_assert(fg_soa_total<block_q8_0>()   == (int) sizeof(block_q8_0),   "q8_0 SoA streams must cover the block");
 static_assert(fg_soa_total<block_q4_K>()   == (int) sizeof(block_q4_K),   "q4_K SoA streams must cover the block");
 static_assert(fg_soa_total<block_q5_K>()   == (int) sizeof(block_q5_K),   "q5_K SoA streams must cover the block");

@@ -220,6 +220,26 @@ template <> struct block_q_t<GGML_TYPE_IQ3_XXS> {
     static constexpr int block_to_q8_1_ratio() { return traits::qk / QK8_1; }
 };
 
+template <> struct block_q_t<GGML_TYPE_IQ4_XS> {
+    struct traits {
+        static constexpr uint32_t qk = QK_K;
+        static constexpr uint32_t qi = QI4_XS / 4;
+        static constexpr uint32_t qr = QR4_XS;
+        static constexpr uint32_t vdr_mmvq = 1;
+    };
+
+    static constexpr std::pair<int, int> get_block_offset(int b, int nb) {
+        return {128 * b, 132 * nb + 4 * b};
+    }
+
+    static constexpr std::pair<int, int> get_d_offset(int nrows, int ncols, int b) {
+        const int nb = nrows * (ncols / QK_K);
+        return {128 * nb + 2 * b, 130 * nb + 2 * b};
+    }
+
+    static constexpr int block_to_q8_1_ratio() { return QK_K / QK8_1; }
+};
+
 template <> struct block_q_t<GGML_TYPE_IQ3_S> {
     struct traits {
         static constexpr uint32_t qk       = QK_K;
