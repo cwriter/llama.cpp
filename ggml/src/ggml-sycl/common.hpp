@@ -86,7 +86,6 @@ extern int g_ggml_sycl_moe_xmx;
 extern int g_ggml_sycl_fused_gemm;
 extern int g_ggml_sycl_grouped_gemm;
 extern int g_ggml_sycl_esimd_q8_0;
-extern int g_ggml_sycl_fuse_qsa_score;
 extern int g_ggml_sycl_fuse_qsa_fa_mask;
 extern int g_ggml_sycl_qsa_fa_no_readback;
 extern int g_ggml_sycl_small_gemm;

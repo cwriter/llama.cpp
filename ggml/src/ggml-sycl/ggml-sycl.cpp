@@ -75,7 +75,6 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/qsa-mask.hpp"
 #include "ggml-sycl/census.hpp"
-#include "ggml-sycl/qsa-score.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/set_rows.hpp"
@@ -132,7 +131,6 @@ int g_ggml_sycl_fused_gemm = 1;
 int g_ggml_sycl_grouped_gemm = 1;
 int g_ggml_sycl_mmid_sched = 0;
 int g_ggml_sycl_wide_loads = GGML_SYCL_WIDE_LOADS_DEFAULT;
-int g_ggml_sycl_fuse_qsa_score = 1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_qsa_fa_no_readback = 0;
 int g_ggml_sycl_small_gemm = 1;
@@ -494,7 +492,6 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fused_gemm = ggml_sycl_get_env("GGML_SYCL_FUSED_GEMM", 1);
         g_ggml_sycl_grouped_gemm = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM", 1);
         g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", 0);
-        g_ggml_sycl_fuse_qsa_score = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_SCORE", 1);
         g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 1);
         g_ggml_sycl_qsa_fa_no_readback = ggml_sycl_get_env("GGML_SYCL_QSA_FA_NO_READBACK", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
@@ -663,7 +660,6 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_GROUPED_GEMM: %d\n", g_ggml_sycl_grouped_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MMID_SCHED: %d\n", g_ggml_sycl_mmid_sched);
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
-        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_SCORE: %d\n", g_ggml_sycl_fuse_qsa_score);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
         GGML_LOG_INFO("  GGML_SYCL_QSA_FA_NO_READBACK: %d\n", g_ggml_sycl_qsa_fa_no_readback);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
@@ -8904,10 +8900,6 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 // every predicate here is purely structural, so it holds for every later execution
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
-    // the indexer score GEMM, its relu and the head sums that the tiled epilogue replaces
-    if (const int n = ggml_sycl_qsa_score_absorbs(cgraph, node_idx)) {
-        return n;
-    }
     // the QSA mask chain, which flash attention reads from the selection list instead
     if (const int n = ggml_sycl_qsa_mask_absorbs(cgraph, node_idx)) {
         return n;
