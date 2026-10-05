@@ -117,7 +117,7 @@ Server results after mode 3 became the default, all defaults, 131k context:
 **Upstream k-pool QSA (#29751) and MTP (#29761).** The branch follows upstream qwen4exp since 2026-10-02.
 - The indexer now caches pooled block keys and selects blocks; MTP-off decode at 100k went from 54 to 33 ms/token.
 - Still needed on this graph, measured at 131k with pipeline mode and MTP (2 rounds each):
-  - QSA indexer score fusion: -463 MiB compute per card; without it card 0 pages (pp32k 1487 -> 956).
+  - QSA indexer score fusion: -463 MiB compute per card; without it card 0 pages (pp32k 1487 -> 956). Removed in the 2026-10-05 rebase: upstream #29825 computes the score with `ggml_lightning_indexer`, which never materializes per-head scores, so the chain it matched is gone. Re-measure memory and pp32k on the SYCL lightning indexer kernel (see `SYCL-rebase-notes.md`).
   - QSA mask fusion, flash attention reads the selection list (`GGML_SYCL_FUSE_QSA_FA_MASK`, now 0 or 1): -334 MiB per card, pp32k +2.6%.
   - `GGML_SYCL_QSA_FA_NO_READBACK=1`: pp32k 697 -> 1487, fill to 100k 575 -> 1258.
   - Compact KQ mask: +960 MiB per card without it, which pages.
