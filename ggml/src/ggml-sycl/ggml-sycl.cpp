@@ -8501,7 +8501,8 @@ static bool mul_mat_uses_library_gemm(ggml_backend_sycl_context * ctx, ggml_tens
     const int64_t flops = M * N * K;
     bool          dnnl_takes_it = false;
 #if GGML_SYCL_DNNL
-    dnnl_takes_it = g_ggml_sycl_enable_dnn && !(flops < GGML_SYCL_SK_MAX_MNK);
+    dnnl_takes_it = g_ggml_sycl_enable_dnn && !(flops < GGML_SYCL_SK_MAX_MNK) &&
+                    ggml_sycl_dnnl_has_optimized_gemm(ctx->device);
 #endif
     if (!dnnl_takes_it && g_ggml_sycl_small_gemm && flops < GGML_SYCL_SK_MAX_MNK &&
         ggml_sycl_small_gemm_f32_shape_ok(M, N, K, src0->ne[0], dst->ne[0]) &&
