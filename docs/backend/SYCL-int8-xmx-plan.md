@@ -786,6 +786,8 @@ an unmatched filter reports success. Always confirm the case count in the output
 
 ## Part B: QSA indexer score in int8 (`qsa-score.cpp`)
 
+**Obsolete since the 2026-10-05 rebase.** Upstream #29825 computes the qwen4exp indexer score with `ggml_lightning_indexer`, and `qsa-score.cpp` was removed. The same int8 idea would now apply to the SYCL lightning indexer kernel (`lightning-indexer.cpp`); measure that kernel first.
+
 **Implemented, correct in both modes, and REJECTED on performance.** 1024 blocks equal, 8192
 blocks 2.5% slower, 32768 blocks 0.7% faster. Flag stays 0.
 
