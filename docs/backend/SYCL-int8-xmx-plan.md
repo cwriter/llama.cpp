@@ -1,8 +1,8 @@
 # SYCL: int8 XMX implementation plan
 
-Status: Parts A-D record completed experiments on Intel Arc Pro B60 (bmg-g21) with oneAPI 2026.1, except for D.2, whose device-program build fails. None of those replacement paths demonstrated a repeatable win over its existing competitor. E includes later experiments and unmeasured proposals; F and G are open leads. The grid-cache improvement is already in the source, while the query-tile gains are environment settings. Historical measurements below were not rerun during this document review.
+Status (2026-10-05): all plan elements have been visited. Parts A-E retain archived results and stop conditions. Current exact lookup, two-row, aligned-load, packed-scale, preload and ESIMD experiments are implemented and tested behind default-off controls. Five-round operator, GRF128/256, compact-tile reader and three-GPU qwen4exp comparisons are complete in I.8-I.14 and J. No new experiment meets the model-level acceptance gate. Conditional follow-ups stop at their failed prerequisite; no rejected archive is reconstructed.
 
-Review date: 2026-10-03. The implementation pointers refer to the current working tree, including its local SYCL changes. Historical line numbers refer to `performance_uplift_mega_branch` at `fbb9699`; use symbol names to locate code. Part H is the current implementation handoff and takes precedence over historical instructions.
+Review date: 2026-10-03. The implementation pointers refer to the current working tree, including its local SYCL changes. Historical line numbers refer to `performance_uplift_mega_branch` at `fbb9699`; use symbol names to locate code. Part H records the completed reader handoff; Part I is the current decode experiment and takes precedence over historical instructions.
 
 Goal: use the int8 XMX path (s8 x s8 -> s32, one 8x16x32 `joint_matrix_mad` per sub-group) where
 it beats f16 XMX, and stay in the integer domain where the math allows it.
@@ -10,7 +10,7 @@ it beats f16 XMX, and stay in the integer domain where the math allows it.
 ## How to use this document
 
 - Parts A-D are an experiment archive. Do not copy their sketches into the tree again; the current signatures, dispatch and layout support have changed.
-- Start with Part H for remaining work. It defines prerequisites, layout contracts, implementation order, and stop conditions. Implement one experiment at a time and let the contributor review the design before code changes.
+- Use Part H for prerequisites and layout contracts, then Part I for the current decode work. They define implementation order and stop conditions. Implement one experiment at a time and let the contributor review the design before code changes.
 - Part E lists ideas that were checked and rejected, so nobody re-does that work.
 - Naming: use `XMX_INT` / `xmx_int` for integer-XMX paths. MoE layout work should follow the existing `reorder_qw` and `reorder_vec_dot_q_sycl` names.
 - Rules for every part:
@@ -2082,9 +2082,7 @@ select instead of a dependent load. The table is hand-tuned (gaps 23,21,18,16,14
     iq3_xxs     6.69      15.54      2.3x
 
 **+15% exact, 32/32 iq4_xs and iq4_nl `MUL_MAT` pass.** The select chain costs about half of what
-the arithmetic stand-in gained, so 15% of a possible 36% is the realistic figure. This is the only
-change in the whole document that makes an existing path faster rather than merely different, and
-it carries no precision cost of any kind.
+the arithmetic stand-in gained, so 15% of a possible 36% is the realistic figure. This was the speedup in that archived integer-XMX series, with no precision cost. It does not establish a gain for the current ordered integer or floating-point XMX kernels; their new comparisons are recorded in I.10 and Part J.
 
 It does not change any verdict. `iq4_nl` at 7.02 against a 14.26 library is the closest any int8
 XMX path has come - 2.0x - and that is still a loss. The other IQ grids require a separate design: they contain 256 or 512 entries, occupying 1-2 KiB, rather than the 16 bytes cached here. The existing `fg_grid_traits` SLM staging is a useful reference; it does not imply a similar gain in this kernel.
@@ -2152,8 +2150,7 @@ This experiment shows no measurable benefit from removing Q8_0 staging on this s
 
 ## Part F: open lead, not yet measured
 
-Everything here is unmeasured. Nothing in this part has been built or benchmarked. It is recorded
-because the reasoning is sound and the two missing facts are cheap to get.
+The proposed fusion remains unimplemented. The prerequisite audit in J.2 finds fused Gated Delta Net and HC nodes on the selected model, and F32 PLE weights. The unfused scalar-decay and quantized-PLE-cast targets are absent in that execution; these leads stop at their applicability gates.
 
 ### F.1 The lead: fuse scalar decay in the non-KDA chunking branch
 
@@ -2340,7 +2337,7 @@ Defer an M/K tiled weight layout until the ordinary SoA experiment is measured. 
 
 #### G.2.1 Follow-up: aligned payload-and-scale tiles
 
-This remains an unmeasured proposal. The ordinary SoA fused-GEMM readers are complete and validated in H.9, so decode and later prefill can share the same weights efficiently. Next compare a tile-local payload/scale permutation against that completed implementation, holding the math, routing, staging policy and persistent byte count fixed.
+The isolated reader comparison is complete in J.1. Compact tiles fail the performance gate against the completed SoA readers, including a GRF256 repeat. No production tiled layout or producer is enabled. The following specification records the tested permutation and the integration requirements that would apply if a future reader passed that gate.
 
 | format | blocks in a full tile | payload bytes | metadata bytes | tile bytes |
 |---|---|---|---|---|
@@ -2806,10 +2803,26 @@ At the contributor's request, IQ3_XXS and IQ4_XS MoE reorder are enabled by defa
 
 The native targets rebuild successfully with the new default. With `GGML_SYCL_REORDER_TYPES` unset, the full B60 candidate suite passes 114/114, and diagnostics report `0xffffffff` with both new bits set. The three-card model smoke passes initial pp64, tg16 and later pp64+tg16 with two repetitions and graphs enabled. Logs are `/tmp/sycl-reorder-default-build.log`, `/tmp/sycl-reorder-default-candidate.log` and `/tmp/sycl-reorder-default-three-gpu.{out,err}`.
 
-## Part I: IQ4_XS decode, table lookup in registers (design and example code, nothing built)
+## Part I: IQ4_XS decode, table lookup in registers (lookup-ceiling experiment and follow-up designs)
 
-Status: plan only. None of the code in this part has been compiled or run. Line numbers refer to
-`fc2542a`. Search for the quoted code if lines moved.
+Status: the lookup-ceiling experiment, modes 2 and 3, and the plain/GLU two-row kernels are implemented and default-off. The ceiling is measured on B60, and all correct variants pass the expanded CPU-reference tests. Follow-up measurements are recorded in I.8. The plain ESIMD experiment is implemented and correct, but slower; its measurements are recorded in I.9. Line numbers in the sketches refer to `fc2542a`; search for symbols if lines moved.
+
+`GGML_SYCL_IQ4_XS_LUT=1` selects the timing stand-in, 2 the shuffle reader, and 3 the vector-load reader. Mode 2 forces the two-row geometry; `GGML_SYCL_MOE_MV_2ROW=1` selects that geometry independently. Mode 3 requires 16-byte-aligned expert bases and strides, otherwise it falls back to mode 0. `GGML_SYCL_IQ4_XS_ESIMD=1` selects the plain 256-wide ESIMD lookup and `=2` selects eight 32-wide lookups. All three controls default to zero. Mode 1 deliberately produces incorrect IQ4_XS results and prints a startup warning. Use it only for performance measurements, never for inference or correctness acceptance.
+
+The performance suite includes both decode geometries required by I.5: the existing M=768, K=2048 gate/up case and a new M=2048, K=768 down case, each with 128 experts and 8 selected experts.
+
+Implementation environment: revision `677a09212`, Intel oneAPI DPC++/C++ 2026.1.1, existing Release build with SYCL, F16, oneDNN and graph support enabled. The filesystem sandbox hides `/dev/dri` and exposes only an OpenCL CPU device. Outside the sandbox, `sycl-ls` detects three Intel Arc Pro B60 GPUs with driver 1.17.39395+13. GPU runs require access outside the sandbox, as in H.8. Do not proceed to I.3 or I.6 until the ceiling has been measured on the target GPU.
+
+Validation (2026-10-04): `test-backend-ops` builds successfully after sourcing oneAPI. The packed stand-in arithmetic passes 10,256 host-side word checks for both nibble halves; `git diff --check` and ASCII/LF/final-newline/trailing-whitespace checks pass. The initial sandbox probe aborted during device discovery. Outside the sandbox, mode 0 passes 49/49 IQ4_XS `MUL_MAT_ID.*` cases, including reused weights, and 8/8 MoE `MUL_MAT_VEC_FUSION` cases at the existing tolerances. Mode 1 is tested only in performance mode. Logs are `/tmp/sycl-iq4-xs-ceiling-build.log`, `/tmp/sycl-iq4-xs-lut0-correctness.log` and `/tmp/sycl-iq4-xs-lut0-glu-correctness.log`.
+
+Five interleaved pairs in fresh processes on SYCL0 use mask 31, graphs disabled and the unrelated integer-XMX flags at zero. Each process executes both n=1 shapes with positive iteration counts; all ten processes exit successfully. Median us/run with observed min..max:
+
+| shape | mode 0, memory lookup | mode 1, incorrect stand-in | ceiling ratio |
+|---|---|---|---|
+| M=768, K=2048 | 30.65 (30.61..31.00) | 11.92 (11.84..11.94) | 2.57x |
+| M=2048, K=768 | 40.51 (40.49..40.87) | 17.24 (17.17..17.29) | 2.35x |
+
+An existing model server remains resident, leaving about 392 MiB free on the measured GPU at process startup. Its DRM compute/render cycle counters do not advance during any timing process. These measurements describe that memory-residency condition; one-time JIT/reorder latency is excluded by the harness warmup and is not separately measured. Results are in `/tmp/sycl-iq4-xs-ceiling-perf-results.json`, with individual logs at `/tmp/sycl-iq4-xs-ceiling-perf-r*-m*.log`. The result clears I.5's 10% ceiling gate, but does not establish a correct lookup variant's performance or a model speedup. I.3 and the mode-2/mode-3 readers are now measured in I.8.
 
 Scope: the reordered IQ4_XS MoE mat-vec used for decode (`mul_mat_vec_q_moe_reorder` and
 `mul_mat_vec_q_moe_reorder_glu` in `mmvq.cpp`), with the dot product
@@ -3427,3 +3440,223 @@ Notes for the implementer:
   `uint32` (as the ESIMD sketch does) saves a little. Expect little.
 - **Rejected:** storing a precomputed scale per 32 values. It needs 16 bytes per superblock
   instead of 8, so the reordered weights would grow, which breaks the same-size rule of Part G.
+
+
+### I.8 Implemented reader and two-row results (2026-10-04)
+
+Modes 2 and 3 and the plain/GLU two-row kernels are implemented. All controls remain default-off. Mode 2 forces the SG16 two-row kernel, whose calls to the subgroup lookup are converged. Mode 3 uses a 16-byte nibble load and falls back to mode 0 for an unaligned expert base or stride. The two-row kernel clamps an odd final row for reads and suppresses its store; it uses the existing layout without padding K or growing weights.
+
+Correctness uses the existing CPU-reference tolerances. Each of five configurations passes 51/51 IQ4_XS `MUL_MAT_ID.*` and 12/12 MoE `MUL_MAT_VEC_FUSION` cases, for 315 successful test executions:
+
+- Old kernel, LUT 0.
+- Two-row kernel, LUT 0.
+- LUT 2 with the two-row flag at 0, testing forced dispatch.
+- Two-row kernel, LUT 3.
+- Old one-row kernel, LUT 3.
+
+The added cases cover reused aligned weights with M=34, K=256/768 and odd-row GLU with M=33, K=256/768 for both SWIGLU and GEGLU. Existing reused-weight cases cover odd rows and K=512. A host indexing check covers K=256/512/768/2048, with each valid chunk visited exactly once. Logs: `/tmp/sycl-iq4-xs-lut23-correctness-<variant>-<moe|glu>.log`. Build log: `/tmp/sycl-iq4-xs-lut23-build.log`.
+
+Five interleaved rounds in fresh processes on SYCL0, with mask 31, graphs disabled and unrelated integer-XMX flags at 0, give the following median us/run (min..max). Each shape has 128 experts, 8 selected experts and n=1. These are plain `MUL_MAT_ID` timings.
+
+| variant | M=768, K=2048 gate/up | M=2048, K=768 down |
+|---|---|---|
+| old kernel, LUT 0 | 30.92 (30.60..31.28) | 40.24 (40.16..40.88) |
+| two-row, LUT 0 | 37.57 (37.41..37.93) | 34.30 (34.26..34.49) |
+| two-row, LUT 2 | 95.92 (95.86..95.95) | 94.93 (94.91..94.98) |
+| two-row, LUT 3 | 36.75 (36.69..36.84) | 33.58 (33.49..34.23) |
+| old one-row, LUT 3 | 30.17 (30.08..30.60) | 39.82 (39.73..40.20) |
+
+The two-row geometry reduces down time by about 15%, but increases gate/up time by about 21%. The subgroup lookup is about 3.1x slower on gate/up and 2.4x slower on down than the old kernel. Vector loads give a small improvement, insufficient for acceptance without model results. The large mode-1 ceiling and poor mode-2 recovery meet the condition for I.6's ESIMD experiment.
+
+The resident server's DRM compute/render cycle counters remain unchanged throughout the runs. Results are in `/tmp/sycl-iq4-xs-lut23-perf-results.json`; use only records with `kind=moe`. The attempted GLU perf cases are excluded: this harness repeats the terminal node rather than the whole fused mat-vec graph, so they do not measure the fused kernel. The temporary GLU perf fixture was removed; GLU correctness fixtures remain.
+
+Separate IGC diagnostic runs confirm the generated instructions. In module `5f3b3ff025b7a5c5`, the LUT-2 plain two-row kernel (`entry_0287`) contains 32 static indirect register reads (`r[a0`); its GLU counterpart (`entry_0273`) contains 64. The LUT-3 plain two-row kernel (`entry_0288`) contains one `load.ugm.d32x4`, and its GLU counterpart (`entry_0274`) contains two. These kernels use 128 GRFs. Dump directories: `/tmp/sycl-iq4-xs-lut2-asm` and `/tmp/sycl-iq4-xs-lut3-asm`. Shader dumping emits other variants too; identify the kernel by its first-line name. Diagnostic timings are excluded from performance results.
+
+No model-level acceptance is claimed for these operator results. The Qwen3-30B-A3B UD-IQ3_XXS model has only 9% IQ4_XS expert tensors. The later inventory in I.10 locates the cached qwen4exp model selected by the contributor; it has 2/144 IQ4_XS expert tensors. No flag default is changed.
+
+
+### I.9 ESIMD implementation and validation (2026-10-04)
+
+The plain I.6 kernel is implemented in `dmmv.cpp`, exported through `dmmv.hpp` and selected before the LUT dispatch by `GGML_SYCL_IQ4_XS_ESIMD=1`. This flag defaults to 0. The kernel uses four ESIMD threads per output row, the existing per-expert planes and q8_1 activation scales, a register table with `iselect`, and an SLM reduction. Dispatch checks 16-byte alignment of weight bases, expert strides, activation bases and activation strides; otherwise it uses the existing reader.
+
+The installed oneAPI 2026.1.1 headers require mutable vectors for `select`, `.read()` before converting a selected region, and scalar half access instead of `sycl::half2::operator[]` inside ESIMD. These changes preserve the sketch's indexing and math. Both block loads explicitly request 16-byte alignment. The Release `test-backend-ops` and `llama-bench` builds pass; log: `/tmp/sycl-iq4-xs-esimd-build.log`.
+
+With the ESIMD flag enabled and LUT/two-row flags at 0, 51/51 IQ4_XS `MUL_MAT_ID.*` cases pass the existing CPU-reference tolerances. The unchanged GLU path also passes 12/12 MoE `MUL_MAT_VEC_FUSION` cases. Logs: `/tmp/sycl-iq4-xs-esimd-correctness-esimd-<moe|glu>.log`. Initial device compilation took several minutes; a detached stack trace confirmed IGC compilation rather than a GPU wait. The run completed successfully with `IGC_TimeReports` and `SYCL_CACHE_PERSISTENT` unset.
+
+Five interleaved old/ESIMD pairs in fresh processes on SYCL0 use the same mask, graph and integer-XMX settings as I.8, with LUT and two-row flags at 0. Each n=1 shape has 128 experts and 8 selected experts. Median us/run (min..max):
+
+| shape | old kernel | ESIMD | ESIMD / old time |
+|---|---|---|---|
+| M=768, K=2048 gate/up | 30.73 (30.62..31.27) | 141.84 (141.80..141.87) | 4.62x |
+| M=2048, K=768 down | 40.34 (40.15..40.98) | 177.91 (177.89..177.91) | 4.41x |
+
+All ten processes complete with positive iteration counts. The resident server's DRM compute/render cycle deltas remain zero. Results: `/tmp/sycl-iq4-xs-esimd-perf-results.json`; individual logs: `/tmp/sycl-iq4-xs-esimd-perf-r*-<old|esimd>-moe.log`. JIT and reorder warmup are excluded from these timings.
+
+Verdict: the I.6 sketch is correct but substantially slower than the existing kernel. Its required down-projection win is absent, so the ESIMD GLU variant is not implemented. The existing GLU path remains selected. No model-level acceptance or default enablement is claimed. I.7's bounded follow-up measurements are recorded in I.11; these ESIMD results do not justify enabling any experimental reader.
+
+
+A separate diagnostic run in `/tmp/sycl-iq4-xs-esimd-asm` identifies the ESIMD kernel in VC module `459f838ca24a7d9c`: 128 GRFs, 1125 static instructions, 256 scalar indirect byte reads used by scalar multiplies, and no DP4A instructions. Thus the 256-wide source lookup does not become a vector register gather in this generated code. This is instruction evidence, not dynamic stall attribution. Diagnostic timing is excluded. The eight-32-wide-lookup alternative suggested in I.6 is implemented as `GGML_SYCL_IQ4_XS_ESIMD=2`; mode 1 retains the 256-wide lookup for comparison.
+
+
+Spill check requested by the contributor: neither ESIMD lookup variant requests a per-thread scratch/private-memory buffer in the generated `.zeinfo`, and neither assembly contains scratch spill loads or stores. Both use 128 GRFs. The `%scratchloc` declaration is not a spill operation. In the follow-up VC module `e3bf56c4f49c0890`, the 256-wide variant still has 1125 static instructions; eight 32-wide lookups reduce this to 885, but retain 256 scalar indirect reads and no DP4A. Dumps: `/tmp/sycl-iq4-xs-esimd32-asm`. The condition for a spill-driven GRF256 trial is absent in both variants.
+
+The 32-wide alternative builds successfully and passes 51/51 IQ4_XS MoE and 12/12 unchanged GLU-path checks at the existing tolerances. Logs: `/tmp/sycl-iq4-xs-esimd32-build.log` and `/tmp/sycl-iq4-xs-esimd32-correctness-esimd32-<moe|glu>.log`. Five interleaved fresh-process pairs with the same settings give median us/run (min..max):
+
+| shape | old kernel | eight 32-wide lookups | ESIMD / old time |
+|---|---|---|---|
+| M=768, K=2048 gate/up | 30.92 (30.69..31.28) | 110.53 (110.47..110.56) | 3.57x |
+| M=2048, K=768 down | 40.27 (40.17..40.54) | 148.21 (148.18..148.32) | 3.68x |
+
+All ten processes complete with positive iteration counts and zero resident-server compute/render cycle deltas. Results: `/tmp/sycl-iq4-xs-esimd32-perf-results.json`; individual logs: `/tmp/sycl-iq4-xs-esimd32-perf-r*-<old|esimd32>-moe.log`. Smaller lookups improve on the original ESIMD sketch but still fail the down-projection gate. Neither ESIMD variant is enabled by default, and the conditional ESIMD GLU work stops here. The completed model benchmark and I.7 follow-ups are recorded in I.11 and I.14.
+
+
+### I.10 qwen4exp inventory and broader XMX coverage (2026-10-04)
+
+The contributor selected Qwen3.8-Flash-Next for model validation and stopped the resident service, releasing all three GPUs for tests. The earlier filename search missed Hugging Face snapshot symlinks; the model is available locally. Use the first of three shards under `/root/.cache/huggingface/hub/models--unsloth--Qwen3.8-Flash-Next-GGUF/snapshots/38bb39ee97821de2c9009abb7e93950eec396e66/UD-IQ4_XS/`, named `Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf`. The architecture metadata is `qwen4exp`, with 512 experts and 10 selected experts.
+
+| expert tensor type | count | K, M, experts |
+|---|---|---|
+| IQ3_S | 94 | 2560, 640, 512 |
+| IQ4_NL | 43 | 640, 2560, 512 |
+| Q8_0 | 5 | 640, 2560, 512 |
+| IQ4_XS | 2 | 2560, 640, 512 |
+
+IQ4_XS accounts for 1.39% of expert tensors. This model can validate the affected graph and mixed-type workload, but a null IQ4_XS-only result does not rule out gains on a model dominated by that type. Header inventories are saved at `/tmp/sycl-qwen4exp-*.inventory.log`; no tensor data was expanded for the inventory. The benchmark command is prepared in `/tmp/sycl-qwen4exp-benchmark-command.json`, using all three GPUs, layer split 34/34/32, q8_0 KV, F16 XMX, ubatch 512, tg128 and pp512/pp2048 in fresh processes. Five-round model comparisons are complete in I.14.
+
+E.5 is an archived four-register IQ4_NL lookup result, not a current-tree measurement. The named `iq4nl_grid` helper and the archived dense integer-XMX family were absent at this checkout; current ordered integer-XMX IQ4_NL staging and fused F16/BF16 GEMM staging indexed the global table. The exact four-word helper is now restored behind default-off `GGML_SYCL_IQ4_GEMM_LUT=1`, shared by ordered integer-XMX IQ4_NL staging and canonical/reordered fused IQ4_NL/IQ4_XS GEMM dequantization. The existing full-register, metadata-register, shared-memory, pipelined and blocked-A policies forward the lookup. Per-block scales and persistent weight bytes are unchanged. The current ordered integer-XMX dispatch requires at least eight average routes per expert, while its device mat-vec gate permits at most eight tokens. With 512 experts and 10 selected experts, qwen4exp cannot meet that integer-XMX gate. The forced four-expert/eight-token fixture validates that path; the selected-model table comparison exercises the floating-point GEMM readers. F16 correctness passes 28/28 dense, 58/58 MoE and 12/12 GLU checks. Each of five additional A-staging policies passes 58/58 MoE checks. BF16 passes 28/28 dense and 58/58 MoE checks under all six tested staging configurations. Runtime tracing exposed that the ordinary grouped fixtures bypass integer XMX: a separate canonical, reorder-disabled IQ4_NL/Q8_0 fixture now confirms both integer-XMX launches and passes 2/2 CPU-reference checks with the flag both off and on, including M=33 and K=96 tails. Logs use `/tmp/sycl-iq4-gemm-*`, `/tmp/sycl-bf16-*` and `/tmp/sycl-integer-xmx-canonical-lut*-dispatch.log`. Generated-code checks and five-round floating-XMX timings are complete in I.12. Same-geometry GRF128/256, current ordered-integer timing and model checks are complete in I.13-I.14; the historical 15% is not claimed for this implementation.
+
+I.7's remaining bounded experiments are implemented for validation: LUT mode 4 uses a 32-bit `scales_l` load with exact nibble extraction; default-off `GGML_SYCL_MOE_MV_PREFETCH=1` forces the plain two-row kernel and prepares two passes' weight and activation operands before either dot. Odd pass counts reuse a valid load for the unused second pass and suppress its accumulation. These experiments retain the original layout and tolerances. The build passes. Packed scales under one-row and two-row dispatch, and paired preload under two-row dispatch, each pass 51/51 MoE and 12/12 GLU CPU-reference checks. Logs are `/tmp/sycl-i7-correctness-*`. Timings and generated-code checks are complete in I.11 and J.
+
+### I.11 Bounded scale/preload measurements (2026-10-04)
+
+Five interleaved fresh-process rounds on the released SYCL0, graph disabled, reorder mask 31, F16, ESIMD and GEMM lookup disabled. Every process returns two positive-run-count cases. Medians below include the five-round minimum and maximum, in us/run. The weights, routing and tolerances are unchanged.
+
+| reader | gate/up M=768 K=2048 | down M=2048 K=768 |
+|---|---|---|
+| old one-row | 31.24 (30.60..31.24) | 40.16 (40.13..40.91) |
+| two-row, LUT 0 | 37.45 (37.37..37.58) | 34.47 (34.17..34.64) |
+| one-row, packed scales (LUT 4) | 30.51 (30.34..30.82) | 40.15 (39.57..40.42) |
+| two-row, packed scales (LUT 4) | 35.17 (34.90..35.28) | 32.32 (32.10..32.90) |
+| two-row, paired preload | 33.78 (33.72..33.92) | 32.15 (32.11..32.17) |
+
+Packed scales improve one-row gate/up by 2.3%, with down flat. On two rows they improve both shapes against the two-row control, but gate/up remains slower than the old one-row kernel. Paired preload improves the two-row control by 9.8% on gate/up and 6.7% on down, but gate/up is still 8.1% slower than the old kernel; down is 19.9% faster. Its ISA does not retain the intended two-pass load overlap, so these results do not validate that mechanism. All variants remain default-off. Results and logs are `/tmp/sycl-i7-perf-results.json` and `/tmp/sycl-i7-perf-r*-*.log`.
+
+The same-geometry 32-row production GEMM register-table configurations pass 59/59 CPU-reference MoE checks each at GRF128 and GRF256 (schedule masks 64 and 192). Logs are `/tmp/sycl-gemm-grf-correctness-{64,192}.log`. Their clean timings and the selected-model comparison follow separately.
+
+### I.12 Current floating-XMX register-table timing (2026-10-04)
+
+Five interleaved fresh-process pairs on SYCL0, graph disabled, F16, reorder mask 31 and the ordinary 16-row grouped tile (schedule mask 0). Each process measures all six cases. Expert count 512 and selected count 10 match the contributor-selected model; the table has 43 IQ4_NL, two IQ4_XS and 94 IQ3_S expert tensors. IQ3_S is the unchanged-type control. Setup, compilation and diagnostics are excluded from timings.
+
+| type | M, K | tokens | old lookup ms (min..max) | exact register lookup ms (min..max) | latency change |
+|---|---|---|---|---|---|
+| IQ4_NL | 2560, 640 | 512 | 6.691 (6.678..6.714) | 8.806 (8.802..8.825) | +31.6% |
+| IQ3_S | 640, 2560 | 512 | 5.896 (5.888..5.919) | 5.892 (5.885..5.936) | -0.1% |
+| IQ4_XS | 640, 2560 | 512 | 7.969 (7.955..7.998) | 10.790 (10.774..10.804) | +35.4% |
+| IQ4_NL | 2560, 640 | 2048 | 14.642 (14.632..14.661) | 18.668 (18.635..18.698) | +27.5% |
+| IQ3_S | 640, 2560 | 2048 | 12.869 (12.786..12.916) | 12.858 (12.819..12.883) | -0.1% |
+| IQ4_XS | 640, 2560 | 2048 | 16.909 (16.838..16.946) | 22.117 (22.106..22.223) | +30.8% |
+
+The exact lookup is correct and appears as register selects/shifts in the ISA, but it is slower in these current F16 grouped-GEMM readers. The unchanged IQ3_S control is flat. This rejects default enablement on the measured shapes; `GGML_SYCL_IQ4_GEMM_LUT` remains 0. The archived integer-XMX 15% gain in E.5 is not reproduced or generalized by this result. Results are `/tmp/sycl-gemm-perf-results.json`; raw logs are `/tmp/sycl-gemm-perf-r*-*.log`. Same-geometry GRF128/256, current ordered-integer timing and qwen4exp model results are recorded in I.13-I.14.
+
+### I.13 GRF128/256 and current ordered-integer comparisons (2026-10-05)
+
+Five interleaved fresh-process rounds on SYCL0 hold the production grouped GEMM tile at 32 rows. Schedule masks 64/192 select GRF128/256 respectively; all other settings match I.12. Each process returns six cases with positive iteration counts. Medians below are ms/run (min..max). Comparing these GRF settings does not confound the register count with a tile-size change.
+
+| type | tokens | old GRF128 | register GRF128 | old GRF256 | register GRF256 |
+|---|---|---|---|---|---|
+| iq4_nl | 512 | 8.100 (8.087..8.129) | 10.617 (10.603..10.632) | 8.654 (8.593..8.712) | 11.296 (11.286..11.322) |
+| iq3_s | 512 | 5.899 (5.892..5.916) | 5.903 (5.887..5.928) | 5.918 (5.909..5.928) | 5.918 (5.907..5.933) |
+| iq4_xs | 512 | 12.473 (12.453..12.485) | 15.442 (15.424..15.447) | 12.825 (12.809..12.832) | 17.017 (16.997..17.024) |
+| iq4_nl | 2048 | 17.514 (17.463..17.543) | 22.482 (22.445..22.508) | 17.891 (17.777..17.956) | 23.298 (23.181..23.353) |
+| iq3_s | 2048 | 12.887 (12.859..12.946) | 12.889 (12.867..12.934) | 12.735 (12.701..12.836) | 12.769 (12.755..12.810) |
+| iq4_xs | 2048 | 25.799 (25.744..25.835) | 30.979 (30.953..31.079) | 26.257 (26.185..26.330) | 34.099 (34.078..34.139) |
+
+GRF256 increases the exact IQ4_NL reader's median latency by 6.4% at n=512 and 3.6% at n=2048; IQ4_XS increases by 10.2% and 10.1%. The unchanged IQ3_S control is approximately flat. Larger GRFs do not rescue this lookup. The ordinary 16-row baseline in I.12 is faster than these 32-row IQ4 configurations. Results: `/tmp/sycl-grf-perf-results.json`; raw logs: `/tmp/sycl-grf-perf-r*-*.log`. Both GRF configurations pass 59/59 CPU-reference MoE checks as recorded in I.11.
+
+The current canonical ordered integer-XMX fixture uses IQ4_NL, M=512, K=256, eight tokens, four experts and four selected experts. Reorder is disabled, grouped GEMM is disabled, and ordered MoE/integer XMX are enabled; separate runtime traces confirm the integer launch rather than floating grouped fallback. Five interleaved fresh-process pairs give old lookup 80.300 us (80.230..80.320) and exact register lookup 85.320 us (85.250..85.370), a 6.3% latency regression. All ten cases have positive iteration counts. Results: `/tmp/sycl-integer-perf-results.json`; raw logs: `/tmp/sycl-integer-perf-r*-*.log`. This is a current ordered-kernel result, not a rerun of the absent archived dense kernel or its historical 15% gain. The selected qwen4exp routing cannot reach this integer dispatch, as explained in I.10.
+
+### I.14 qwen4exp acceptance comparisons (2026-10-05)
+
+Five interleaved rounds, seven configurations per round, each in a fresh process on all three released B60 GPUs. Variant order reverses on alternate rounds. The command in `/tmp/sycl-qwen4exp-benchmark-command.json` adds verbose logging and `-pg 512,16` to exercise later prefill plus decode. Graphs are disabled for timing; F16, q8_0 KV, ubatch 512, reorder mask 31, layer split 34/34/32 and the model shards remain fixed. All 35 processes exit successfully, returning 140 positive-throughput cases. Each individual benchmark has one timed repetition; the five independent process rounds provide the spread below. Values are median tokens/s (min..max).
+
+| variant | pp512 | pp2048 | tg128 | later pp512 + tg16 |
+|---|---|---|---|---|
+| old | 441.752 (438.231..518.434) | 572.410 (559.337..574.453) | 35.779 (35.752..35.812) | 372.205 (353.515..373.896) |
+| two-row | 441.710 (438.685..517.627) | 571.267 (569.961..573.380) | 35.777 (35.601..35.806) | 372.617 (371.066..374.204) |
+| shuffle | 442.406 (440.426..516.143) | 572.514 (571.650..573.317) | 35.535 (35.490..35.580) | 372.365 (371.185..372.563) |
+| vector-two-row | 445.498 (439.295..517.910) | 573.164 (572.136..573.869) | 35.751 (35.723..35.779) | 373.084 (372.380..373.482) |
+| gemm-register-grid | 421.724 (420.578..422.211) | 538.848 (537.491..542.232) | 35.789 (35.728..35.853) | 359.042 (357.595..360.789) |
+| gemm-grid-m32-grf128 | 465.026 (404.308..466.635) | 510.236 (508.566..511.772) | 35.778 (35.743..35.783) | 344.396 (342.999..346.952) |
+| gemm-grid-m32-grf256 | 332.255 (238.994..337.842) | 501.877 (500.836..502.374) | 35.789 (35.693..35.818) | 341.911 (341.569..342.483) |
+
+The ordinary 16-row exact GEMM table lowers median pp512 throughput by 4.5%, pp2048 by 5.9%, and later pp512+tg16 by 3.5%; tg128 is flat. Holding the 32-row register-table geometry fixed, GRF256 lowers pp2048 by another 1.6% and later prefill/decode by 0.7%. The pp512 runs have substantial spread (including the old baseline), so their apparent 32-row GRF128 improvement is not acceptance evidence. IQ4_XS-only two-row/vector variants show no repeatable model gain; shuffle reduces tg128 by about 0.7%. The selected mixed model has just 2/144 IQ4_XS expert tensors, limiting conclusions about IQ4_XS-dominated models. No new flag default changes.
+
+All 35 verbose logs report the same placement and model buffers: 49/49 layers offloaded; SYCL0 21724.06 MiB, SYCL1 21128.08 MiB, SYCL2 18369.99 MiB, SYCL_Host 644.14 MiB, CPU_Mapped 27465.95 MiB. These are reported model-buffer allocations, not a measurement of peak device memory or first-use reorder latency. The existing lazy-loading configuration is held fixed; no weight expansion or new persistent layout is introduced. Results: `/tmp/sycl-qwen4exp-pairs-results.json`; raw logs: `/tmp/sycl-qwen4exp-r*-*.log`. Operator results and model results both reject default enablement of the register table.
+
+## Part J: complete-plan audit (2026-10-05, complete)
+
+This audit distinguishes an archived result from code present in this checkout. Parts A-D and E are archives; the document explicitly forbids copying rejected sketches back into the tree. Each remaining item is checked against its stated prerequisites rather than silently treated as implemented.
+
+| area | completed visit | disposition |
+|---|---|---|
+| 0 and background | measurement rules, integer scaling, flags and existing XMX paths reviewed | archived and current results distinguished; no default enablement |
+| A | current ordered integer-XMX Q8_0/IQ4_NL inspected, traced, CPU-reference tested and timed | restored lookup regresses 6.3%; historical replacement remains archived |
+| B, C, D.1, D.3, D.4 | rejected replacements and stop conditions reviewed | rejected archived kernels are not reconstructed |
+| D.2 | archived device-compiler failure and unchanged prerequisites reviewed | compiler/driver gate remains closed; no new runtime claim |
+| E.1-E.4, E.6 | tile, merge-last, latency and direct-load evidence reviewed | retained as constraints and archived results |
+| E.5 | source drift identified; exact lookup restored and validated in current integer and F16/BF16 GEMM staging | current operator and model timings reject default enablement; I.10-I.14 |
+| F.1-F.4 | graph selection, TRI/EXP semantics, scalar gate and actual runtime nodes checked | selected graph executes fused Gated Delta Net; unfused scalar-decay target absent, J.2 |
+| F.5-F.7 | actual PLE type/placement and fused HC nodes checked | F32 PLE has no quantized cast; HC already fused, J.2 |
+| G.0-G.1 | alignment claims, current aligned nibble loads and XMX staging ISA checked | exact layouts preserved; diagnostics separated from timing |
+| G.2-G.2.1 | 136 host byte round trips; bit-exact GPU reader checks; five-round GRF128/256 timings | compact reader fails performance gate; no producer or production-layout integration, J.1 |
+| G.3-G.7 | descriptors, all-consumer requirements, no growth and ordinary-SoA prerequisites reviewed | integration/transfer/view/staging/model tests for a new tile layout stop at the failed reader gate |
+| H.1-H.5, H.9 | completed baseline SoA readers and historical acceptance checked; selected model and graph replay exercised | current baseline retained; new experiments fail acceptance |
+| H.6 | earlier two-pass/one-pass softmax measurements and rejection reviewed | no changed evidence to rerun or enable |
+| H.7-H.8 | deferred work, baseline and evidence limits reviewed | conditional gates retained |
+| I.0-I.4 | ceiling, exact reader variants, plain/GLU tails, ISA and five-round timings complete | no accepted model win, I.8/I.14 |
+| I.5 | CPU-reference tests, generated code, operator and five-round model comparisons complete | default-off; mixed-model coverage limitation recorded |
+| I.6 | both ESIMD lookup widths implemented, correct, no spill evidence and substantially slower | failed down-projection gate stops GLU variant; no spill-driven GRF256 requirement |
+| I.7 | two-row geometry, packed scales and paired preload tested and timed; ISA checked | compiler sinks preload; gate/up tradeoff remains; expanded scales violate no-growth rule |
+
+
+The G.2.1 isolated GPU reader probe uses the existing F16 XMX kernel with either completed SoA or compact tiled offsets, preserving payload, scale math, staging policy and byte count. Initial bit-exact GPU output comparisons pass for both types at M=33, K=256/768, N=10, compact tails and unaligned expert bases, plus gate/up and down shapes at N=10/32/64. IQ4_XS generated code uses 512 bytes of private scratch with private loads/stores; IQ3_XXS has no private scratch buffer. The GRF256 repeat passes the same output comparisons and retains the IQ4_XS scratch allocation. Clean five-round timings are complete in J.1. Temporary probe sources, binaries and dumps use `/tmp/sycl-tile-*`; no producer is enabled from this initial result.
+
+Current XMX ISA diagnostics confirm grouped F16 IQ4_NL and IQ4_XS dispatch with reordered weights. Module `5a5a7b402b08849d`, assembly entries 0059 and 0217, contains the selected narrow 16-row kernels: both use 128 GRF and DPAS, and the exact lookup branch uses comparisons at 4/8/12, register selects and byte shifts rather than dependent memory table reads. The same kernel retains the old lookup branch for flag-off comparison. IQ4_NL metadata reports 16 bytes per SIMT lane of global `private_space` (256 bytes per SIMD16 thread); IQ4_XS reports 28 bytes per lane (448 bytes per SIMD16 thread). These private allocations are not, by themselves, evidence of register-allocation spilling. The separate tiled probe uses a 512-byte scratch buffer and was also repeated at GRF256. The production grouped comparison adds same-geometry 32-row GRF128/256 runs using schedule masks 64/192; mask 128 alone does not select GRF256 for the ordinary narrow kernel.
+
+Paired preload module `723b2c877cf9fdae`, entry 0288, uses 128 GRF, DP4A and no private scratch buffer. The compiler sinks the second pass's weight/activation loads past the first dot: first-pass vector loads occur at assembly lines 1050/1125/1126 and its first DP4A at 1287, whereas second-pass vector loads begin at 1358/1433/1434. Thus this source experiment does not achieve the intended two-pass memory overlap; do not attribute a timing change to that overlap. The dumps and dispatch logs use `/tmp/sycl-current-gemm-asm*` and `/tmp/sycl-current-preload-asm*`. Diagnostics and correctness are excluded from clean timing runs; an initial partial round that overlapped GRF256 correctness was discarded and the full timing suite restarted.
+
+The current qwen4exp inventory has `blk.1.ple_conv1d.weight` as F32 (type 0), shape `[4, 10240]`. Its graph therefore does not execute the quantized-weight cast hypothesized in F.5. The completed scheduler trace places its PLE operations on SYCL0, as recorded in J.2; the archived host-placement observation does not apply to this run. No IQ4 dequant optimization is justified for this weight in the selected file.
+
+Packed-scale mode 4 is also visible in the ISA: module `723b2c877cf9fdae`, two-row entry 0292 and one-row entry 0299. The two-row scale path has a 32-bit load for the packed low scales (assembly line 773), between the two 16-bit scale loads, followed by word shifts. Correctness and repeated timings compare it separately from the aligned-nibble and subgroup-table changes.
+
+
+### J.1 Compact tiled reader profit gate (2026-10-05)
+
+The isolated probe extracts the current F16 XMX kernel and changes only reader offsets/metadata extraction. It compares completed SoA against compact payload/scale tiles of G.2.1, with identical bytes, math, routing and staging. Host permutation/tail proofs pass 136 exact byte round trips. Each of ten fresh GPU processes compares both layouts bit-for-bit for 20 type/shape/alignment cases, including M=33, K=256/768 and unaligned expert bases. No persistent producer is changed. Ten warmup launches precede 100 timed launches for the main shapes (20 for small tail checks). Process GRF order and within-process layout order alternate.
+
+Five-round median us/run (min..max) for the main shapes:
+
+| type | M, K | N | SoA GRF128 | tiled GRF128 | SoA GRF256 | tiled GRF256 |
+|---|---|---|---|---|---|---|
+| iq3_xxs | 768, 2048 | 10 | 26.847 (22.089..31.050) | 31.657 (26.027..36.574) | 22.362 (17.477..25.556) | 28.288 (22.107..32.316) |
+| iq3_xxs | 768, 2048 | 32 | 21.240 (21.239..21.402) | 24.922 (24.907..24.996) | 15.437 (15.428..15.447) | 19.383 (19.381..19.395) |
+| iq3_xxs | 768, 2048 | 64 | 22.195 (22.192..22.204) | 25.899 (25.892..25.903) | 17.553 (17.535..17.652) | 21.372 (21.349..21.383) |
+| iq3_xxs | 2048, 768 | 10 | 10.915 (10.908..10.936) | 12.658 (12.648..12.664) | 9.174 (9.167..10.726) | 10.789 (10.772..13.349) |
+| iq3_xxs | 2048, 768 | 32 | 11.494 (11.477..11.513) | 13.218 (13.203..13.227) | 9.722 (9.706..9.729) | 11.321 (11.317..11.463) |
+| iq3_xxs | 2048, 768 | 64 | 22.454 (22.413..22.493) | 25.585 (25.575..25.659) | 18.878 (18.862..18.910) | 21.745 (21.714..21.768) |
+| iq4_xs | 768, 2048 | 10 | 45.674 (42.024..53.826) | 45.326 (43.056..51.375) | 32.324 (24.545..34.998) | 35.673 (27.079..35.975) |
+| iq4_xs | 768, 2048 | 32 | 31.922 (31.870..31.960) | 32.629 (32.586..32.670) | 19.398 (19.352..19.434) | 21.383 (21.324..21.401) |
+| iq4_xs | 768, 2048 | 64 | 34.099 (34.095..34.124) | 34.316 (34.285..34.346) | 22.729 (22.693..22.776) | 24.736 (24.703..24.748) |
+| iq4_xs | 2048, 768 | 10 | 16.648 (15.571..18.399) | 16.265 (15.660..16.727) | 15.775 (11.774..17.697) | 16.127 (13.386..17.561) |
+| iq4_xs | 2048, 768 | 32 | 16.086 (16.048..16.099) | 16.168 (16.138..16.201) | 12.176 (12.170..12.182) | 12.958 (12.951..12.969) |
+| iq4_xs | 2048, 768 | 64 | 32.165 (32.106..32.279) | 33.629 (33.569..33.653) | 23.721 (23.710..23.873) | 25.402 (25.342..25.539) |
+
+IQ3_XXS tiles are consistently slower at both GRF sizes. IQ4_XS is approximately flat or slower at GRF128; its N=10 results have substantial spread, while stable N=32/64 cases do not improve. GRF256 improves both IQ4_XS layouts' absolute latency but the tiled reader still regresses against same-GRF SoA. The 512-byte IQ4_XS scratch allocation persists at actual GRF256, confirmed by generated metadata; private array storage alone does not establish register-pressure spilling. IQ3_XXS has no private scratch buffer. Thus compact tiles fail the reader profit gate before production integration. Producer, descriptor, all-reader, transfer/view and model tests for a new tiled layout are conditional follow-ups stopped by this negative result, not claimed as implemented. Source/binaries: `/tmp/sycl-tile-layout-probe*`; raw timings: `/tmp/sycl-tile-clean-r*-grf*.log`; diagnostics: `/tmp/sycl-tile-probe-asm` and `/tmp/sycl-tile256-asm`.
+
+### J.2 Runtime applicability and graph replay (2026-10-05)
+
+Two separate three-GPU qwen4exp smoke runs enable SYCL graphs: the old baseline, and exact GEMM table plus LUT 3/two-row readers. Each completes pp64, tg16 and later pp64+tg16 with two repetitions, returning three valid benchmark records with two positive samples each. Scheduler debug traces show `GATED_DELT` nodes on SYCL0/1/2 during the reserved/executed graphs, and existing `DSV4_HC_PR`/`DSV4_HC_PO` nodes on the layer GPUs. This confirms fused runtime execution rather than inferring support solely from source defaults. The unfused scalar-decay target in F.1 is absent; no graph fusion for that absent chain is added. The HC ADD lead is already covered by fused HC operations.
+
+The PLE trace assigns the `blk.1.ple_conv1d.weight` CONT/MUL sequence and `ple_conv_out-1` ADD to SYCL0. Combined with its F32 inventory, this excludes both a quantized-weight cast and the archived CPU-placement premise for this selected execution. It does not claim a general placement rule for other models or flags. Logs: `/tmp/sycl-qwen4exp-graph-default.log` and `/tmp/sycl-qwen4exp-graph-lookup-readers.log`. Graph smoke validates successful execution/replay; CPU-reference operator tests, rather than model throughput or smoke completion, establish numerical correctness of changed kernels.
+
+All elements have now been visited. Historical rejections remain archived, prerequisite failures are explicit, and no new experimental flag is enabled by default. Builds, CPU-reference checks, clean timing pairs and graph smoke are complete; there is no pending acceptance run in this plan.
