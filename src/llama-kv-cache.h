@@ -228,6 +228,13 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // rotation matrices kept in the backend buffers: any copy, or the copy on the device of layer il
+    // returns nullptr if the rotation is disabled
+    ggml_tensor * get_k_rot() const;
+    ggml_tensor * get_v_rot() const;
+    ggml_tensor * get_k_rot(int32_t il) const;
+    ggml_tensor * get_v_rot(int32_t il) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
@@ -264,6 +271,10 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // rotation matrices on the device of this layer
+        ggml_tensor * k_rot = nullptr;
+        ggml_tensor * v_rot = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -297,6 +308,9 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // separate from ctxs_bufs, because clear() zeroes those
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs_rot;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
@@ -424,6 +438,12 @@ public:
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+
+    // see llama_kv_cache::get_k_rot()
+    ggml_tensor * get_k_rot() const;
+    ggml_tensor * get_v_rot() const;
+    ggml_tensor * get_k_rot(int32_t il) const;
+    ggml_tensor * get_v_rot(int32_t il) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;

@@ -359,11 +359,11 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                 ggml_tensor * ik_kv = mctx_idx->get_k(ctx0, il);
 
                 if (inp_attn->self_k_rot) {
-                    Qcur = llama_mul_mat_hadamard(ctx0, Qcur, inp_attn->self_k_rot);
-                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+                    Qcur = llama_mul_mat_hadamard(ctx0, Qcur, inp_attn->get_k_rot(il));
+                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->get_k_rot(il));
                 }
                 if (inp_attn->self_v_rot) {
-                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->get_v_rot(il));
                 }
 
                 // Main branch: store K/V, take cache views
@@ -527,7 +527,7 @@ llama_model_minimax_m3::graph::graph(const llama_model & model, const llm_graph_
                     }
                 }
                 if (inp_attn->self_v_rot) {
-                    cur = llama_mul_mat_hadamard(ctx0, cur, inp_attn->self_v_rot);
+                    cur = llama_mul_mat_hadamard(ctx0, cur, inp_attn->get_v_rot(il));
                 }
                 cb(cur, "kqv_out", il);
                 if (model.layers[il].wo) {
