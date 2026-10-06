@@ -269,6 +269,8 @@ enum ggml_sycl_wide_load_bit {
 };
 static constexpr int GGML_SYCL_WIDE_LOADS_DEFAULT = ~0;
 extern int g_ggml_sycl_wide_loads;
+// lightning indexer kernel: 0 = per-key sub-group, 1 = several keys per sub-group, 2 = XMX tiles for 8+ tokens
+extern int g_ggml_sycl_lightning_indexer;
 // ggml_can_fuse_subgraph() takes at most 31 nodes, and the span is 2*n_expert_used.
 static constexpr int GGML_SYCL_MOE_REDUCE_MAX_EXPERTS = 15;
 extern int g_ggml_sycl_fa_onednn;

@@ -12043,6 +12043,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // qwen4exp indexer shapes: token and key tails of the tiled kernels
+    for (int kv : { 255, 1000, 4097 }) {
+        for (int bs : { 1, 2, 7, 8, 33, 1024 }) {
+            for (int ns : { 1, 2 }) {
+                test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, ns, ns, GGML_TYPE_F32));
+            }
+        }
+    }
+    for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, 1000, 33, 2, 1, type_K));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -12571,6 +12583,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    // qwen4exp indexer: 4 heads, f32 pooled keys, n_pool = n_kv/4 up to ~104k context
+    for (int kv : { 512, 2048, 4096, 8192, 16384, 26112 }) {
+        for (int bs : { 1, 512, 1024 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F32));
         }
     }
 
