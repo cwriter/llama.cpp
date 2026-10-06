@@ -2045,7 +2045,10 @@ ESIMD_INLINE void q8_0_mac_stripe(
     }
 }
 
-template <int WG>
+// TAIL: after the full stripes, take the leftover blocks in stripes of 4 and then 2 per thread
+// before falling back to one block at a time (GGML_SYCL_Q8_0_MMV_TAIL). With K=2560 the 80 blocks of a row
+// leave 16 after one WG*STRIPE pass, which otherwise cost two rounds of 32-byte loads.
+template <int WG, bool TAIL = false>
 ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd(
         const void * vx, const float * y, float * dst,
         const int ncols, const int nrows,
@@ -2080,6 +2083,21 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd(
                                 d + base0 + b, d + base1 + b, has_row1, y_vec, acc0, acc1);
     }
 
+    if constexpr (TAIL) {
+        for (; ib + WG * 4 <= nblk_row; ib += WG * 4) {
+            const int b = ib + tid * 4;
+            simd<float, 128> y_vec = block_load<float, 128>(y + (size_t) b * QK8_0);
+            q8_0_mac_stripe<4>(qs + (base0 + b) * QK8_0, qs + (base1 + b) * QK8_0,
+                               d + base0 + b, d + base1 + b, has_row1, y_vec, acc0, acc1);
+        }
+        for (; ib + WG * 2 <= nblk_row; ib += WG * 2) {
+            const int b = ib + tid * 2;
+            simd<float, 64> y_vec = block_load<float, 64>(y + (size_t) b * QK8_0);
+            q8_0_mac_stripe<2>(qs + (base0 + b) * QK8_0, qs + (base1 + b) * QK8_0,
+                               d + base0 + b, d + base1 + b, has_row1, y_vec, acc0, acc1);
+        }
+    }
+
     // Distribute remaining blocks across the work-group.
     for (int b = ib + tid; b < nblk_row; b += WG) {
         simd<float, 32> y_vec = block_load<float, 32>(y + (size_t) b * QK8_0);
@@ -2105,18 +2123,28 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd(
     }
 }
 
-template <int WG>
-static void q8_0_esimd_launch(const void * vx, const float * y, float * dst, const int ncols,
-                              const int nrows, dpct::queue_ptr stream) {
+template <int WG, bool TAIL>
+static void q8_0_esimd_launch_tail(const void * vx, const float * y, float * dst, const int ncols,
+                                   const int nrows, dpct::queue_ptr stream) {
     const int workgroups = (nrows + 1) / 2;
     stream->submit([&](sycl::handler & h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * 2), h);
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * WG), sycl::range<1>(WG)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_q8_0_reorder_esimd<WG>(vx, y, dst, ncols, nrows, lmem, it);
+                dequantize_mul_mat_vec_q8_0_reorder_esimd<WG, TAIL>(vx, y, dst, ncols, nrows, lmem, it);
             });
     });
+}
+
+template <int WG>
+static void q8_0_esimd_launch(const void * vx, const float * y, float * dst, const int ncols,
+                              const int nrows, dpct::queue_ptr stream) {
+    if (g_ggml_sycl_q8_0_mmv_tail) {
+        q8_0_esimd_launch_tail<WG, true>(vx, y, dst, ncols, nrows, stream);
+    } else {
+        q8_0_esimd_launch_tail<WG, false>(vx, y, dst, ncols, nrows, stream);
+    }
 }
 
 static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const float *y,
