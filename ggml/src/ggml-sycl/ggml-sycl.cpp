@@ -131,7 +131,7 @@ int g_ggml_sycl_fused_gemm = 1;
 int g_ggml_sycl_grouped_gemm = 1;
 int g_ggml_sycl_mmid_sched = 0;
 int g_ggml_sycl_wide_loads = GGML_SYCL_WIDE_LOADS_DEFAULT;
-int g_ggml_sycl_lightning_indexer = 0;
+int g_ggml_sycl_lightning_indexer = GGML_SYCL_LIGHTNING_INDEXER_DEFAULT;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_qsa_fa_no_readback = 0;
 int g_ggml_sycl_small_gemm = 1;
@@ -524,7 +524,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_kv_soa = ggml_sycl_get_env("GGML_SYCL_KV_SOA", 0);
         g_ggml_sycl_kq_mask_bits = ggml_sycl_get_env("GGML_SYCL_KQ_MASK_BITS", GGML_SYCL_KQ_MASK_DEFAULT);
         g_ggml_sycl_wide_loads = ggml_sycl_get_env("GGML_SYCL_WIDE_LOADS", GGML_SYCL_WIDE_LOADS_DEFAULT);
-        g_ggml_sycl_lightning_indexer = ggml_sycl_get_env("GGML_SYCL_LIGHTNING_INDEXER", 0);
+        g_ggml_sycl_lightning_indexer = ggml_sycl_get_env("GGML_SYCL_LIGHTNING_INDEXER", GGML_SYCL_LIGHTNING_INDEXER_DEFAULT);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
