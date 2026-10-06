@@ -1522,6 +1522,7 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         queue_ptr stream_dst = dst_ctx->stream;
         queue_ptr stream_src = src_ctx->stream;
         size_t size = ggml_nbytes(src);
+        ggml_sycl_pipe_trace_scope trace_scope("BCPY", dst_ctx->device, dst->name, size);
         // a packed mask copies as its bits when both sides are packed; a mixed pair falls back
         // to the host path, which unpacks on the way out and packs on the way in
         const bool src_bits = ggml_sycl_kq_mask_is_bits(src);
@@ -7472,6 +7473,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
         ggml_backend_sycl_buffer_set_tensor(buf, tensor, data, offset, size);
         return;
     }
+    ggml_sycl_pipe_trace_scope trace_scope("SETA", sycl_ctx->device, tensor->name, size);
     SYCL_CHECK(CHECK_TRY_ERROR(
         (stream)->memcpy((char *)tensor->data + offset, data, size)));
 }
