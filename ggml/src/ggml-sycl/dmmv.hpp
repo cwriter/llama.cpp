@@ -24,4 +24,20 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream);
 
+// Reordered MoE expert mat-vec with the f32 activation (ESIMD). Returns false for an unsupported type.
+bool ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
+    enum ggml_type src0_type, const void * vx_base, const float * y, const int32_t * ids_dev,
+    float * dst_base, int ncols, int nrows, int n_experts_used, int n_tokens,
+    size_t expert_weight_stride, size_t dst_row_stride, size_t src1_row_stride,
+    size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
+    dpct::queue_ptr stream);
+
+// Same, for the gate and up weights with the GLU folded in (IQ3_S, SWIGLU).
+bool ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
+    enum ggml_type src0_type, const void * vx_gate_base, const void * vx_up_base, const float * y,
+    const int32_t * ids_dev, float * dst_base, int ncols, int nrows, int n_experts_used, int n_tokens,
+    size_t expert_weight_stride, size_t dst_row_stride, size_t src1_row_stride,
+    size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
+    ggml_glu_op glu_op, dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_DMMV_HPP
