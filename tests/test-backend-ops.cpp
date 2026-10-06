@@ -1290,6 +1290,8 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    // perf: repeat the whole graph rather than only its output node, so a fused chain is what gets timed
+    virtual bool perf_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
     virtual bool check_backend(ggml_backend_t) { return true; }
@@ -1659,8 +1661,18 @@ struct test_case {
         }
 
         // duplicate the op
-        for (int i = 1; i < n_runs; i++) {
-            ggml_graph_add_node(gf, out);
+        if (perf_whole_graph()) {
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            n_runs = std::min(n_runs, ggml_graph_size(gf) / n_nodes);
+            for (int i = 1; i < n_runs; i++) {
+                for (int j = 0; j < n_nodes; j++) {
+                    ggml_graph_add_node(gf, ggml_graph_node(gf, j));
+                }
+            }
+        } else {
+            for (int i = 1; i < n_runs; i++) {
+                ggml_graph_add_node(gf, out);
+            }
         }
 
         // calculate memory
@@ -7641,6 +7653,7 @@ struct test_mul_mat_vec_fusion : public test_case {
 
     bool run_whole_graph() override { return true; }
     bool use_weight_context() override { return use_id && with_lane_scale; }
+    bool perf_whole_graph() override { return use_id; }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
         ggml_tensor * out = nullptr;
@@ -10867,6 +10880,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 37, 512,
             true, 16, 8, false, false, true, false, {1, 1}));
     }
+    // MoE expert mat-vecs at decode, IQ3_S gate/up with the GLU and IQ4_NL down: 10 of 64 experts, one and three tokens
+    for (int n : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 64, 10, false, 2560, n, 640));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, n, 640, 2560,
+            true, 64, 10, true, false, true, false, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
+        true, 64, 10, false, false, true, false, {1, 1}));
 
     for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, 256, 1, 2));
@@ -12281,6 +12302,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t m : {40960, 24576}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, 2560, {1, 1}, {1, 1}));
     }
+    // 8 tokens route to ~75 distinct experts, so the weights do not stay in L2 across runs
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 8, 640, 2560,
+        true, 512, 10, true, false, true, false, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 8, 640));
 
     // the MTP eh_proj: a 2D q8_0 weight against a [5120, 4 streams, n_tokens] activation, and the
     // same product with the activation flattened to [5120, 4 * n_tokens]

@@ -276,6 +276,9 @@ extern int g_ggml_sycl_lightning_indexer;
 // epilogue). 0 picks per type (see launch_mul_mat_vec_q_moe_reorder); 1 is the original kernel;
 // 2 and 4 force that many rows, each lane then keeps that many independent weight streams.
 extern int g_ggml_sycl_moe_mmv_rows;
+// ESIMD block-load kernel for the reordered MoE expert mat-vec at decode, reading the f32 activation
+// directly. 0 keeps the sub-group kernels; 1 takes IQ4_NL; 2 also takes IQ3_S gate/up with the SWIGLU fused.
+extern int g_ggml_sycl_moe_esimd;
 // Q8_0 reordered ESIMD mat-vec: take the blocks left after the full 8-block stripes in 4- and
 // 2-block stripes instead of one block at a time (default). 0 keeps the original loop.
 extern int g_ggml_sycl_q8_0_mmv_tail;
