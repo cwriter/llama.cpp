@@ -3817,7 +3817,11 @@ bool ggml_sycl_mul_mat_vec_q_id(
 // Reorder (SoA) MoE expert GEMV: MoE expert/row/lane indexing (from mul_mat_vec_q_moe) with the
 // dense-reorder per-block reads (from mul_mat_vec_q_reorder). Each expert slice in vx_base is a
 // self-contained SoA, so nblocks = nrows*(ncols/qk) per expert and the constant expert stride holds.
-template <typename reorder_vec_dot_q_sycl>
+// ROWS > 1: one sub-group computes ROWS consecutive output rows with independent accumulators, so
+// each lane keeps ROWS weight streams in flight. Expert rows are short here (K=640 for the down
+// projection is 360 bytes of IQ4_NL), and with one row per sub-group the reduction and the
+// address setup cost as much as the loads (GGML_SYCL_MOE_MMV_ROWS).
+template <typename reorder_vec_dot_q_sycl, int ROWS = 1>
 static void mul_mat_vec_q_moe_reorder(
     const void * __restrict__ vx_base, const void * __restrict__ vy_base,
     float * __restrict__ dst_base, const int32_t * __restrict__ ids_dev,
@@ -3839,8 +3843,8 @@ static void mul_mat_vec_q_moe_reorder(
     const char * vy  = (const char *) vy_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride;
     float *      dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
 
-    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
-    if (row >= nrows) {
+    const int row0 = (item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1)) * ROWS;
+    if (row0 >= nrows) {
         return;
     }
 
@@ -3854,27 +3858,34 @@ static void mul_mat_vec_q_moe_reorder(
     static_assert(blocks_per_subgroup > 0);
     static_assert(block_elements_per_subgroup > 0);
 
-    float partial_sum = 0.0f;
+    float partial_sum[ROWS] = {};
     for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
-        const int ibx = row * blocks_per_row + i;
-
-        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
-        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
-
         const int           iby            = i * block_type::block_to_q8_1_ratio();
         const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
         const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
 
 #pragma unroll
-        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
-            const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
-            partial_sum += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        for (int r = 0; r < ROWS; ++r) {
+            // a tail row past nrows recomputes the last row and is not stored
+            const int ibx = sycl::min(row0 + r, nrows - 1) * blocks_per_row + i;
+
+            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+
+#pragma unroll
+            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+                partial_sum[r] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+            }
         }
     }
 
-    auto sum = sycl::reduce_over_group(sg, partial_sum, std::plus<>());
-    if (sg.leader()) {
-        dst[row] = sum;
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        const float sum = sycl::reduce_over_group(sg, partial_sum[r], std::plus<>());
+        if (sg.leader() && row0 + r < nrows) {
+            dst[row0 + r] = sum;
+        }
     }
 }
 
@@ -3882,7 +3893,7 @@ static void mul_mat_vec_q_moe_reorder(
 // the same output column and folds them, so the pair never lands in memory and the GLU never gets
 // its own launch. Same indexing as mul_mat_vec_q_moe_reorder(); only the second weight base and
 // the fold at the end differ.
-template <typename reorder_vec_dot_q_sycl>
+template <typename reorder_vec_dot_q_sycl, int ROWS = 1>
 static void mul_mat_vec_q_moe_reorder_glu(
     const void * __restrict__ vx_gate_base, const void * __restrict__ vx_up_base,
     const void * __restrict__ vy_base,
@@ -3906,8 +3917,8 @@ static void mul_mat_vec_q_moe_reorder_glu(
     const char * vy  = (const char *) vy_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride;
     float *      dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
 
-    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1);
-    if (row >= nrows) {
+    const int row0 = (item_ct1.get_group(2) * item_ct1.get_local_range(1) + item_ct1.get_local_id(1)) * ROWS;
+    if (row0 >= nrows) {
         return;
     }
 
@@ -3921,30 +3932,36 @@ static void mul_mat_vec_q_moe_reorder_glu(
     static_assert(blocks_per_subgroup > 0);
     static_assert(block_elements_per_subgroup > 0);
 
-    float partial_gate = 0.0f;
-    float partial_up   = 0.0f;
+    float partial_gate[ROWS] = {};
+    float partial_up[ROWS]   = {};
     for (int i = sg.get_local_linear_id() / block_elements_per_subgroup; i < blocks_per_row; i += blocks_per_subgroup) {
-        const int ibx = row * blocks_per_row + i;
-
-        const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
-        const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
-
         const int           iby            = i * block_type::block_to_q8_1_ratio();
         const int8_t *      q8_1_quant_ptr = (const int8_t *) vy + iby * QK8_1;
         const sycl::half2 * q8_1_ds_ptr    = (const sycl::half2 *) ((const char *) vy + ncols + iby * sizeof(sycl::half2));
 
 #pragma unroll
-        for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
-            const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
-            partial_gate += reorder_vec_dot_q_sycl()(vx_gate, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
-            partial_up   += reorder_vec_dot_q_sycl()(vx_up,   bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+        for (int r = 0; r < ROWS; ++r) {
+            const int ibx = sycl::min(row0 + r, nrows - 1) * blocks_per_row + i;
+
+            const auto bx_offset = block_type::get_block_offset(ibx, nblocks);
+            const auto d_offset  = block_type::get_d_offset(nrows, ncols, ibx);
+
+#pragma unroll
+            for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
+                const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+                partial_gate[r] += reorder_vec_dot_q_sycl()(vx_gate, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                partial_up[r]   += reorder_vec_dot_q_sycl()(vx_up,   bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+            }
         }
     }
 
-    const float gate = sycl::reduce_over_group(sg, partial_gate, std::plus<>());
-    const float up   = sycl::reduce_over_group(sg, partial_up,   std::plus<>());
-    if (sg.leader()) {
-        dst[row] = up * (glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate));
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+        const float gate = sycl::reduce_over_group(sg, partial_gate[r], std::plus<>());
+        const float up   = sycl::reduce_over_group(sg, partial_up[r],   std::plus<>());
+        if (sg.leader() && row0 + r < nrows) {
+            dst[row0 + r] = up * (glu_op == GGML_GLU_OP_SWIGLU ? op_silu(gate) : op_gelu(gate));
+        }
     }
 }
 
@@ -3956,19 +3973,29 @@ static void launch_mul_mat_vec_q_moe_reorder_glu(
     const size_t src1_row_stride, const size_t ids_token_stride,
     const size_t dst_token_stride, const size_t src1_token_stride,
     const ggml_glu_op glu_op, dpct::queue_ptr stream) {
-    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
-    const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_moe_reorder_glu<reorder_vec_dot_q_sycl>(
-                    vx_gate_base, vx_up_base, vy, dst_base, ids_dev, ncols, nrows,
-                    expert_weight_stride, dst_row_stride, src1_row_stride,
-                    ids_token_stride, dst_token_stride, src1_token_stride, glu_op, item);
-            });
-    });
+    auto launch = [&](auto rows_tag) {
+        constexpr int ROWS = decltype(rows_tag)::value;
+        const int            block_num_y = (nrows + GGML_SYCL_MMV_Y * ROWS - 1) / (GGML_SYCL_MMV_Y * ROWS);
+        const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
+        const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_moe_reorder_glu<reorder_vec_dot_q_sycl, ROWS>(
+                        vx_gate_base, vx_up_base, vy, dst_base, ids_dev, ncols, nrows,
+                        expert_weight_stride, dst_row_stride, src1_row_stride,
+                        ids_token_stride, dst_token_stride, src1_token_stride, glu_op, item);
+                });
+        });
+    };
+    // the GLU path carries the long gate/up rows (K=2560 on qwen4exp), where more rows per sub-group
+    // measured slower (IQ3_S: +4.6% at 2, +18% at 4), so it keeps one unless forced
+    switch (g_ggml_sycl_moe_mmv_rows) {
+        case 4:  launch(std::integral_constant<int, 4>{}); break;
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        default: launch(std::integral_constant<int, 1>{}); break;
+    }
 }
 
 template <typename reorder_vec_dot_q_sycl>
@@ -4099,19 +4126,34 @@ static void launch_mul_mat_vec_q_moe_reorder(
             dst_token_stride, src1_token_stride, stream);
         return;
     }
-    const int            block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
-    const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
-    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl>(
-                    vx_base, vy, dst_base, ids_dev, ncols, nrows,
-                    expert_weight_stride, dst_row_stride, src1_row_stride,
-                    ids_token_stride, dst_token_stride, src1_token_stride, item);
-            });
-    });
+    auto launch = [&](auto rows_tag) {
+        constexpr int ROWS = decltype(rows_tag)::value;
+        const int            block_num_y = (nrows + GGML_SYCL_MMV_Y * ROWS - 1) / (GGML_SYCL_MMV_Y * ROWS);
+        const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num_y);
+        const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                    mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl, ROWS>(
+                        vx_base, vy, dst_base, ids_dev, ncols, nrows,
+                        expert_weight_stride, dst_row_stride, src1_row_stride,
+                        ids_token_stride, dst_token_stride, src1_token_stride, item);
+                });
+        });
+    };
+    // 0 picks per type from measurements of the down projection (2560 x K=640, 10 of 512 experts):
+    // Q8_0 -30% at 4 rows, IQ4_NL -12% at 2; types not measured keep one row
+    int rows = g_ggml_sycl_moe_mmv_rows;
+    if (rows == 0) {
+        constexpr ggml_type type = reorder_vec_dot_q_sycl::gtype;
+        rows = type == GGML_TYPE_Q8_0 ? 4 : type == GGML_TYPE_IQ4_NL ? 2 : 1;
+    }
+    switch (rows) {
+        case 4:  launch(std::integral_constant<int, 4>{}); break;
+        case 2:  launch(std::integral_constant<int, 2>{}); break;
+        default: launch(std::integral_constant<int, 1>{}); break;
+    }
 }
 
 bool ggml_sycl_mul_mat_vec_q_id_reorder_glu(

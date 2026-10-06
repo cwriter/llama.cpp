@@ -272,6 +272,13 @@ extern int g_ggml_sycl_wide_loads;
 // lightning indexer kernel: 0 = per-key sub-group, 1 = several keys per sub-group, 2 = XMX tiles for 8+ tokens
 static constexpr int GGML_SYCL_LIGHTNING_INDEXER_DEFAULT = 2;
 extern int g_ggml_sycl_lightning_indexer;
+// Rows per sub-group in the reordered MoE expert mat-vec (decode path, with and without the GLU
+// epilogue). 0 picks per type (see launch_mul_mat_vec_q_moe_reorder); 1 is the original kernel;
+// 2 and 4 force that many rows, each lane then keeps that many independent weight streams.
+extern int g_ggml_sycl_moe_mmv_rows;
+// Q8_0 reordered ESIMD mat-vec: take the blocks left after the full 8-block stripes in 4- and
+// 2-block stripes instead of one block at a time (default). 0 keeps the original loop.
+extern int g_ggml_sycl_q8_0_mmv_tail;
 // ggml_can_fuse_subgraph() takes at most 31 nodes, and the span is 2*n_expert_used.
 static constexpr int GGML_SYCL_MOE_REDUCE_MAX_EXPERTS = 15;
 extern int g_ggml_sycl_fa_onednn;

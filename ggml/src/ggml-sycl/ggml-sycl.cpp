@@ -132,6 +132,8 @@ int g_ggml_sycl_grouped_gemm = 1;
 int g_ggml_sycl_mmid_sched = 0;
 int g_ggml_sycl_wide_loads = GGML_SYCL_WIDE_LOADS_DEFAULT;
 int g_ggml_sycl_lightning_indexer = GGML_SYCL_LIGHTNING_INDEXER_DEFAULT;
+int g_ggml_sycl_moe_mmv_rows = 0;
+int g_ggml_sycl_q8_0_mmv_tail = 1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_qsa_fa_no_readback = 0;
 int g_ggml_sycl_small_gemm = 1;
@@ -525,6 +527,11 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_kq_mask_bits = ggml_sycl_get_env("GGML_SYCL_KQ_MASK_BITS", GGML_SYCL_KQ_MASK_DEFAULT);
         g_ggml_sycl_wide_loads = ggml_sycl_get_env("GGML_SYCL_WIDE_LOADS", GGML_SYCL_WIDE_LOADS_DEFAULT);
         g_ggml_sycl_lightning_indexer = ggml_sycl_get_env("GGML_SYCL_LIGHTNING_INDEXER", GGML_SYCL_LIGHTNING_INDEXER_DEFAULT);
+        g_ggml_sycl_moe_mmv_rows = ggml_sycl_get_env("GGML_SYCL_MOE_MMV_ROWS", 0);
+        if (g_ggml_sycl_moe_mmv_rows != 1 && g_ggml_sycl_moe_mmv_rows != 2 && g_ggml_sycl_moe_mmv_rows != 4) {
+            g_ggml_sycl_moe_mmv_rows = 0;
+        }
+        g_ggml_sycl_q8_0_mmv_tail = ggml_sycl_get_env("GGML_SYCL_Q8_0_MMV_TAIL", 1) != 0;
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
             g_ggml_sycl_dev2dev_memcpy = DEV2DEV_MEMCPY_SYCL;
@@ -619,6 +626,8 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_KQ_MASK_BITS: %d (pack=%d tail=%d compact=%d)\n", g_ggml_sycl_kq_mask_bits,
                       g_ggml_sycl_kq_mask_bits ? 1 : 0, (g_ggml_sycl_kq_mask_bits & 2) ? 1 : 0,
                       (g_ggml_sycl_kq_mask_bits & 4) ? 1 : 0);
+        GGML_LOG_INFO("  GGML_SYCL_MOE_MMV_ROWS: %d\n", g_ggml_sycl_moe_mmv_rows);
+        GGML_LOG_INFO("  GGML_SYCL_Q8_0_MMV_TAIL: %d\n", g_ggml_sycl_q8_0_mmv_tail);
         GGML_LOG_INFO("  GGML_SYCL_WIDE_LOADS: 0x%x (hc=%d gdn=%d convert=%d)\n", g_ggml_sycl_wide_loads,
                       (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_HC) != 0,
                       (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_GDN) != 0,

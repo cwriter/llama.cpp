@@ -10861,6 +10861,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // MoE mat-vec with an output row count that GGML_SYCL_MOE_MMV_ROWS (2, 4) does not divide
+    for (ggml_type type : {GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 16, 8, false, 37, 1, 512));
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 37, 512,
+            true, 16, 8, false, false, true, false, {1, 1}));
+    }
+
     for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, 256, 1, 2));
         test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, 256, 256, 2));
@@ -12262,6 +12269,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, bs, 2560, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, bs, 640, 2560,
             false, 16, 8, false, false, true, false, { 1, 1 }));
+    }
+    // its routed experts at decode: 512 experts, 10 used, IQ3_S gate/up with the GLU fused, IQ4_NL down
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
+        true, 512, 10, false, false, true, false, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 512, 10, false, 640, 1, 2560));
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, 1, 640));
+    // q8_0 mat-vec too large for L2 (the shapes above stay cached across repetitions), K=2560 leaves a tail
+    // of 16 blocks after the 64-block stripes
+    for (int64_t m : {40960, 24576}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, 2560, {1, 1}, {1, 1}));
     }
 
     // the MTP eh_proj: a 2D q8_0 weight against a [5120, 4 streams, n_tokens] activation, and the
