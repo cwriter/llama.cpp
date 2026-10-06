@@ -350,6 +350,10 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // rotation matrices on the device of layer il
+    ggml_tensor * get_k_rot(int32_t il) const;
+    ggml_tensor * get_v_rot(int32_t il) const;
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
@@ -516,6 +520,12 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
+    // rotation matrices on the device of layer il
+    ggml_tensor * get_k_rot    (int32_t il) const;
+    ggml_tensor * get_v_rot    (int32_t il) const;
+    ggml_tensor * get_k_rot_swa(int32_t il) const;
+    ggml_tensor * get_v_rot_swa(int32_t il) const;
+
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
@@ -559,6 +569,10 @@ public:
 
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
+
+    // rotation matrices on the device of layer il
+    ggml_tensor * get_k_rot    (int32_t il) const;
+    ggml_tensor * get_k_rot_swa(int32_t il) const;
 
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
