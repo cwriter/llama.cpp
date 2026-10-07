@@ -817,7 +817,8 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_ASSERT(max_bias == 0.0f);  // ALiBi not supported
     GGML_ASSERT(Q->ne[3] == K->ne[3] || K->ne[3] == 1);
 
-    const bool V_is_K_view = V->view_src
+    // MLA V is a narrower view of K and needs its own strided dequantization.
+    const bool V_is_K_view = V->ne[0] == K->ne[0] && V->view_src
         && (V->view_src == K || (V->view_src == K->view_src
             && V->view_offs == K->view_offs));
     // Standalone online VKQ is slower than staged oneMKL for the tested prefill shapes.
@@ -883,12 +884,6 @@ void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     const int64_t q_row_stride  = Q->nb[1] / sizeof(float);
     const int64_t q_head_stride = Q->nb[2] / sizeof(float);
-
-    // Alias the dequantized buffers only when K and V expose the same values.
-    // MLA V is a narrower view of K and needs its own strided dequantization.
-    const bool V_is_K_view = V->ne[0] == K->ne[0] && V->view_src
-        && (V->view_src == K || (V->view_src == K->view_src
-            && V->view_offs == K->view_offs));
 
     // Early interleaved detection for debug output.
     // True interleaved detection happens after dequant (nb12_fp16 == nb11_fp16),

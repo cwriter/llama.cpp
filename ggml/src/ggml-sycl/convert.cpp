@@ -865,7 +865,7 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
                 return dequantize_row_iq4_nl_sycl;
             }
         case GGML_TYPE_MXFP4:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_mxfp4_sycl_reorder;
             }
             return dequantize_row_mxfp4_sycl;
@@ -974,7 +974,7 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
                 return dequantize_row_iq4_nl_sycl;
             }
         case GGML_TYPE_MXFP4:
-            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
+            if (dst->src[0]->extra && ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
                 return dequantize_row_mxfp4_sycl_reorder;
             }
             return dequantize_row_mxfp4_sycl;

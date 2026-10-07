@@ -126,30 +126,6 @@ int g_ggml_sycl_enable_esimd = GGML_SYCL_ESIMD_DEFAULT;
 int g_ggml_sycl_mmvq_wide = 1;
 int g_ggml_sycl_esimd_q8_0 = 1;
 int g_ggml_sycl_prioritize_dmmv = 0;
-int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
-int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
-int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
-int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
-static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
-
-// value of a GGML_SYCL_DYNAMIC_PRECISION-style variable; def if unset or invalid
-static int ggml_sycl_get_env_precision(const char * name, int def) {
-    const char * env = getenv(name);
-    if (!env) {
-        return def;
-    }
-    std::string mode(env);
-    for (char & c : mode) {
-        c = (char) std::toupper((unsigned char) c);
-    }
-    for (int i = GGML_SYCL_DYNAMIC_PRECISION_F16; i <= GGML_SYCL_DYNAMIC_PRECISION_F32; i++) {
-        if (mode == ggml_sycl_dynamic_precision_names[i]) {
-            return i;
-        }
-    }
-    GGML_LOG_WARN("%s: unknown %s=%s, using %s\n", __func__, name, env, ggml_sycl_dynamic_precision_names[def]);
-    return def;
-}
 int g_ggml_sycl_moe_reorder = -1;
 int g_ggml_sycl_moe_xmx = 1;
 int g_ggml_sycl_fused_gemm = 1;
@@ -523,12 +499,6 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_mmvq_wide = ggml_sycl_get_env("GGML_SYCL_MMVQ_WIDE", 1);
         g_ggml_sycl_esimd_q8_0 = ggml_sycl_get_env("GGML_SYCL_ESIMD_Q8_0", 1);
         g_ggml_sycl_prioritize_dmmv = ggml_sycl_get_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
-        g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
-        g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
-        g_ggml_sycl_dynamic_precision =
-            ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
-        g_ggml_sycl_dynamic_required_precision =
-            ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_REQUIRED_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_F32);
         g_ggml_sycl_moe_reorder = ggml_sycl_get_env("GGML_SYCL_MOE_REORDER", -1);
         g_ggml_sycl_moe_xmx = ggml_sycl_get_env("GGML_SYCL_MOE_XMX", 1);
         g_ggml_sycl_fused_gemm = ggml_sycl_get_env("GGML_SYCL_FUSED_GEMM", 1);
@@ -717,12 +687,6 @@ static void ggml_check_sycl() try {
 #endif
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_OPT: %d\n", g_ggml_sycl_enable_optimize);
-        GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
-        GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
-        GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_PRECISION: %s\n",
-                      ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_precision]);
-        GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_REQUIRED_PRECISION: %s\n",
-                      ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_required_precision]);
         GGML_LOG_INFO("  GGML_SYCL_MOE_REORDER: %d\n", g_ggml_sycl_moe_reorder);
         GGML_LOG_INFO("  GGML_SYCL_MOE_XMX: %d\n", g_ggml_sycl_moe_xmx);
         GGML_LOG_INFO("  GGML_SYCL_FUSED_GEMM: %d\n", g_ggml_sycl_fused_gemm);
@@ -1258,13 +1222,14 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // graph inputs are uploaded every ubatch, and in pipeline mode several ubatches are in flight
     const bool   ring    = g_ggml_sycl_staging_ring != 0;
     const bool   compute = ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
-    const size_t max_cap = ring && compute ? (size_t) g_ggml_sycl_staging_mib << 20 : 4 * ctx->staging_chunk_max;
-    if (stg.data == nullptr) {
+    const size_t slots   = std::max(1, g_ggml_sycl_upload_staging_slots);
+    const size_t max_cap = ring && compute ? (size_t) g_ggml_sycl_staging_mib << 20 : slots * ctx->staging_chunk_max;
+    if (g_ggml_sycl_upload_staging_slots > 0 && stg.data == nullptr) {
         const size_t cap = std::min(max_cap, ctx->staging_first_cap);
         stg.data = (char *) sycl::malloc_host(cap, *stream);
         stg.cap  = stg.data != nullptr ? cap : 0;
     }
-    if (stg.data != nullptr) {
+    if (g_ggml_sycl_upload_staging_slots > 0 && stg.data != nullptr) {
         stg.free_retired(*stream, false);
         auto done = [](const sycl::event & ev) {
             return ev.get_info<sycl::info::event::command_execution_status>() ==
@@ -1299,7 +1264,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         // a SoA chunk must hold whole spans, as the permute works one span at a time
         const size_t align = soa ? ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>::span_size : 1;
         while (remaining > 0) {
-            const size_t chunk_max = std::min(ctx->staging_chunk_max, stg.cap / 4) / align * align;
+            const size_t chunk_max = std::min(ctx->staging_chunk_max, stg.cap / slots) / align * align;
             const size_t chunk     = std::min(remaining, chunk_max);
             // the legacy mode spends a whole slot on every chunk
             const size_t span      = ring ? GGML_PAD(chunk, 256) : chunk_max;
@@ -1344,9 +1309,6 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // no pinned memory available: fall back to the old malloc bounce
     ggml_sycl_upload_join(ctx->device);
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
-#ifndef _WIN32
-    // Note: Use host buffer to save the data from mmap(), then copy to device. It's workaround for mmap() issue on PVC GPU.
-    // This function will be called during load model from disk. Use memory buffer replace dynamic won't save more time and brings potential memory leak risk here.
     char * host_buf = (char *) malloc(size);
     if (soa) {
         ggml_sycl_kv_soa_canonical_to_span(host_buf, data, size);
@@ -1355,9 +1317,6 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     }
     SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, host_buf, size).wait()));
     free(host_buf);
-#else
-    SYCL_CHECK(CHECK_TRY_ERROR((*stream).memcpy((char *) tensor->data + offset, data, size).wait()));
-#endif
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -6028,7 +5987,7 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
 // The only types opt_for_reorder_id() reorders. Shared with the graph compatibility check so
 // the two cannot drift: MUL_MAT_ID has its own, narrower list than MUL_MAT.
 static inline bool ggml_sycl_mul_mat_id_reorders_type(enum ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K ||
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_MXFP4 ||
            (type == GGML_TYPE_IQ3_S  && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ3_S)) ||
            (type == GGML_TYPE_IQ4_NL && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ4_NL)) ||
            (type == GGML_TYPE_Q8_0   && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_Q8_0)) ||
@@ -6040,8 +5999,7 @@ static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tenso
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
-    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K &&
-        src0->type != GGML_TYPE_MXFP4) {
+    if (!ggml_sycl_mul_mat_id_reorders_type(src0->type)) {
         return;
     }
     // The MXFP4 reorder kernels use 8-byte vector loads, so every expert slice must stay aligned.

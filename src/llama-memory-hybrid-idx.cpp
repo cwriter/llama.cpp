@@ -424,10 +424,9 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         // their pools as they were, so only the tail is redone; an edit at the first position regroups it all
         const llama_pos stale = mem_idx_stale[s];
 
-        size_t n_kept = 0;
         bool   kept   = false;
         if (!sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first &&
-                (stale == POS_CLEAN || (stale > sq.pos_min && !sq.shared))) {
+                (stale == POS_CLEAN || stale > sq.pos_min)) {
             if (stale != POS_CLEAN) {
                 sq.cells.erase(std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(stale, (uint32_t) 0)),
                         sq.cells.end());
@@ -436,7 +435,6 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
                 }
                 sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
             }
-            n_kept = sq.cells.size();
             for (auto it = sq.cells.empty() ? sp.begin() : sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
             }
