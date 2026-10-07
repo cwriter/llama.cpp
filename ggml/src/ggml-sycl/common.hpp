@@ -842,6 +842,20 @@ struct ggml_backend_sycl_context {
         return pool(device);
     }
 
+    ggml_sycl_fattn_kv_buffers & fattn_buffers(int device) {
+        if (fattn_bufs[device] == nullptr) {
+            fattn_bufs[device] = new_fattn_kv_buffers(stream(device, 0), device);
+        }
+        return *fattn_bufs[device];
+    }
+
+    ggml_sycl_fattn_kv_buffers & fattn_buffers() {
+        return fattn_buffers(device);
+    }
+
+    // uid of the last graph whose MoE weight consumers were checked: the same graph has the same consumers
+    uint64_t moe_consumers_checked_uid = 0;
+
 #ifdef GGML_SYCL_GRAPH
     // Map from first node pointer to graph - allows multiple graphs per context when the
     // computation is split across CPU/GPU (e.g. with --n-cpu-moe)
