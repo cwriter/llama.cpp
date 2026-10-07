@@ -2254,6 +2254,91 @@ static void q8_0_esimd_launch_rows(const void * vx, const float * y, float * dst
     });
 }
 
+// GGML_SYCL_Q8_0_GLU_ESIMD: the {gate, up, SWIGLU} mat-vec pair of a dense FFN (the qwen4exp shared expert) on the
+// stripes above, one token: a work-group streams NR rows of both reordered Q8_0 weights against the f32 activation
+// and writes silu(gate) * up. The MMVQ path quantizes the activation to q8_1 in a launch of its own first.
+template <int WG, int NR>
+ESIMD_INLINE void q8_0_glu_reorder_esimd_rows(
+        const void * vg, const void * vu, const float * y, float * dst, const int ncols, const int nrows,
+        sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
+    using namespace sycl::ext::intel::esimd;
+
+    constexpr int STRIPE = 8;
+
+    const int          nblk_row = ncols / QK8_0;
+    const size_t       nb       = (size_t) nrows * nblk_row;
+    const int8_t *     qg       = (const int8_t *) vg;
+    const int8_t *     qu       = (const int8_t *) vu;
+    const sycl::half * dg       = (const sycl::half *) (qg + nb * QK8_0);
+    const sycl::half * du       = (const sycl::half *) (qu + nb * QK8_0);
+
+    const int tid  = it.get_local_id(0);
+    const int row0 = it.get_group(0) * NR;
+
+    size_t base[NR];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        base[r] = (size_t) (row0 + r < nrows ? row0 + r : nrows - 1) * nblk_row;
+    }
+
+    simd<float, 32> acc_g[NR];
+    simd<float, 32> acc_u[NR];
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        acc_g[r] = 0.0f;
+        acc_u[r] = 0.0f;
+    }
+
+    int ib = 0;
+    for (; ib + WG * STRIPE <= nblk_row; ib += WG * STRIPE) {
+        q8_0_mac_stripe_rows<STRIPE, NR>(qg, dg, base, ib + tid * STRIPE, y, acc_g);
+        q8_0_mac_stripe_rows<STRIPE, NR>(qu, du, base, ib + tid * STRIPE, y, acc_u);
+    }
+    for (; ib + WG * 4 <= nblk_row; ib += WG * 4) {
+        q8_0_mac_stripe_rows<4, NR>(qg, dg, base, ib + tid * 4, y, acc_g);
+        q8_0_mac_stripe_rows<4, NR>(qu, du, base, ib + tid * 4, y, acc_u);
+    }
+    for (; ib + WG * 2 <= nblk_row; ib += WG * 2) {
+        q8_0_mac_stripe_rows<2, NR>(qg, dg, base, ib + tid * 2, y, acc_g);
+        q8_0_mac_stripe_rows<2, NR>(qu, du, base, ib + tid * 2, y, acc_u);
+    }
+    for (int b = ib + tid; b < nblk_row; b += WG) {
+        q8_0_mac_stripe_rows<1, NR>(qg, dg, base, b, y, acc_g);
+        q8_0_mac_stripe_rows<1, NR>(qu, du, base, b, y, acc_u);
+    }
+
+#pragma unroll
+    for (int r = 0; r < NR; ++r) {
+        lmem[(tid * NR + r) * 2 + 0] = reduce<float>(acc_g[r], std::plus<>{});
+        lmem[(tid * NR + r) * 2 + 1] = reduce<float>(acc_u[r], std::plus<>{});
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    if (tid < NR && row0 + tid < nrows) {
+        float g = 0.0f;
+        float u = 0.0f;
+        for (int p = 0; p < WG; ++p) {
+            g += lmem[(p * NR + tid) * 2 + 0];
+            u += lmem[(p * NR + tid) * 2 + 1];
+        }
+        dst[row0 + tid] = g / (1.0f + sycl::exp(-g)) * u;
+    }
+}
+
+template <int WG, int NR>
+static void q8_0_glu_esimd_launch_rows(const void * vg, const void * vu, const float * y, float * dst, const int ncols,
+                                       const int nrows, dpct::queue_ptr stream) {
+    const int workgroups = (nrows + NR - 1) / NR;
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * NR * 2), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * WG), sycl::range<1>(WG)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                q8_0_glu_reorder_esimd_rows<WG, NR>(vg, vu, y, dst, ncols, nrows, lmem, it);
+            });
+    });
+}
+
 static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const float *y,
                                                            float *dst, const int ncols,
                                                            const int nrows,
@@ -3453,6 +3538,29 @@ static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * d
         });
 }
 #endif
+
+bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y, float * dst, int64_t ncols,
+                              int64_t nrows, dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    static const int level = ggml_sycl_get_env("GGML_SYCL_Q8_0_GLU_ESIMD", 1);
+    if (level == 0 || !g_ggml_sycl_enable_esimd || ncols % QK8_0 != 0 || ncols > INT32_MAX || nrows > INT32_MAX) {
+        return false;
+    }
+    // the stripe shapes of the dense Q8_0 kernels (GGML_SYCL_Q8_0_MMV_SHAPES) by row length
+    const int64_t nblk_row = ncols / QK8_0;
+    if (nblk_row >= 128) {
+        q8_0_glu_esimd_launch_rows<16, 2>(vg, vu, y, dst, (int) ncols, (int) nrows, stream);
+    } else if (nblk_row >= 64) {
+        q8_0_glu_esimd_launch_rows<4, 4>(vg, vu, y, dst, (int) ncols, (int) nrows, stream);
+    } else {
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(vg, vu, y, dst, ncols, nrows, stream);
+    return false;
+#endif
+}
 
 bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
                                  dpct::queue_ptr stream) {
