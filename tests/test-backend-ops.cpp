@@ -8119,6 +8119,62 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+// n_l MoE gate/up mat-vec pairs with SWIGLU, each layer with its own expert weights and routing, summed. With
+// n_l * n_used experts well above the GPU L2, the experts stream from VRAM as in a model; the single-layer perf
+// case of test_mul_mat_vec_fusion keeps hitting the same experts in L2. The time includes the n_l - 1 adds.
+struct test_moe_glu_stream : public test_case {
+    const ggml_type type;
+    const int64_t   m;  // tokens
+    const int64_t   n;  // rows per expert
+    const int64_t   k;
+    const int       n_mats;
+    const int       n_used;
+    const int       n_l;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, m, n, k, n_mats, n_used, n_l);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GLU_STREAM";
+    }
+
+    double max_nmse_err() override { return 5e-3; }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    test_moe_glu_stream(ggml_type type = GGML_TYPE_IQ3_S, int64_t m = 1, int64_t n = 640, int64_t k = 2560,
+            int n_mats = 32, int n_used = 10, int n_l = 8)
+        : type(type), m(m), n(n), k(k), n_mats(n_mats), n_used(n_used), n_l(n_l) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, m);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * out = nullptr;
+        for (int l = 0; l < n_l; ++l) {
+            ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+            ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+            ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
+            if (n_used != n_mats) {
+                ids = ggml_view_2d(ctx, ids, n_used, m, ids->nb[1], 0);
+            }
+            ggml_tensor * ffn_up   = ggml_mul_mat_id(ctx, ups, cur, ids);
+            ggml_tensor * ffn_gate = ggml_mul_mat_id(ctx, gates, cur, ids);
+            ggml_tensor * y        = ggml_glu_split(ctx, ffn_gate, ffn_up, GGML_GLU_OP_SWIGLU);
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -11235,6 +11291,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 1, 64, 4352,
         true, 16, 8, false, false, true, false, {1, 1}));
+    for (int64_t m : {1, 3}) {
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ3_S, m, 37, 2560, 8, 4, 2));
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ3_S, m, 64, 1536, 8, 4, 2));
+    }
 
     for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, 256, 1, 2));
@@ -12673,6 +12733,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // its recurrent layers at decode: the attn_gate and ssm_out mat-vecs after the delta net, without it (mode 0)
     for (int mode : {0, 1, 2}) {
         test_cases.emplace_back(new test_gdn_layer_stream(128, 48, 16, 2560, 4, mode));
+    }
+    // the qwen4exp IQ3_S expert gate/up at decode and at 8 tokens, streamed from VRAM over 8 layers
+    for (int64_t m : {1, 8}) {
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ3_S, m, 640, 2560, 32, 10, 8));
     }
     // 8 tokens route to ~75 distinct experts, so the weights do not stay in L2 across runs
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 8, 640, 2560,

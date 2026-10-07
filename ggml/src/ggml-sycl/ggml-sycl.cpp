@@ -137,7 +137,7 @@ int g_ggml_sycl_moe_mmv_rows = 0;
 int g_ggml_sycl_q8_0_mmv_tail = 1;
 int g_ggml_sycl_q8_0_mmv_shapes = 1;
 int g_ggml_sycl_fuse_hc_pre = 1;
-int g_ggml_sycl_moe_esimd = 3;
+int g_ggml_sycl_moe_esimd = 4;
 int g_ggml_sycl_upload_queue = -1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_fuse_conv_window = 1;
@@ -542,7 +542,7 @@ static void ggml_check_sycl() try {
         if (g_ggml_sycl_moe_mmv_rows != 1 && g_ggml_sycl_moe_mmv_rows != 2 && g_ggml_sycl_moe_mmv_rows != 4) {
             g_ggml_sycl_moe_mmv_rows = 0;
         }
-        g_ggml_sycl_moe_esimd = ggml_sycl_get_env("GGML_SYCL_MOE_ESIMD", 3);
+        g_ggml_sycl_moe_esimd = ggml_sycl_get_env("GGML_SYCL_MOE_ESIMD", 4);
         g_ggml_sycl_q8_0_mmv_tail = ggml_sycl_get_env("GGML_SYCL_Q8_0_MMV_TAIL", 1) != 0;
         g_ggml_sycl_q8_0_mmv_shapes = ggml_sycl_get_env("GGML_SYCL_Q8_0_MMV_SHAPES", 1) != 0;
         g_ggml_sycl_fuse_hc_pre = ggml_sycl_get_env("GGML_SYCL_FUSE_HC_PRE", 1) != 0;
