@@ -6182,6 +6182,109 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     }
 }
 
+// GGML_SYCL_FUSE_MATVEC_EPI: an f32 mat-vec (one token) and the elementwise tail that consumes only it, as one
+// ESIMD launch: SIGMOID (qwen4exp ssm beta, shared-expert gate) or ADD(bias) -> SOFTPLUS -> MUL(scale) (the ssm
+// alpha gate). No-op reshapes/views in between are followed. The kernel runs at the mat-vec and writes the last
+// node, so graph_optimize keeps the mat-vec's activation allocated until then.
+struct ggml_sycl_matvec_epi_match {
+    ggml_tensor *       mm      = nullptr;
+    ggml_tensor *       last    = nullptr;
+    const ggml_tensor * bias    = nullptr;
+    const ggml_tensor * scale   = nullptr;
+    int                 epi     = 0;
+    int                 last_idx = -1;
+};
+
+static bool ggml_sycl_fuse_matvec_epi_enabled() {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_FUSE_MATVEC_EPI", 1) != 0;
+    return on && g_ggml_sycl_enable_fusion && g_ggml_sycl_enable_esimd;
+}
+
+static bool ggml_sycl_match_matvec_epilogue(const ggml_cgraph * cgraph, int i, ggml_sycl_matvec_epi_match & m,
+                                            bool any_tokens) {
+    if (!ggml_sycl_fuse_matvec_epi_enabled()) {
+        return false;
+    }
+    ggml_tensor *       mm   = cgraph->nodes[i];
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    if (mm->op != GGML_OP_MUL_MAT || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+        mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
+        src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+        (!any_tokens && src1->ne[1] != 1) || src0->ne[1] > 512 || src0->ne[0] % 128 != 0 ||
+        !src0->buffer || ggml_backend_buffer_is_sycl_split(src0->buffer)) {
+        return false;
+    }
+    const int64_t M = src0->ne[1];
+
+    int              idxs[16];
+    enum ggml_op     ops[16];
+    int              n   = 0;
+    const ggml_tensor * cur = mm;
+    int              j   = i + 1;
+    auto push = [&](int k) { idxs[n] = k; ops[n] = cgraph->nodes[k]->op; ++n; };
+    auto skip_views = [&]() {
+        while (j < cgraph->n_nodes && n < 12 &&
+               (cgraph->nodes[j]->op == GGML_OP_RESHAPE || cgraph->nodes[j]->op == GGML_OP_VIEW) &&
+               cgraph->nodes[j]->src[0] == cur && ggml_is_contiguous(cgraph->nodes[j])) {
+            cur = cgraph->nodes[j];
+            push(j++);
+        }
+    };
+    auto is_vec = [&](const ggml_tensor * t) {
+        return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == M;
+    };
+    push(i);
+    skip_views();
+    if (j >= cgraph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * nj = cgraph->nodes[j];
+    if (nj->op == GGML_OP_UNARY && ggml_get_unary_op(nj) == GGML_UNARY_OP_SIGMOID && nj->src[0] == cur) {
+        push(j);
+        m.epi = 1;
+    } else if (nj->op == GGML_OP_ADD && nj->src[0] == cur && is_vec(nj->src[1])) {
+        m.bias = nj->src[1];
+        cur    = nj;
+        push(j++);
+        skip_views();
+        if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(cgraph->nodes[j]) != GGML_UNARY_OP_SOFTPLUS || cgraph->nodes[j]->src[0] != cur) {
+            return false;
+        }
+        cur = cgraph->nodes[j];
+        push(j++);
+        skip_views();
+        if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_MUL) {
+            return false;
+        }
+        nj = cgraph->nodes[j];
+        if (nj->src[0] == cur && is_vec(nj->src[1])) {
+            m.scale = nj->src[1];
+        } else if (nj->src[1] == cur && is_vec(nj->src[0])) {
+            m.scale = nj->src[0];
+        } else {
+            return false;
+        }
+        push(j);
+        m.epi = 2;
+    } else {
+        return false;
+    }
+    ggml_tensor * last = cgraph->nodes[j];
+    if (last->type != GGML_TYPE_F32 || !ggml_is_contiguous(last) || ggml_nelements(last) != M * src1->ne[1]) {
+        return false;
+    }
+    const int outputs[1] = { j };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, outputs, 1)) {
+        return false;
+    }
+    m.mm       = mm;
+    m.last     = last;
+    m.last_idx = j;
+    return true;
+}
+
 // {mul_mat(gate), mul_mat(up), GLU} over the standard (non-reorder) weight layout,
 // for quant pairs the reorder kernel does not cover (mixed gate/up types, e.g. UD-Q4_K_XL's
 // iq4_xs gate + q5_K up). Two launches replace five: one shared q8_1 quantization and one
@@ -8586,6 +8689,21 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        if (node->op == GGML_OP_MUL_MAT) {
+            ggml_sycl_matvec_epi_match em;
+            if (ggml_sycl_match_matvec_epilogue(cgraph, i, em, /*any_tokens=*/false)) {
+                scope_op_debug_print scope_dbg_print("ggml_sycl_matvec_epi_fused", em.last, /*num_src=*/0);
+                const ggml_tensor * a = em.mm->src[0];
+                if (ggml_sycl_f32_mat_vec_epi_esimd((const float *) a->data, (const float *) em.mm->src[1]->data,
+                                                    (float *) em.last->data, a->ne[1], a->ne[0], a->ne[0], em.epi,
+                                                    em.bias ? (const float *) em.bias->data : nullptr,
+                                                    em.scale ? (const float *) em.scale->data : nullptr,
+                                                    sycl_ctx->stream())) {
+                    i = em.last_idx;
+                    continue;
+                }
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_mul_mat_glu_mmvq_fused(*sycl_ctx, cgraph, i)) {
             i += 2;
             continue;
@@ -9212,6 +9330,15 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_sycl_dsv4_hc_pre_up_match match;
         if (cgraph->nodes[i]->op == GGML_OP_SCALE && ggml_sycl_match_dsv4_hc_pre_up(cgraph, i, match, /*any_tokens=*/true)) {
             params->add_alloc_dep(params->user_data, match.scale->src[0], match.dst);
+        }
+    }
+    // a fused mat-vec epilogue reads the activation at the mat-vec and writes the tail's last node
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_sycl_matvec_epi_match em;
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_sycl_match_matvec_epilogue(cgraph, i, em, /*any_tokens=*/true)) {
+            ggml_tensor * x = em.mm->src[1];
+            params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, em.last);
+            i = em.last_idx;
         }
     }
     // a skipped state gather is read at its gated delta net, so its row ids must live that long.

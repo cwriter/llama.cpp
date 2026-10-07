@@ -8238,6 +8238,58 @@ struct test_glu_stream : public test_case {
     }
 };
 
+// the qwen4exp recurrent-layer gates as the model builds them: beta = sigmoid(W_b x) and alpha = softplus(W_a x + dt) * a
+// over f32 [n_embd, n_heads] weights, with the reshapes in between, plus the shared-expert gate sigmoid(w x) (1 row).
+// Backends can run each mat-vec with its tail as one kernel.
+struct test_matvec_epi : public test_case {
+    const int64_t k;
+    const int64_t m;
+    const int64_t n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR3(k, m, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MATVEC_EPI";
+    }
+
+    double max_nmse_err() override { return 1e-5; }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    test_matvec_epi(int64_t k = 2560, int64_t m = 48, int64_t n_tokens = 1) : k(k), m(m), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w_beta  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * w_alpha = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_tensor * dt      = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * a       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, m);
+        ggml_tensor * w_sh    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+
+        ggml_tensor * beta = ggml_mul_mat(ctx, w_beta, x);
+        beta = ggml_reshape_4d(ctx, beta, 1, m, n_tokens, 1);
+        beta = ggml_sigmoid(ctx, beta);
+
+        ggml_tensor * alpha = ggml_mul_mat(ctx, w_alpha, x);
+        alpha = ggml_reshape_3d(ctx, alpha, m, n_tokens, 1);
+        alpha = ggml_add(ctx, alpha, dt);
+        alpha = ggml_softplus(ctx, alpha);
+        alpha = ggml_mul(ctx, alpha, a);
+        alpha = ggml_reshape_4d(ctx, alpha, 1, m, n_tokens, 1);
+
+        ggml_tensor * sh = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_sh, x));
+
+        ggml_tensor * out = ggml_add(ctx, ggml_mul(ctx, beta, alpha), ggml_reshape_4d(ctx, ggml_repeat_4d(ctx, sh, m, n_tokens, 1, 1), 1, m, n_tokens, 1));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -12424,6 +12476,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // q8_0 dense gate/up + SWIGLU over 1..8 tokens at the qwen4exp shared-expert shape, and an
     // odd row count for the row tail.
     test_cases.emplace_back(new test_glu_stream(GGML_TYPE_Q8_0, 1, 640, 2560, 2));
+    for (int64_t nt : {1, 2}) {
+        test_cases.emplace_back(new test_matvec_epi(2560, 48, nt));
+        test_cases.emplace_back(new test_matvec_epi(512, 7, nt));
+    }
     test_cases.emplace_back(new test_glu_stream(GGML_TYPE_Q8_0, 1, 37, 4096, 2));
     for (int64_t m_batch = 1; m_batch <= 8; ++m_batch) {
         for (int64_t rows : {640, 321}) {
@@ -12779,6 +12835,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, bs, 640, 2560,
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
+    // its recurrent-layer alpha/beta gates and the shared-expert gate
+    test_cases.emplace_back(new test_matvec_epi(2560, 48, 1));
     // the shared-expert gate/up streamed from VRAM: 16 pairs, 56 MiB
     test_cases.emplace_back(new test_glu_stream(GGML_TYPE_Q8_0, 1, 640, 2560, 16));
     // its routed experts at decode: 512 experts, 10 used, IQ3_S gate/up with the GLU fused, IQ4_NL down
