@@ -538,3 +538,216 @@ void ggml_sycl_op_dsv4_hc_post_fused_gate(ggml_backend_sycl_context & ctx, ggml_
     GGML_ASSERT(gate.src != nullptr);
     dsv4_hc_post_impl(ctx, dst, &gate);
 }
+
+// tunable: sub-groups (embedding elements) per work-group of the fused up-projection + hc_pre
+static constexpr int dsv4_hc_pre_up_sg_per_wg = 16;
+// tokens per launch: each one adds an activation row to local memory and accumulators to every lane
+static constexpr int64_t dsv4_hc_pre_up_max_tokens = 4;
+// the activation of all tokens sits in local memory: 32 KiB at most
+static constexpr int64_t dsv4_hc_pre_up_max_cols = 2048;
+
+// dst[i0, t] = out_scale * sum_h x[i0, h, t] * sigmoid(gate[i0 + h*n_embd, t]), with
+// gate = W_up * silu(act_scale*lo + act_bias). W_up is Q8_0 in the reordered SoA layout:
+// [qs: nrows*ncols int8] [d: nrows*ncols/QK8_0 half]. The work-group first writes the activation
+// for all NT tokens to local memory. Then one sub-group per i0 takes the HC weight rows of element
+// i0, so the combine needs no other sub-group, and reads them once for all tokens. Lane l takes
+// the 4-byte words l, l + WARP_SIZE, ... of a row.
+template <int HC, int NT>
+static void dsv4_hc_pre_up_q8_0_sycl(
+        const float * lo, const void * vw, const float * x, float * dst,
+        int ncols, int64_t n_embd,
+        int64_t slo1, int64_t sx1, int64_t sx2, int64_t sd1,
+        float act_scale, float act_bias, float out_scale,
+        queue_ptr stream) {
+    const int64_t      nrows = HC * n_embd;
+    const int          nblk  = ncols / QK8_0;
+    const int          nw    = ncols / 4;
+    const int8_t *     qs    = (const int8_t *) vw;
+    const sycl::half * d     = (const sycl::half *) (qs + nrows * ncols);
+
+    constexpr int wg   = dsv4_hc_pre_up_sg_per_wg * WARP_SIZE;
+    const int64_t n_wg = ceil_div(n_embd, dsv4_hc_pre_up_sg_per_wg);
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<sycl::float4, 1> act(sycl::range<1>(NT * nw), cgh);
+        cgh.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(n_wg * wg), sycl::range<1>(wg)),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                for (int iw = item.get_local_id(0); iw < NT * nw; iw += wg) {
+                    const float * lo_w = lo + (iw / nw) * slo1 + 4 * (iw % nw);
+                    sycl::float4 a;
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        a[j] = op_silu(act_scale * lo_w[j] + act_bias);
+                    }
+                    act[iw] = a;
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+
+                const auto    sg   = item.get_sub_group();
+                const int64_t i0   = item.get_group(0) * dsv4_hc_pre_up_sg_per_wg + sg.get_group_linear_id();
+                const int     lane = sg.get_local_linear_id();
+                if (i0 >= n_embd) {
+                    return;
+                }
+
+                float acc[NT][HC] = {};
+                for (int w = lane; w < nw; w += WARP_SIZE) {
+                    const int ib = 4 * w / QK8_0;
+
+                    sycl::float4 a[NT];
+#pragma unroll
+                    for (int t = 0; t < NT; ++t) {
+                        a[t] = act[t * nw + w];
+                    }
+
+#pragma unroll
+                    for (int h = 0; h < HC; ++h) {
+                        const int64_t row = i0 + h*n_embd;
+                        const sycl::vec<int8_t, 4> q = *(const sycl::vec<int8_t, 4> *) (qs + row*ncols + 4*w);
+                        const float dq = d[row*nblk + ib];
+#pragma unroll
+                        for (int t = 0; t < NT; ++t) {
+                            acc[t][h] += dq * (q[0]*a[t][0] + q[1]*a[t][1] + q[2]*a[t][2] + q[3]*a[t][3]);
+                        }
+                    }
+                }
+
+#pragma unroll
+                for (int t = 0; t < NT; ++t) {
+                    float sum = 0.0f;
+#pragma unroll
+                    for (int h = 0; h < HC; ++h) {
+                        const float g = sycl::reduce_over_group(sg, acc[t][h], sycl::plus<float>());
+                        sum += x[i0 + h*sx1 + t*sx2] * (1.0f / (1.0f + sycl::exp(-g)));
+                    }
+                    if (lane == 0) {
+                        dst[i0 + t*sd1] = out_scale * sum;
+                    }
+                }
+            });
+    });
+}
+
+bool ggml_sycl_match_dsv4_hc_pre_up(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_dsv4_hc_pre_up_match & match,
+                                    bool any_tokens) {
+    if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_hc_pre || node_idx + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * scale = cgraph->nodes[node_idx];
+    ggml_tensor * unary = cgraph->nodes[node_idx + 1];
+    ggml_tensor * up    = cgraph->nodes[node_idx + 2];
+    if (scale->op != GGML_OP_SCALE || unary->op != GGML_OP_UNARY || up->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    if (ggml_get_unary_op(unary) != GGML_UNARY_OP_SILU || unary->src[0] != scale || up->src[1] != unary) {
+        return false;
+    }
+
+    // the span ends at the hc_pre; only views of the gate (or other no-op views) sit before it
+    int idxs[8] = { node_idx, node_idx + 1, node_idx + 2 };
+    enum ggml_op ops[8] = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT };
+    int n = 3;
+    int last = -1;
+    for (int j = node_idx + 3; j < cgraph->n_nodes && j <= node_idx + 6; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (t->op == GGML_OP_DSV4_HC_PRE) {
+            last = j;
+            break;
+        }
+        if (t->op != GGML_OP_RESHAPE && t->op != GGML_OP_VIEW) {
+            return false;
+        }
+        if (t->view_src == up) {
+            idxs[n] = j;
+            ops[n]  = t->op;
+            n++;
+        }
+    }
+    if (last < 0) {
+        return false;
+    }
+    idxs[n] = last;
+    ops[n]  = GGML_OP_DSV4_HC_PRE;
+    n++;
+
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, &last, 1)) {
+        return false;
+    }
+
+    ggml_tensor *       dst  = cgraph->nodes[last];
+    const ggml_tensor * x    = dst->src[0];
+    const ggml_tensor * gate = dst->src[1];
+    const ggml_tensor * lo   = scale->src[0];
+    const ggml_tensor * w    = up->src[0];
+
+    // the gated form of hc_pre, reading the up output as [n_embd, hc, n_tokens] from offset 0
+    if (ggml_get_op_params_i32(dst, 1) == 0 || gate->view_src != up || gate->view_offs != 0 || !ggml_is_contiguous(gate)) {
+        return false;
+    }
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[2];
+    if (x->ne[1] != DSV4_HC || x->ne[3] != 1 || (!any_tokens && n_tokens > dsv4_hc_pre_up_max_tokens) || !ggml_are_same_shape(x, gate)) {
+        return false;
+    }
+    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || dst->type != GGML_TYPE_F32 || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    // lo [ncols, n_tokens] -> scale -> silu -> up [hc*n_embd, n_tokens]
+    const int64_t ncols = lo->ne[0];
+    if (w->type != GGML_TYPE_Q8_0 || ncols % QK8_0 != 0 || ncols > dsv4_hc_pre_up_max_cols || w->ne[0] != ncols || w->ne[1] != DSV4_HC * n_embd ||
+        !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1 || (uintptr_t) w->data % 4 != 0) {
+        return false;
+    }
+    if (lo->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(lo) || lo->ne[1] != n_tokens || lo->ne[2] != 1 || lo->ne[3] != 1 ||
+        !ggml_are_same_shape(lo, unary) || up->ne[1] != n_tokens) {
+        return false;
+    }
+
+    match.scale = scale;
+    match.unary = unary;
+    match.up    = up;
+    match.dst   = dst;
+    match.last  = last;
+    return true;
+}
+
+void ggml_sycl_op_dsv4_hc_pre_up_fused(ggml_backend_sycl_context & ctx, const ggml_sycl_dsv4_hc_pre_up_match & match) {
+    scope_op_debug_print scope_dbg_print(__func__, match.dst, /*num_src=*/2);
+
+    const ggml_tensor * lo  = match.scale->src[0];
+    const ggml_tensor * w   = match.up->src[0];
+    const ggml_tensor * x   = match.dst->src[0];
+    ggml_tensor *       dst = match.dst;
+
+    float act_scale;
+    float act_bias;
+    memcpy(&act_scale, (const float *) match.scale->op_params + 0, sizeof(float));
+    memcpy(&act_bias,  (const float *) match.scale->op_params + 1, sizeof(float));
+    const float out_scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[2];
+
+    const auto launch = [&](auto nt) {
+        dsv4_hc_pre_up_q8_0_sycl<DSV4_HC, decltype(nt)::value>(
+                (const float *) lo->data, w->data, (const float *) x->data, (float *) dst->data,
+                (int) lo->ne[0], n_embd,
+                lo->nb[1] / sizeof(float), x->nb[1] / sizeof(float), x->nb[2] / sizeof(float), dst->nb[1] / sizeof(float),
+                act_scale, act_bias, out_scale, ctx.stream());
+    };
+
+    switch (n_tokens) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        default: GGML_ABORT("fused hc_pre: unsupported n_tokens %d", (int) n_tokens);
+    }
+}

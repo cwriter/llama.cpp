@@ -4280,6 +4280,9 @@ struct test_dsv4_hc : public test_case {
         if (name == "x" || name == "residual") {
             lo = -1.0f; hi = 1.0f; return true;
         }
+        if (name == "lo") {
+            lo = -4.0f; hi = 4.0f; return true;
+        }
         return false;
     }
 
@@ -4371,6 +4374,58 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
 
             out = ggml_dsv4_hc_pre(ctx, x, weights);
         }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// the hc_pre gate as qwen4exp builds it: up(silu(lo/hc)) with a Q8_0 up weight, then the gated
+// hc_pre over the normed streams x. Backends can fuse the whole chain.
+struct test_dsv4_hc_pre_up : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_lr;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_PRE_UP";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_lr, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    // the CPU reference quantizes the activation to Q8_0 for the mat-vec
+    double max_nmse_err() override { return 5e-4; }
+
+    test_dsv4_hc_pre_up(int64_t n_embd = 64, int64_t n_lr = 64, int64_t n_tokens = 1)
+        : n_embd(n_embd), n_lr(n_lr), n_tokens(n_tokens) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        // keep the gate out of the flat ends of the sigmoid
+        ggml_tensor * w_up = ggml_get_tensor(ctx, "w_up");
+        init_tensor_uniform(w_up, -0.15f, 0.15f);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_lr, n_tokens);
+        ggml_set_name(lo, "lo");
+
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_lr, n_embd*hc);
+        ggml_set_name(w_up, "w_up");
+
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc)));
+
+        out = ggml_dsv4_hc_pre_gated(ctx,
+                ggml_reshape_3d(ctx, x,    n_embd, hc, n_tokens),
+                ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), 1.0f / (float) hc);
         ggml_set_name(out, "out");
         return out;
     }
@@ -9750,6 +9805,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_dsv4_hc_pre_up(64, 64, 1));
+    test_cases.emplace_back(new test_dsv4_hc_pre_up(100, 96, 1));
+    for (int64_t n_tokens : { 1, 2, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_up(2560, 320, n_tokens));
+    }
+
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
@@ -12353,6 +12414,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, n, 1));
         test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n, true));
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true));
+    }
+    for (int n : {1, 2, 4}) {
+        test_cases.emplace_back(new test_dsv4_hc_pre_up(2560, 320, n));
     }
 
     // qwen4exp (Qwen3.8-Flash-Next): 512 experts, 10 used; gate/up 2560 -> 640, down 640 -> 2560

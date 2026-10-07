@@ -134,6 +134,7 @@ int g_ggml_sycl_wide_loads = GGML_SYCL_WIDE_LOADS_DEFAULT;
 int g_ggml_sycl_lightning_indexer = GGML_SYCL_LIGHTNING_INDEXER_DEFAULT;
 int g_ggml_sycl_moe_mmv_rows = 0;
 int g_ggml_sycl_q8_0_mmv_tail = 1;
+int g_ggml_sycl_fuse_hc_pre = 0;
 int g_ggml_sycl_moe_esimd = 2;
 int g_ggml_sycl_upload_queue = -1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
@@ -535,6 +536,7 @@ static void ggml_check_sycl() try {
         }
         g_ggml_sycl_moe_esimd = ggml_sycl_get_env("GGML_SYCL_MOE_ESIMD", 2);
         g_ggml_sycl_q8_0_mmv_tail = ggml_sycl_get_env("GGML_SYCL_Q8_0_MMV_TAIL", 1) != 0;
+        g_ggml_sycl_fuse_hc_pre = ggml_sycl_get_env("GGML_SYCL_FUSE_HC_PRE", 0) != 0;
         g_ggml_sycl_upload_queue = ggml_sycl_get_env("GGML_SYCL_UPLOAD_QUEUE", -1);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
@@ -633,6 +635,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_MOE_MMV_ROWS: %d\n", g_ggml_sycl_moe_mmv_rows);
         GGML_LOG_INFO("  GGML_SYCL_MOE_ESIMD: %d\n", g_ggml_sycl_moe_esimd);
         GGML_LOG_INFO("  GGML_SYCL_Q8_0_MMV_TAIL: %d\n", g_ggml_sycl_q8_0_mmv_tail);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_HC_PRE: %d\n", g_ggml_sycl_fuse_hc_pre);
         GGML_LOG_INFO("  GGML_SYCL_UPLOAD_QUEUE: %d (-1 = on with the Level Zero v2 adapter)\n", g_ggml_sycl_upload_queue);
         GGML_LOG_INFO("  GGML_SYCL_WIDE_LOADS: 0x%x (hc=%d gdn=%d convert=%d)\n", g_ggml_sycl_wide_loads,
                       (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_HC) != 0,
@@ -8244,6 +8247,18 @@ static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx
 
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx);
 
+// the fused hc_pre reads the up weight in the reordered Q8_0 layout: reorder it here when the
+// plain mat-vec would have, and decline when it would not
+static bool ggml_sycl_hc_pre_up_weight_ready(ggml_backend_sycl_context & ctx, const ggml_sycl_dsv4_hc_pre_up_match & match) {
+    const ggml_tensor * w = match.up->src[0];
+    if (w->view_src || !w->buffer || !ggml_backend_buffer_is_sycl(w->buffer) || ggml_backend_buffer_is_sycl_split(w->buffer)) {
+        return false;
+    }
+    opt_for_reorder(&ctx, w, match.unary, match.up, mul_mat_algo::DMMV);
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
+    return extra && extra->optimized_feature.is_reordered();
+}
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_kq_mask_graph kq_mask;
     ggml_sycl_kq_mask_graph_begin(*sycl_ctx, cgraph, kq_mask);
@@ -8397,6 +8412,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1]);
             i++;
             continue;
+        }
+
+        // scale -> silu -> up mat-vec -> hc_pre in one launch; it runs here and writes the hc_pre.
+        // graph_optimize keeps the scale input allocated until then.
+        if (node->op == GGML_OP_SCALE) {
+            ggml_sycl_dsv4_hc_pre_up_match hc_match;
+            if (ggml_sycl_match_dsv4_hc_pre_up(cgraph, i, hc_match) &&
+                ggml_sycl_hc_pre_up_weight_ready(*sycl_ctx, hc_match)) {
+                ggml_sycl_op_dsv4_hc_pre_up_fused(*sycl_ctx, hc_match);
+                i = hc_match.last;
+                continue;
+            }
         }
 
         // The hyper-connection gate is 2*sigmoid(inject/hc) over an (hc, n_tokens) tensor - a
@@ -9066,6 +9093,15 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
         params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.dst);
         params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.dst);
         i += match.node_count - 1;
+    }
+    // the fused hc_pre reads the scale input at the scale node but writes the hc_pre output, so
+    // the input must stay allocated until the hc_pre or that output could take its memory.
+    // Added for any token count, so that the topology does not change with the ubatch size.
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_sycl_dsv4_hc_pre_up_match match;
+        if (cgraph->nodes[i]->op == GGML_OP_SCALE && ggml_sycl_match_dsv4_hc_pre_up(cgraph, i, match, /*any_tokens=*/true)) {
+            params->add_alloc_dep(params->user_data, match.scale->src[0], match.dst);
+        }
     }
 }
 
