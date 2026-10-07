@@ -3205,6 +3205,85 @@ static void iq3_s_moe_glu_dp4a_esimd_launch(const void * vx_gate_base, const voi
         });
 }
 
+// GGML_SYCL_IQ3_S_PERSIST: the level-4 kernel ran 6400 short-lived threads per decode call (200 work-groups, 5 waves
+// on 1280 thread slots), each with its own activation quantization, grid staging and two barriers for 20 blocks of
+// work; VTune showed the vector engines 22% idle (wave ramps and tails), 9% stalled on barriers and the loads issued
+// in per-wave bursts. Here exactly one thread per slot is launched, and each walks whole rows - row u of the
+// (expert, row) list, then u + T, ... - so 6400 rows over 1280 threads are exactly 5 per thread, the prologue runs
+// once per work-group, and the main loop has no barrier: threads drift out of phase and keep the engines busy.
+// Only for an activation shared by all experts (gate/up at decode).
+template <int WG, int NB>
+ESIMD_INLINE void mul_mat_vec_iq3_s_moe_glu_dp4a_persist_esimd(
+        const void * vx_gate_base, const void * vx_up_base, const void * y_base, float * dst_base,
+        const int32_t * ids_dev, const int ncols, const int nrows, const int n_experts_used,
+        const size_t expert_weight_stride, const size_t dst_row_stride, const size_t ids_token_stride,
+        const size_t dst_token_stride, const size_t src1_token_stride, const sycl::nd_item<3> & it) {
+    using namespace sycl::ext::intel::esimd;
+
+    slm_init<IQ3_S_MOE_DP4A_YQ_SLM + IQ3_S_MOE_DP4A_MAX_COLS>();
+
+    const int tid       = it.get_local_id(2);
+    const int token_idx = it.get_group(0);
+    const float * y = (const float *) ((const char *) y_base + (size_t) token_idx * src1_token_stride);
+
+    for (int i = tid; i < 512 / 16; i += WG) {
+        slm_block_store<uint32_t, 16>(i * 16 * sizeof(uint32_t), block_load<uint32_t, 16>(iq3s_grid + i * 16));
+    }
+    for (int j = tid; j < ncols / 32; j += WG) {
+        simd<float, 32>  v    = block_load<float, 32>(y + j * 32);
+        const float      amax = hmax<float>(abs(v));
+        const float      id   = amax > 0.0f ? 127.0f / amax : 0.0f;
+        simd<int8_t, 32> q    = convert<int8_t>(rnde<float, 32>(v * id));
+        slm_block_store<int8_t, 32>(IQ3_S_MOE_DP4A_YQ_SLM + j * 32, q);
+        slm_scalar_store<float>(IQ3_S_MOE_DP4A_YD_SLM + j * sizeof(float), amax / 127.0f);
+    }
+    barrier();
+
+    const int blocks_per_row = ncols / QK_K;
+    const int n_threads      = it.get_group_range(2) * WG;
+    const int total          = n_experts_used * nrows;
+    for (int u = it.get_group(2) * WG + tid; u < total; u += n_threads) {
+        const int e   = u / nrows;
+        const int row = u - e * nrows;
+        const int i02 = *(const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride + e * sizeof(int32_t));
+        const uint8_t * vg = (const uint8_t *) vx_gate_base + (size_t) i02 * expert_weight_stride;
+        const uint8_t * vu = (const uint8_t *) vx_up_base   + (size_t) i02 * expert_weight_stride;
+
+        simd<float, 8> acc_g = 0.0f;
+        simd<float, 8> acc_u = 0.0f;
+        int b = 0;
+        for (; b + NB <= blocks_per_row; b += NB) {
+            iq3_s_moe_glu_dp4a_step<NB, 1>(vg, vu, row, nrows, blocks_per_row, b, acc_g, acc_u);
+        }
+        for (; b < blocks_per_row; ++b) {
+            iq3_s_moe_glu_dp4a_step<1, 1>(vg, vu, row, nrows, blocks_per_row, b, acc_g, acc_u);
+        }
+        const float g = reduce<float>(acc_g, std::plus<>{});
+        const float v = reduce<float>(acc_u, std::plus<>{});
+        float * dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) e * dst_row_stride);
+        dst[row] = v * g / (1.0f + sycl::exp(-g));
+    }
+}
+
+template <int WG, int NB>
+static void iq3_s_moe_glu_dp4a_persist_esimd_launch(const void * vx_gate_base, const void * vx_up_base, const float * y,
+                                                    const int32_t * ids_dev, float * dst_base, const int ncols,
+                                                    const int nrows, const int n_experts_used, const int n_tokens,
+                                                    const size_t expert_weight_stride, const size_t dst_row_stride,
+                                                    const size_t ids_token_stride, const size_t dst_token_stride,
+                                                    const size_t src1_token_stride, const int n_wg, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0 && ncols <= IQ3_S_MOE_DP4A_MAX_COLS);
+    const sycl::range<3> block_nums((unsigned) n_tokens, 1, (unsigned) n_wg);
+    const sycl::range<3> block_dims(1, 1, WG);
+    stream->parallel_for(
+        sycl::nd_range<3>(block_nums * block_dims, block_dims),
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            mul_mat_vec_iq3_s_moe_glu_dp4a_persist_esimd<WG, NB>(vx_gate_base, vx_up_base, y, dst_base, ids_dev, ncols,
+                nrows, n_experts_used, expert_weight_stride, dst_row_stride, ids_token_stride, dst_token_stride,
+                src1_token_stride, it);
+        });
+}
+
 // GGML_SYCL_MOE_ESIMD=4: the level-3 kernel with each row's blocks split across KS threads. A thread walks NB
 // blocks, then KS - 1 more steps away, so a row of KS * NB blocks takes one step per thread instead of a 4-block
 // loop and a 1-block tail; the partial sums meet in SLM. Each thread's chain of dependent loads is KS times
@@ -3766,6 +3845,18 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     if (src0_type != GGML_TYPE_IQ3_S || glu_op != GGML_GLU_OP_SWIGLU || ncols % QK_K != 0) {
         return false;
+    }
+    static const int persist = ggml_sycl_get_env("GGML_SYCL_IQ3_S_PERSIST", 1);
+    if (persist && g_ggml_sycl_moe_esimd >= 4 && ncols <= IQ3_S_MOE_DP4A_MAX_COLS && src1_row_stride == 0) {
+        // one thread per hardware thread slot: the compute units (vector engines) x 8 threads at 128 registers,
+        // in work-groups of 32; GGML_SYCL_IQ3_S_PERSIST_WG overrides the work-group count for tuning
+        static const int n_wg_env = ggml_sycl_get_env("GGML_SYCL_IQ3_S_PERSIST_WG", 0);
+        static const int n_wg_dev = (int) stream->get_device().get_info<sycl::info::device::max_compute_units>() * 8 / 32;
+        const int        n_wg     = n_wg_env > 0 ? n_wg_env : std::max(1, n_wg_dev);
+        iq3_s_moe_glu_dp4a_persist_esimd_launch<32, 5>(vx_gate_base, vx_up_base, y, ids_dev, dst_base, ncols, nrows,
+            n_experts_used, n_tokens, expert_weight_stride, dst_row_stride, ids_token_stride, dst_token_stride,
+            src1_token_stride, n_wg, stream);
+        return true;
     }
     if (g_ggml_sycl_moe_esimd >= 4 && ncols <= IQ3_S_MOE_DP4A_MAX_COLS) {
         // GGML_SYCL_IQ3_S_DP4A_KS picks the split for tuning: 2 threads x 5 blocks or 5 threads x 2 blocks per row,
