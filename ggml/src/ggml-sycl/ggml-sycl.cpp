@@ -138,7 +138,7 @@ int g_ggml_sycl_fuse_hc_pre = 1;
 int g_ggml_sycl_moe_esimd = 3;
 int g_ggml_sycl_upload_queue = -1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
-int g_ggml_sycl_fuse_conv_window = 0;
+int g_ggml_sycl_fuse_conv_window = 1;
 int g_ggml_sycl_qsa_fa_no_readback = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
@@ -500,7 +500,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_grouped_gemm = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM", 1);
         g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", 0);
         g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 1);
-        g_ggml_sycl_fuse_conv_window = ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_WINDOW", 0);
+        g_ggml_sycl_fuse_conv_window = ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_WINDOW", 1);
         g_ggml_sycl_qsa_fa_no_readback = ggml_sycl_get_env("GGML_SYCL_QSA_FA_NO_READBACK", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
