@@ -3406,6 +3406,80 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     GGML_UNUSED(ctx);
 }
 
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+// f32 mat-vec for one token (the qwen4exp MoE router: 512 x 2560 f32, 48 per token). KS threads share a row; each
+// takes CH chunks of 128 floats, issues all their weight and activation loads before the FMAs, and the KS partial
+// sums meet in SLM. The split-K sub-group kernel runs 512 such rows as 32 work-groups of float4 loads in a 40-step
+// loop and streams the 5.2 MiB at ~67% of the VRAM bandwidth.
+template <int KS, int RG, int CH>
+static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * dst, const int M, const int K,
+                                     const int lda, dpct::queue_ptr stream) {
+    constexpr int WG = KS * RG;
+    const int     n_wg = ceil_div(M, RG);
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) n_wg * WG), sycl::range<1>(WG)),
+        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            slm_init<WG * sizeof(float)>();
+            const int tid = it.get_local_id(0);
+            const int rg  = tid / KS;
+            const int ks  = tid % KS;
+            const int m   = it.get_group(0) * RG + rg;
+            const int nch = K / 128;
+
+            simd<float, 128> acc = 0.0f;
+            if (m < M) {
+                const float * arow = a + (size_t) m * lda;
+                int c = ks * CH;
+                for (; c + CH <= nch; c += KS * CH) {
+                    simd<float, 128 * CH> av = block_load<float, 128 * CH>(arow + c * 128);
+                    simd<float, 128 * CH> bv = block_load<float, 128 * CH>(b + c * 128);
+#pragma unroll
+                    for (int i = 0; i < CH; ++i) {
+                        acc += av.template select<128, 1>(i * 128) * bv.template select<128, 1>(i * 128);
+                    }
+                }
+                // a K that is not a multiple of KS * CH chunks: the rest one chunk at a time
+                for (int i = 0; i < CH && c + i < nch; ++i) {
+                    acc += block_load<float, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
+                }
+            }
+            slm_scalar_store<float>(tid * sizeof(float), reduce<float>(acc, std::plus<>{}));
+            barrier();
+            if (ks == 0 && m < M) {
+                simd<float, KS> part = slm_block_load<float, KS>(tid * sizeof(float));
+                dst[m] = reduce<float>(part, std::plus<>{});
+            }
+        });
+}
+#endif
+
+bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                 dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    static const int level = ggml_sycl_get_env("GGML_SYCL_F32_MMV_ESIMD", 1);
+    if (level == 0 || !g_ggml_sycl_enable_esimd || M < 128 || K % 128 != 0 || lda % 4 != 0 ||
+        ((uintptr_t) a | (uintptr_t) b) % 16 != 0 || M > INT32_MAX || K > INT32_MAX) {
+        return false;
+    }
+    // GGML_SYCL_F32_MMV_KS: threads per row, for tuning
+    static const int ks = ggml_sycl_get_env("GGML_SYCL_F32_MMV_KS", 2);
+    if (ks == 2) {
+        f32_mat_vec_esimd_launch<2, 16, 5>(a, b, dst, (int) M, (int) K, (int) lda, stream);
+    } else if (ks == 8) {
+        f32_mat_vec_esimd_launch<8, 4, 5>(a, b, dst, (int) M, (int) K, (int) lda, stream);
+    } else if (ks == 5) {
+        f32_mat_vec_esimd_launch<5, 8, 4>(a, b, dst, (int) M, (int) K, (int) lda, stream);
+    } else {
+        f32_mat_vec_esimd_launch<4, 8, 5>(a, b, dst, (int) M, (int) K, (int) lda, stream);
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(a, b, dst, M, K, lda, stream);
+    return false;
+#endif
+}
+
 bool ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
     enum ggml_type src0_type, const void * vx_base, const float * y, const int32_t * ids_dev,
     float * dst_base, int ncols, int nrows, int n_experts_used, int n_tokens,

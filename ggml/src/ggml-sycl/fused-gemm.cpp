@@ -1,6 +1,7 @@
 #include <atomic>
 
 #include "fused-gemm.hpp"
+#include "dmmv.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
@@ -2915,6 +2916,11 @@ bool ggml_sycl_small_gemm_f32(const float * a, const float * b, float * dst, int
     }
     if (!ggml_sycl_small_gemm_f32_device_ok(stream)) {
         return false;
+    }
+
+    // one token: the ESIMD mat-vec, when enabled and the shape suits it
+    if (N == 1 && ldd >= M && ggml_sycl_f32_mat_vec_esimd(a, b, dst, M, K, lda, stream)) {
+        return true;
     }
 
     const int64_t mn  = M * N;
