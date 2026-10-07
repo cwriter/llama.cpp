@@ -2895,6 +2895,50 @@ static void iq4_nl_moe_row_esimd_launch(const void * vx_base, const float * y, c
         });
 }
 
+// GGML_SYCL_IQ4_NL_PERSIST: the IQ4_NL expert down at decode ran 12800 threads (2 rows each, one round of loads) in
+// 10 waves on 1280 thread slots: VTune 13% idle, 78% occupancy, ~65% of the VRAM bandwidth. Here one thread per
+// thread slot walks (expert, row pair) units with a stride of the thread count: 10 experts x 1280 pairs at 2560 rows
+// are exactly 10 per thread, no tail, and the threads drift out of phase. No SLM and no barrier, as before.
+template <int WG, int R, int NB>
+static void iq4_nl_moe_persist_esimd_launch(const void * vx_base, const float * y, const int32_t * ids_dev, float * dst_base,
+                                            const int ncols, const int nrows, const int n_experts_used, const int n_tokens,
+                                            const size_t expert_weight_stride, const size_t dst_row_stride,
+                                            const size_t src1_row_stride, const size_t ids_token_stride,
+                                            const size_t dst_token_stride, const size_t src1_token_stride,
+                                            const int n_wg, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols == NB * QK4_NL);
+    const sycl::range<3> block_nums((unsigned) n_tokens, 1, (unsigned) n_wg);
+    const sycl::range<3> block_dims(1, 1, WG);
+    stream->parallel_for(
+        sycl::nd_range<3>(block_nums * block_dims, block_dims),
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            const int token_idx = it.get_group(0);
+            const int n_pairs   = (nrows + R - 1) / R;
+            const int total     = n_experts_used * n_pairs;
+            const int n_threads = it.get_group_range(2) * WG;
+            for (int u = it.get_group(2) * WG + it.get_local_id(2); u < total; u += n_threads) {
+                const int e    = u / n_pairs;
+                const int row0 = (u - e * n_pairs) * R;
+                const int i02  = *(const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride + e * sizeof(int32_t));
+                const uint8_t *    qs  = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride;
+                const sycl::half * d   = (const sycl::half *) (qs + (size_t) nrows * (ncols / 2));
+                const float *      yr  = (const float *) ((const char *) y + (size_t) token_idx * src1_token_stride + (size_t) e * src1_row_stride);
+                float *            dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) e * dst_row_stride);
+
+                simd<float, 16 * R> acc = 0.0f;
+                iq4_nl_moe_mac_stripe<NB, R>(qs, d, row0, nrows, ncols, 0, yr, acc);
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (row0 + r < nrows) {
+                        simd<float, 16> acc_r = acc.template select<16, 1>(r * 16);
+                        dst[row0 + r] = reduce<float>(acc_r, std::plus<>{});
+                    }
+                }
+            }
+        });
+}
+
 // One reordered IQ3_S block of one row against a 256-float activation stripe. Per expert slice the
 // layout is [qs: nb*64] [qh: nb*8] [signs: nb*32] [{d, scales}: nb*6]. Grid entry k holds the
 // magnitudes of elements 4k..4k+3, and bit e%8 of signs[e/8] is the sign of element e.
@@ -3804,6 +3848,23 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
     }
     if (src0_type != GGML_TYPE_IQ4_NL || ncols % QK4_NL != 0) {
         return false;
+    }
+    static const int nl_persist = ggml_sycl_get_env("GGML_SYCL_IQ4_NL_PERSIST", 1);
+    if (nl_persist && g_ggml_sycl_moe_esimd >= 5 && ncols == 20 * QK4_NL) {
+        // one thread per thread slot (compute units x 8, work-groups of 32); _WG overrides the count, _R the rows per unit
+        static const int n_wg_env = ggml_sycl_get_env("GGML_SYCL_IQ4_NL_PERSIST_WG", 0);
+        static const int r_env    = ggml_sycl_get_env("GGML_SYCL_IQ4_NL_PERSIST_R", 2);
+        static const int n_wg_dev = (int) stream->get_device().get_info<sycl::info::device::max_compute_units>() * 8 / 32;
+        const int        n_wg     = n_wg_env > 0 ? n_wg_env : std::max(1, n_wg_dev);
+#define IQ4_NL_PERSIST_LAUNCH(R_) \
+        iq4_nl_moe_persist_esimd_launch<32, R_, 20>(vx_base, y, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens, \
+            expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride, dst_token_stride, \
+            src1_token_stride, n_wg, stream); \
+        return true
+        if (r_env == 1) { IQ4_NL_PERSIST_LAUNCH(1); }
+        if (r_env == 4) { IQ4_NL_PERSIST_LAUNCH(4); }
+        IQ4_NL_PERSIST_LAUNCH(2);
+#undef IQ4_NL_PERSIST_LAUNCH
     }
     if (g_ggml_sycl_moe_esimd >= 5 && ncols == 20 * QK4_NL) {
         // GGML_SYCL_IQ4_NL_MOE_R / _WG pick rows per thread and threads per work-group for tuning
