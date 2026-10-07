@@ -801,6 +801,9 @@ struct ggml_backend_sycl_context {
         return fattn_buffers(device);
     }
 
+    // uid of the last graph whose MoE weight consumers were checked: the same graph has the same consumers
+    uint64_t moe_consumers_checked_uid = 0;
+
 #ifdef GGML_SYCL_GRAPH
     // Map from first node pointer to graph - allows multiple graphs per context when the
     // computation is split across CPU/GPU (e.g. with --n-cpu-moe)
