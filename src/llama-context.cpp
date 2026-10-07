@@ -632,6 +632,9 @@ void llama_context::sched_reserve() {
 
     sched_need_reserve = false;
 
+    // the graphs reserved below build the samplers attached now
+    sampling.reserved_signatures = sampling.signatures;
+
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
@@ -1310,6 +1313,47 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+// The ops, types and shapes of the graph a backend sampler builds on one row of logits: all that the
+// scheduler's allocation depends on. Parameters that only end up in op_params (temperature, top-p,
+// ...) are left out, so a new sampler with other values but the same chain matches.
+static std::string llama_sampler_graph_signature(llama_sampler * sampler, int64_t n_vocab) {
+    constexpr size_t max_nodes = 1024;
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * max_nodes + ggml_graph_overhead_custom(max_nodes, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx { ggml_init(params) };
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), max_nodes, false);
+
+    llama_sampler_data data = {
+        /*.logits     =*/ ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_vocab),
+        /*.probs      =*/ nullptr,
+        /*.sampled    =*/ nullptr,
+        /*.candidates =*/ nullptr,
+    };
+    if (sampler->iface->backend_reset) {
+        sampler->iface->backend_reset(sampler);
+    }
+    sampler->iface->backend_apply(sampler, ctx.get(), gf, &data);
+    for (ggml_tensor * t : { data.logits, data.probs, data.sampled, data.candidates }) {
+        if (t != nullptr) {
+            ggml_build_forward_expand(gf, t);
+        }
+    }
+
+    std::string sig;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        sig += std::to_string(t->op) + ':' + std::to_string(t->type);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            sig += ',' + std::to_string(t->ne[d]);
+        }
+        sig += ';';
+    }
+    return sig;
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1323,10 +1367,9 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
             LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
             warned = true;
         }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
+        // dropping a sampler only shrinks the graph, which the last reserve covers
         sampling.samplers.erase(seq_id);
+        sampling.signatures.erase(seq_id);
         return false;
     }
 
@@ -1341,9 +1384,17 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
         sampler->iface->backend_init(sampler, buft, cparams.n_outputs_max_per_seq);
 
-        sampling.samplers[seq_id] = sampler;
+        // the server attaches a new sampler with every request and detaches it after: re-planning the
+        // whole graph for a sampler that builds a graph the last reserve already covered costs a full
+        // reserve (~0.1 s on a large model) per request for nothing
+        std::string sig = llama_sampler_graph_signature(sampler, model.vocab.n_tokens());
+        const auto reserved = sampling.reserved_signatures.find(seq_id);
+        if (reserved == sampling.reserved_signatures.end() || reserved->second != sig) {
+            sched_need_reserve = true;
+        }
 
-        sched_need_reserve = true;
+        sampling.samplers[seq_id]   = sampler;
+        sampling.signatures[seq_id] = std::move(sig);
 
         return true;
     }
@@ -1351,18 +1402,16 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (sampler && !can_offload) {
         LLAMA_LOG_WARN("%s: sampler '%s' for seq_id = %d, cannot be offloaded to the backend\n", __func__, llama_sampler_name(sampler), seq_id);
 
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
-
+        // dropping a sampler only shrinks the graph, which the last reserve covers
         sampling.samplers.erase(seq_id);
+        sampling.signatures.erase(seq_id);
 
         return false;
     }
 
+    // dropping a sampler only shrinks the graph, which the last reserve covers
     sampling.samplers.erase(seq_id);
-
-    sched_need_reserve = true;
+    sampling.signatures.erase(seq_id);
 
     return true;
 }
