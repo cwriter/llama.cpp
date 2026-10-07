@@ -6481,8 +6481,10 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
 
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     // reads the f32 activation itself, so the q8_1 quantize below is skipped
+    static const bool moe_q8_0_esimd = ggml_sycl_get_env("GGML_SYCL_MOE_Q8_0_ESIMD", 1) != 0;
     if (use_reorder && !ordered_hint && g_ggml_sycl_moe_esimd >= 1 && g_ggml_sycl_enable_esimd &&
-        src0->type == GGML_TYPE_IQ4_NL && src0->nb[2] % 4 == 0) {
+        (src0->type == GGML_TYPE_IQ4_NL || (moe_q8_0_esimd && src0->type == GGML_TYPE_Q8_0)) &&
+        src0->nb[2] % 4 == 0) {
         return ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
             src0->type, src0->data, (const float *) src1->data, (const int32_t *) ids->data,
             (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) ne12,
