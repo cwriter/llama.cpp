@@ -2570,7 +2570,7 @@ ESIMD_INLINE sycl::ext::intel::esimd::simd<float, N> iq4_nl_values(sycl::ext::in
 // [qs: nrows*ncols/2] [d: nrows*ncols/QK4_NL halves], Q4_0 nibble order. One thread computes R
 // consecutive rows of one routed expert over the whole row, so there is no cross-thread reduction.
 // The R rows share each activation stripe, which is read as f32 (no q8_1 quantize).
-template <int NBLK, int R>
+template <int NBLK, int R, bool Y_SLM = false>
 ESIMD_INLINE void iq4_nl_moe_mac_stripe(
         const uint8_t * qs, const sycl::half * d, const int row0, const int nrows, const int ncols,
         const int b, const float * y, sycl::ext::intel::esimd::simd<float, 16 * R> & acc) {
@@ -2588,7 +2588,12 @@ ESIMD_INLINE void iq4_nl_moe_mac_stripe(
         q.template select<16 * NBLK, 1>(r * 16 * NBLK) = block_load<uint8_t, 16 * NBLK>(qs + ib * (QK4_NL / 2));
         dh.template select<NBLK, 1>(r * NBLK) = block_load<sycl::half, NBLK>(d + ib, element_aligned_tag{});
     }
-    simd<float, 32 * NBLK> y_vec = block_load<float, 32 * NBLK>(y + (size_t) b * QK4_NL);
+    simd<float, 32 * NBLK> y_vec;
+    if constexpr (Y_SLM) {
+        y_vec = slm_block_load<float, 32 * NBLK>(b * QK4_NL * sizeof(float));
+    } else {
+        y_vec = block_load<float, 32 * NBLK>(y + (size_t) b * QK4_NL);
+    }
     simd<float, NBLK * R>  df    = convert<float>(dh);
 
 #pragma unroll
@@ -2670,6 +2675,62 @@ static void iq4_nl_moe_esimd_launch(const void * vx_base, const float * y, const
         sycl::nd_range<3>(block_nums * block_dims, block_dims),
         [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
             mul_mat_vec_iq4_nl_moe_reorder_esimd<R>(vx_base, y, dst_base, ids_dev, ncols, nrows,
+                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                dst_token_stride, src1_token_stride, it);
+        });
+}
+
+// GGML_SYCL_MOE_ESIMD=5: rows of exactly NB blocks take them in one stripe, so a thread issues all of its weight
+// loads at once instead of in 3 dependent rounds (8 + 8 + 4 blocks at 640 columns).
+template <int R, int NB>
+ESIMD_INLINE void mul_mat_vec_iq4_nl_moe_reorder_row_esimd(
+        const void * vx_base, const void * y_base, float * dst_base, const int32_t * ids_dev,
+        const int ncols, const int nrows, const size_t expert_weight_stride, const size_t dst_row_stride,
+        const size_t src1_row_stride, const size_t ids_token_stride, const size_t dst_token_stride,
+        const size_t src1_token_stride, const sycl::nd_item<3> & it) {
+    using namespace sycl::ext::intel::esimd;
+
+    const int row0 = (int) (it.get_group(2) * it.get_local_range(2) + it.get_local_id(2)) * R;
+    if (row0 >= nrows) {
+        return;
+    }
+
+    const int token_idx  = it.get_group(0);
+    const int expert_idx = it.get_group(1);
+    const int i02 = *(const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride + expert_idx * sizeof(int32_t));
+
+    const uint8_t *    qs  = (const uint8_t *) vx_base + (size_t) i02 * expert_weight_stride;
+    const sycl::half * d   = (const sycl::half *) (qs + (size_t) nrows * (ncols / 2));
+    const float *      y   = (const float *) ((const char *) y_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride);
+    float *            dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+
+    simd<float, 16 * R> acc = 0.0f;
+    iq4_nl_moe_mac_stripe<NB, R>(qs, d, row0, nrows, ncols, 0, y, acc);
+
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r < nrows) {
+            simd<float, 16> acc_r = acc.template select<16, 1>(r * 16);
+            dst[row0 + r] = reduce<float>(acc_r, std::plus<>{});
+        }
+    }
+}
+
+template <int R, int WG, int NB>
+static void iq4_nl_moe_row_esimd_launch(const void * vx_base, const float * y, const int32_t * ids_dev, float * dst_base,
+                                        const int ncols, const int nrows, const int n_experts_used, const int n_tokens,
+                                        const size_t expert_weight_stride, const size_t dst_row_stride,
+                                        const size_t src1_row_stride, const size_t ids_token_stride,
+                                        const size_t dst_token_stride, const size_t src1_token_stride,
+                                        dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols == NB * QK4_NL);
+    const int            block_num = ceil_div(nrows, R * WG);
+    const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num);
+    const sycl::range<3> block_dims(1, 1, WG);
+    stream->parallel_for(
+        sycl::nd_range<3>(block_nums * block_dims, block_dims),
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            mul_mat_vec_iq4_nl_moe_reorder_row_esimd<R, NB>(vx_base, y, dst_base, ids_dev, ncols, nrows,
                 expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
                 dst_token_stride, src1_token_stride, it);
         });
@@ -3354,6 +3415,26 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     if (src0_type != GGML_TYPE_IQ4_NL || ncols % QK4_NL != 0) {
         return false;
+    }
+    if (g_ggml_sycl_moe_esimd >= 5 && ncols == 20 * QK4_NL) {
+        // GGML_SYCL_IQ4_NL_MOE_R / _WG pick rows per thread and threads per work-group for tuning
+        static const int r  = ggml_sycl_get_env("GGML_SYCL_IQ4_NL_MOE_R", 2);
+        static const int wg = ggml_sycl_get_env("GGML_SYCL_IQ4_NL_MOE_WG", 8);
+#define IQ4_NL_ROW_LAUNCH(R_, WG_) \
+        iq4_nl_moe_row_esimd_launch<R_, WG_, 20>(vx_base, y, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens, \
+            expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride, dst_token_stride, \
+            src1_token_stride, stream); \
+        return true
+        if (r == 1) {
+            IQ4_NL_ROW_LAUNCH(1, 8);
+        }
+        if (r == 4) {
+            if (wg == 16) { IQ4_NL_ROW_LAUNCH(4, 16); }
+            IQ4_NL_ROW_LAUNCH(4, 8);
+        }
+        if (wg == 16) { IQ4_NL_ROW_LAUNCH(2, 16); }
+        IQ4_NL_ROW_LAUNCH(2, 8);
+#undef IQ4_NL_ROW_LAUNCH
     }
     // 4 rows per thread and 8 threads per work-group measured best on Arc Pro B60 (2, 8 rows: 10-18% slower)
     iq4_nl_moe_esimd_launch<4, 8>(vx_base, y, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,

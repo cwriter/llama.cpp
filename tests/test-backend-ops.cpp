@@ -8131,6 +8131,7 @@ struct test_mul_mat_vec_fusion : public test_case {
 // n_l MoE gate/up mat-vec pairs with SWIGLU, each layer with its own expert weights and routing, summed. With
 // n_l * n_used experts well above the GPU L2, the experts stream from VRAM as in a model; the single-layer perf
 // case of test_mul_mat_vec_fusion keeps hitting the same experts in L2. The time includes the n_l - 1 adds.
+// glu = false: the down projection instead, one expert mat-vec per routed expert over its own activation row.
 struct test_moe_glu_stream : public test_case {
     const ggml_type type;
     const int64_t   m;  // tokens
@@ -8139,6 +8140,7 @@ struct test_moe_glu_stream : public test_case {
     const int       n_mats;
     const int       n_used;
     const int       n_l;
+    const bool      glu;
 
     std::string vars() override {
         return VARS_TO_STR7(type, m, n, k, n_mats, n_used, n_l);
@@ -8146,7 +8148,7 @@ struct test_moe_glu_stream : public test_case {
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "MOE_GLU_STREAM";
+        return glu ? "MOE_GLU_STREAM" : "MOE_DOWN_STREAM";
     }
 
     double max_nmse_err() override { return 5e-3; }
@@ -8155,15 +8157,24 @@ struct test_moe_glu_stream : public test_case {
     bool perf_whole_graph() override { return true; }
 
     test_moe_glu_stream(ggml_type type = GGML_TYPE_IQ3_S, int64_t m = 1, int64_t n = 640, int64_t k = 2560,
-            int n_mats = 32, int n_used = 10, int n_l = 8)
-        : type(type), m(m), n(n), k(k), n_mats(n_mats), n_used(n_used), n_l(n_l) {}
+            int n_mats = 32, int n_used = 10, int n_l = 8, bool glu = true)
+        : type(type), m(m), n(n), k(k), n_mats(n_mats), n_used(n_used), n_l(n_l), glu(glu) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, m);
+        ggml_tensor * cur = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, glu ? 1 : n_used, m);
         ggml_set_name(cur, "cur");
 
         ggml_tensor * out = nullptr;
-        for (int l = 0; l < n_l; ++l) {
+        for (int l = 0; l < n_l && !glu; ++l) {
+            ggml_tensor * downs = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+            ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
+            if (n_used != n_mats) {
+                ids = ggml_view_2d(ctx, ids, n_used, m, ids->nb[1], 0);
+            }
+            ggml_tensor * y = ggml_mul_mat_id(ctx, downs, cur, ids);
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        for (int l = 0; l < n_l && glu; ++l) {
             ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
             ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
             ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
@@ -11304,6 +11315,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t m : {1, 3}) {
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ3_S, m, 37, 2560, 8, 4, 2));
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ3_S, m, 64, 1536, 8, 4, 2));
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ4_NL, m, 2560, 640, 8, 4, 2, false));
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ4_NL, m, 37, 352, 8, 4, 2, false));
     }
 
     for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
@@ -12747,6 +12760,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // the qwen4exp IQ3_S expert gate/up at decode and at 8 tokens, streamed from VRAM over 8 layers
     for (int64_t m : {1, 8}) {
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ3_S, m, 640, 2560, 32, 10, 8));
+        // the IQ4_NL down projection 640 -> 2560
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ4_NL, m, 2560, 640, 32, 10, 8, false));
     }
     // 8 tokens route to ~75 distinct experts, so the weights do not stay in L2 across runs
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 8, 640, 2560,
