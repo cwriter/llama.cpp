@@ -8195,6 +8195,49 @@ struct test_moe_glu_stream : public test_case {
     }
 };
 
+// n_l dense gate/up mat-vec pairs with SWIGLU, each with its own weights, summed: the weights stream from VRAM as in
+// a model, where a single pair (3.5 MiB at the qwen4exp shared expert) stays in L2 across perf runs.
+struct test_glu_stream : public test_case {
+    const ggml_type type;
+    const int64_t   m;
+    const int64_t   n;
+    const int64_t   k;
+    const int       n_l;
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, m, n, k, n_l);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GLU_STREAM";
+    }
+
+    double max_nmse_err() override { return 5e-3; }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    test_glu_stream(ggml_type type = GGML_TYPE_Q8_0, int64_t m = 1, int64_t n = 640, int64_t k = 2560, int n_l = 16)
+        : type(type), m(m), n(n), k(k), n_l(n_l) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        ggml_set_name(cur, "cur");
+        ggml_tensor * out = nullptr;
+        for (int l = 0; l < n_l; ++l) {
+            ggml_tensor * gate = ggml_new_tensor_2d(ctx, type, k, n);
+            ggml_tensor * up   = ggml_new_tensor_2d(ctx, type, k, n);
+            ggml_tensor * g    = ggml_mul_mat(ctx, gate, cur);
+            ggml_tensor * u    = ggml_mul_mat(ctx, up, cur);
+            ggml_tensor * y    = ggml_glu_split(ctx, g, u, GGML_GLU_OP_SWIGLU);
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -12378,6 +12421,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // q8_0 dense gate/up + SWIGLU over 1..8 tokens at the qwen4exp shared-expert shape, and an
     // odd row count for the row tail.
+    test_cases.emplace_back(new test_glu_stream(GGML_TYPE_Q8_0, 1, 640, 2560, 2));
+    test_cases.emplace_back(new test_glu_stream(GGML_TYPE_Q8_0, 1, 37, 4096, 2));
     for (int64_t m_batch = 1; m_batch <= 8; ++m_batch) {
         for (int64_t rows : {640, 321}) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, m_batch, rows, 2560,
@@ -12732,6 +12777,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, bs, 640, 2560,
             false, 16, 8, false, false, true, false, { 1, 1 }));
     }
+    // the shared-expert gate/up streamed from VRAM: 16 pairs, 56 MiB
+    test_cases.emplace_back(new test_glu_stream(GGML_TYPE_Q8_0, 1, 640, 2560, 16));
     // its routed experts at decode: 512 experts, 10 used, IQ3_S gate/up with the GLU fused, IQ4_NL down
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
         true, 512, 10, false, false, true, false, { 1, 1 }));

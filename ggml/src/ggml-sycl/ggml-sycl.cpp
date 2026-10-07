@@ -6267,6 +6267,14 @@ static bool ggml_sycl_mul_mat_glu_mmvq_fused(ggml_backend_sycl_context & ctx, gg
     const int64_t ne00 = wu->ne[0];
     const int64_t ne11 = act->ne[1];
 
+    // one token of a Q8_0 SWIGLU pair: the ESIMD kernel reads the f32 activation, no q8_1 launch
+    if (ne11 == 1 && wu->type == GGML_TYPE_Q8_0 && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && !ggml_get_op_params_i32(glu, 1) &&
+        act->type == GGML_TYPE_F32 && ggml_is_contiguous(act) && ggml_is_contiguous(glu) && glu->ne[1] == 1 &&
+        ggml_sycl_q8_0_glu_esimd(wg->data, wu->data, (const float *) act->data, (float *) glu->data, ne00, wu->ne[1],
+                                 ctx.stream())) {
+        return true;
+    }
+
     const queue_ptr stream           = ctx.stream();
     const int       src1_padded_cols = GGML_PAD((int) ne00, MATRIX_ROW_PADDING);
 
