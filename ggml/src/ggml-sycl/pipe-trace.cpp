@@ -41,6 +41,9 @@ struct pipe_trace {
             return;
         }
         t_start = std::chrono::steady_clock::now();
+        // steady_clock is CLOCK_MONOTONIC: the origin lets perf -k mono samples be placed on the trace's time axis
+        fprintf(f, "# t_start_mono_ns %lld\n",
+                (long long) std::chrono::duration_cast<std::chrono::nanoseconds>(t_start.time_since_epoch()).count());
         fprintf(f, "# kind dev t0_us t1_us detail bytes\n");
         poller = std::thread([this] { poll(); });
     }
