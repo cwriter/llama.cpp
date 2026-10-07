@@ -36,6 +36,7 @@
 #include <thread>
 #include <set>
 #include <map>
+#include <unordered_map>
 #include <utility>
 
 #include <sycl/sycl.hpp>
@@ -141,6 +142,7 @@ int g_ggml_sycl_upload_queue = -1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_fuse_conv_window = 1;
 int g_ggml_sycl_gdn_state_store = 1;
+int g_ggml_sycl_gdn_state_gather = 0;
 int g_ggml_sycl_qsa_fa_no_readback = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
@@ -504,6 +506,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 1);
         g_ggml_sycl_fuse_conv_window = ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_WINDOW", 1);
         g_ggml_sycl_gdn_state_store = ggml_sycl_get_env("GGML_SYCL_GDN_STATE_STORE", 1);
+        g_ggml_sycl_gdn_state_gather = ggml_sycl_get_env("GGML_SYCL_GDN_STATE_GATHER", 0);
         g_ggml_sycl_qsa_fa_no_readback = ggml_sycl_get_env("GGML_SYCL_QSA_FA_NO_READBACK", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
@@ -691,6 +694,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_CONV_WINDOW: %d\n", g_ggml_sycl_fuse_conv_window);
         GGML_LOG_INFO("  GGML_SYCL_GDN_STATE_STORE: %d\n", g_ggml_sycl_gdn_state_store);
+        GGML_LOG_INFO("  GGML_SYCL_GDN_STATE_GATHER: %d\n", g_ggml_sycl_gdn_state_gather);
         GGML_LOG_INFO("  GGML_SYCL_QSA_FA_NO_READBACK: %d\n", g_ggml_sycl_qsa_fa_no_readback);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
@@ -7788,6 +7792,57 @@ static bool ggml_sycl_is_view_or_noop(const ggml_tensor * t) {
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
 
+// build_rs gathers the ubatch's recurrent states into a fresh tensor (GET_ROWS of the cache by s_copy)
+// and the gated delta net reads s0 from it. With one sequence the gather is a 3 MiB copy per recurrent
+// layer and token on qwen4exp that only feeds the gated delta net, which can read the cache rows itself.
+// Map each GET_ROWS whose only computed reader is one gated delta net's whole s0 to that gated delta net.
+// One sequence only: each kernel thread reads its own s0 column before it writes any state, so the
+// in-place write back (fused cache, or a later CPY) cannot race the read; with several sequences one
+// sequence's source row can be another's destination.
+using ggml_sycl_gdn_state_gathers = std::unordered_map<const ggml_tensor *, const ggml_tensor *>;
+
+static ggml_sycl_gdn_state_gathers ggml_sycl_match_gdn_state_gathers(const ggml_cgraph * cgraph) {
+    ggml_sycl_gdn_state_gathers readers; // gather -> its gated delta net, nullptr = none yet or not skippable
+    std::unordered_map<const ggml_tensor *, bool> bad;
+    if (!g_ggml_sycl_gdn_state_gather || !g_ggml_sycl_enable_fusion) {
+        return readers;
+    }
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        if (n->op == GGML_OP_GET_ROWS && n->type == GGML_TYPE_F32 && !(n->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            n->src[0]->type == GGML_TYPE_F32 && n->src[1]->type == GGML_TYPE_I32 &&
+            n->src[0]->nb[0] == sizeof(float) && n->src[0]->nb[1] % sizeof(float) == 0 &&
+            n->ne[1] == 1 && n->ne[2] == 1 && n->ne[3] == 1) {
+            readers[n] = nullptr;
+            continue;
+        }
+        if (readers.empty() || ggml_sycl_is_view_or_noop(n)) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src = n->src[k];
+            if (src == nullptr) {
+                continue;
+            }
+            const auto it = readers.find(src->view_src ? src->view_src : src);
+            if (it == readers.end()) {
+                continue;
+            }
+            // the only computed reader: a gated delta net taking the whole gather as s0
+            const bool s0 = n->op == GGML_OP_GATED_DELTA_NET && k == 5 && src->view_offs == 0 &&
+                            ggml_nelements(src) == ggml_nelements(it->first) && ggml_is_contiguous(src);
+            if (!s0 || it->second != nullptr) {
+                bad[it->first] = true;
+            }
+            it->second = n;
+        }
+    }
+    for (auto it = readers.begin(); it != readers.end();) {
+        it = (it->second == nullptr || bad.count(it->first)) ? readers.erase(it) : std::next(it);
+    }
+    return readers;
+}
+
 // match gated_delta_net + the strided cpy that scatters its state snapshots into the cache
 // (slot i -> rollback group i, slot 0 newest), so the kernel can write them and skip the cpy.
 // returns the number of following nodes to skip (0 = no fusion)
@@ -8274,6 +8329,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
     ggml_sycl_conv_window_match conv_window;
 
+    const ggml_sycl_gdn_state_gathers gdn_gathers = ggml_sycl_match_gdn_state_gathers(cgraph);
+
     ggml_sycl_census_graph * census = nullptr;
     if (g_ggml_sycl_census) {
         std::vector<int> absorbed_by(cgraph->n_nodes, -1);
@@ -8375,6 +8432,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        // recurrent-state gather read only by a gated delta net: hand the cache rows to it instead
+        if (node->op == GGML_OP_GET_ROWS && !gdn_gathers.empty()) {
+            const auto it = gdn_gathers.find(node);
+            if (it != gdn_gathers.end()) {
+                sycl_ctx->gdn_gather = { it->second, (const float *) node->src[0]->data,
+                                         (const int32_t *) node->src[1]->data, (int64_t) (node->src[0]->nb[1] / sizeof(float)) };
+                continue;
+            }
+        }
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
@@ -9131,6 +9197,11 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
         if (cgraph->nodes[i]->op == GGML_OP_SCALE && ggml_sycl_match_dsv4_hc_pre_up(cgraph, i, match, /*any_tokens=*/true)) {
             params->add_alloc_dep(params->user_data, match.scale->src[0], match.dst);
         }
+    }
+    // a skipped state gather is read at its gated delta net, so its row ids must live that long.
+    // The match does not depend on the token count, so the topology does not change with the ubatch size.
+    for (const auto & [gather, gdn] : ggml_sycl_match_gdn_state_gathers(cgraph)) {
+        params->add_alloc_dep(params->user_data, gather->src[1], const_cast<ggml_tensor *>(gdn));
     }
     // the fused conv window reads state and x at the ssm_conv, after their last use in the graph (the concat)
     for (int i = 0; i < cgraph->n_nodes; ++i) {

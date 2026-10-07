@@ -89,6 +89,7 @@ extern int g_ggml_sycl_esimd_q8_0;
 extern int g_ggml_sycl_fuse_qsa_fa_mask;
 extern int g_ggml_sycl_fuse_conv_window;
 extern int g_ggml_sycl_gdn_state_store;
+extern int g_ggml_sycl_gdn_state_gather;
 extern int g_ggml_sycl_qsa_fa_no_readback;
 extern int g_ggml_sycl_small_gemm;
 extern int g_ggml_sycl_mv_fuse;
@@ -672,10 +673,20 @@ struct ggml_sycl_graph {
 static_assert(std::is_trivial<ggml_sycl_graph::node_properties>::value, "node_properties must be trivial");
 #endif
 
+// A GET_ROWS of recurrent states whose only reader is a GATED_DELTA_NET, skipped by the compute loop:
+// the gated delta net reads its s0 rows from `states` at the gathered row indices instead.
+struct ggml_sycl_gdn_state_gather {
+    const ggml_tensor * gdn        = nullptr;
+    const float *       states     = nullptr;
+    const int32_t *     ids        = nullptr;
+    int64_t             row_stride = 0; // floats
+};
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
     device_opt_feature opt_feature;
+    ggml_sycl_gdn_state_gather gdn_gather;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
