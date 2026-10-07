@@ -1391,6 +1391,8 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
         const auto reserved = sampling.reserved_signatures.find(seq_id);
         if (reserved == sampling.reserved_signatures.end() || reserved->second != sig) {
             sched_need_reserve = true;
+        } else {
+            LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler graph covered by the last reserve\n", __func__, (int) seq_id);
         }
 
         sampling.samplers[seq_id]   = sampler;
