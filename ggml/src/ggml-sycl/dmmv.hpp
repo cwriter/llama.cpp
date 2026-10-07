@@ -44,6 +44,10 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
 bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y, float * dst, int64_t ncols,
                               int64_t nrows, dpct::queue_ptr stream);
 
+// f32 mat-vec for one token with an epilogue (1: sigmoid, 2: softplus(x + bias[m]) * scale[m]) on ESIMD
+bool ggml_sycl_f32_mat_vec_epi_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                     int epi, const float * bias, const float * scale, dpct::queue_ptr stream);
+
 // f32 mat-vec dst[m] = sum_k a[m * lda + k] * b[k] on ESIMD (GGML_SYCL_F32_MMV_ESIMD); false if the shape is not taken
 bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
                                  dpct::queue_ptr stream);

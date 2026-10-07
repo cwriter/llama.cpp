@@ -3570,9 +3570,11 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
 // takes CH chunks of 128 floats, issues all their weight and activation loads before the FMAs, and the KS partial
 // sums meet in SLM. The split-K sub-group kernel runs 512 such rows as 32 work-groups of float4 loads in a 40-step
 // loop and streams the 5.2 MiB at ~67% of the VRAM bandwidth.
-template <int KS, int RG, int CH>
+// EPI 0: dst = a.b; 1: sigmoid(a.b); 2: softplus(a.b + bias[m]) * scale[m] (the qwen4exp alpha gate)
+template <int KS, int RG, int CH, int EPI = 0>
 static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * dst, const int M, const int K,
-                                     const int lda, dpct::queue_ptr stream) {
+                                     const int lda, dpct::queue_ptr stream, const float * bias = nullptr,
+                                     const float * scale = nullptr) {
     constexpr int WG = KS * RG;
     const int     n_wg = ceil_div(M, RG);
     stream->parallel_for(
@@ -3607,7 +3609,17 @@ static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * d
             barrier();
             if (ks == 0 && m < M) {
                 simd<float, KS> part = slm_block_load<float, KS>(tid * sizeof(float));
-                dst[m] = reduce<float>(part, std::plus<>{});
+                float v = reduce<float>(part, std::plus<>{});
+                if constexpr (EPI == 1) {
+                    v = 1.0f / (1.0f + sycl::exp(-v));
+                } else if constexpr (EPI == 2) {
+                    // op_softplus of element_wise.cpp, then the scale
+                    v += bias[m];
+                    const float vmax = v > 0.0f ? v : 0.0f;
+                    const float vabs = v < 0.0f ? -v : v;
+                    v = (vmax + sycl::log1p(sycl::exp(-vabs))) * scale[m];
+                }
+                dst[m] = v;
             }
         });
 }
@@ -3632,6 +3644,31 @@ bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y,
     return true;
 #else
     GGML_UNUSED_VARS(vg, vu, y, dst, ncols, nrows, stream);
+    return false;
+#endif
+}
+
+bool ggml_sycl_f32_mat_vec_epi_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                     int epi, const float * bias, const float * scale, dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (!g_ggml_sycl_enable_esimd || K % 128 != 0 || lda % 4 != 0 || ((uintptr_t) a | (uintptr_t) b) % 16 != 0 ||
+        M > INT32_MAX || K > INT32_MAX || (epi != 1 && epi != 2)) {
+        return false;
+    }
+    // few rows: more threads per row, so the row loads are spread over enough threads
+    const bool small = M < 128;
+#define F32_EPI_LAUNCH(E_) \
+    if (small) { f32_mat_vec_esimd_launch<10, 4, 2, E_>(a, b, dst, (int) M, (int) K, (int) lda, stream, bias, scale); } \
+    else       { f32_mat_vec_esimd_launch<2, 16, 5, E_>(a, b, dst, (int) M, (int) K, (int) lda, stream, bias, scale); }
+    if (epi == 1) {
+        F32_EPI_LAUNCH(1)
+    } else {
+        F32_EPI_LAUNCH(2)
+    }
+#undef F32_EPI_LAUNCH
+    return true;
+#else
+    GGML_UNUSED_VARS(a, b, dst, M, K, lda, epi, bias, scale, stream);
     return false;
 #endif
 }
