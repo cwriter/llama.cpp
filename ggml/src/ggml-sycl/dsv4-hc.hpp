@@ -21,6 +21,14 @@ struct ggml_sycl_dsv4_hc_post_gate {
 void ggml_sycl_op_dsv4_hc_post_fused_gate(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                           const ggml_sycl_dsv4_hc_post_gate & gate);
 
+// GGML_SYCL_FUSE_HC_POST_NORM: the gated hc_post and the grouped RMS norm * gamma that the next hyper-connection
+// mix runs on its output, as one kernel: a work-group owns one (stream, token) row, writes the hc_post output and
+// the normed row. False (nothing launched) if the shapes do not suit it.
+bool ggml_sycl_dsv4_hc_post_norm_ok(const ggml_tensor * hc_post, const ggml_tensor * rms, const ggml_tensor * mul);
+bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                               const ggml_sycl_dsv4_hc_post_gate & gate, ggml_tensor * rms,
+                                               ggml_tensor * mul);
+
 // The hc_pre gate is up(silu(scale(lo))) with a reordered Q8_0 up weight, built by three launches
 // per hyper-connection block. With GGML_SYCL_FUSE_HC_PRE one kernel does the scale, the unary, the
 // mat-vec and the gated hc_pre: a sub-group owns the hc weight rows of one embedding element.
