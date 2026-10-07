@@ -4382,11 +4382,13 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
 };
 
 // the hc_pre gate as qwen4exp builds it: up(silu(lo/hc)) with a Q8_0 up weight, then the gated
-// hc_pre over the normed streams x. Backends can fuse the whole chain.
+// hc_pre over the normed streams x. Backends can fuse the whole chain. n_l > 1 sums n_l such blocks with their
+// own weights, so the weights stream from VRAM; one 3.5 MiB weight stays in L2 across perf runs.
 struct test_dsv4_hc_pre_up : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_lr;
     const int64_t n_tokens;
+    const int     n_l;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4394,7 +4396,7 @@ struct test_dsv4_hc_pre_up : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR3(n_embd, n_lr, n_tokens);
+        return n_l > 1 ? VARS_TO_STR4(n_embd, n_lr, n_tokens, n_l) : VARS_TO_STR3(n_embd, n_lr, n_tokens);
     }
 
     bool run_whole_graph() override { return true; }
@@ -4403,14 +4405,16 @@ struct test_dsv4_hc_pre_up : public test_dsv4_hc {
     // the CPU reference quantizes the activation to Q8_0 for the mat-vec
     double max_nmse_err() override { return 5e-4; }
 
-    test_dsv4_hc_pre_up(int64_t n_embd = 64, int64_t n_lr = 64, int64_t n_tokens = 1)
-        : n_embd(n_embd), n_lr(n_lr), n_tokens(n_tokens) {}
+    test_dsv4_hc_pre_up(int64_t n_embd = 64, int64_t n_lr = 64, int64_t n_tokens = 1, int n_l = 1)
+        : n_embd(n_embd), n_lr(n_lr), n_tokens(n_tokens), n_l(n_l) {}
 
     void initialize_tensors(ggml_context * ctx) override {
         test_dsv4_hc::initialize_tensors(ctx);
         // keep the gate out of the flat ends of the sigmoid
-        ggml_tensor * w_up = ggml_get_tensor(ctx, "w_up");
-        init_tensor_uniform(w_up, -0.15f, 0.15f);
+        for (int l = 0; l < n_l; ++l) {
+            ggml_tensor * w_up = ggml_get_tensor(ctx, l == 0 ? "w_up" : ("w_up" + std::to_string(l)).c_str());
+            init_tensor_uniform(w_up, -0.15f, 0.15f);
+        }
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -4420,14 +4424,19 @@ struct test_dsv4_hc_pre_up : public test_dsv4_hc {
         ggml_tensor * lo = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_lr, n_tokens);
         ggml_set_name(lo, "lo");
 
-        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_lr, n_embd*hc);
-        ggml_set_name(w_up, "w_up");
+        ggml_tensor * sum = nullptr;
+        for (int l = 0; l < n_l; ++l) {
+            ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_lr, n_embd*hc);
+            ggml_set_name(w_up, l == 0 ? "w_up" : ("w_up" + std::to_string(l)).c_str());
 
-        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc)));
+            ggml_tensor * gate = ggml_mul_mat(ctx, w_up, ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc)));
 
-        out = ggml_dsv4_hc_pre_gated(ctx,
-                ggml_reshape_3d(ctx, x,    n_embd, hc, n_tokens),
-                ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), 1.0f / (float) hc);
+            ggml_tensor * y = ggml_dsv4_hc_pre_gated(ctx,
+                    ggml_reshape_3d(ctx, x,    n_embd, hc, n_tokens),
+                    ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), 1.0f / (float) hc);
+            sum = sum ? ggml_add(ctx, sum, y) : y;
+        }
+        out = sum;
         ggml_set_name(out, "out");
         return out;
     }
@@ -10125,6 +10134,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_pre_up(100, 96, 1));
     for (int64_t n_tokens : { 1, 2, 3, 4, 5 }) {
         test_cases.emplace_back(new test_dsv4_hc_pre_up(2560, 320, n_tokens));
+        test_cases.emplace_back(new test_dsv4_hc_pre_up(2560, 320, n_tokens, 2));
     }
 
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
@@ -12793,6 +12803,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int n : {1, 2, 4}) {
         test_cases.emplace_back(new test_dsv4_hc_pre_up(2560, 320, n));
     }
+    // streamed from VRAM: 8 weights of 3.5 MiB
+    test_cases.emplace_back(new test_dsv4_hc_pre_up(2560, 320, 1, 8));
 
     // qwen4exp (Qwen3.8-Flash-Next): 512 experts, 10 used; gate/up 2560 -> 640, down 640 -> 2560
     for (int bs : {1, 1024}) {

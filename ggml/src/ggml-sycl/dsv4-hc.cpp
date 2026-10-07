@@ -5,6 +5,11 @@
 #include <cmath>
 #include <type_traits>
 
+#if defined(__INTEL_LLVM_COMPILER)
+    #include <sycl/ext/intel/esimd.hpp>
+    #define GGML_SYCL_DSV4_HC_HAS_ESIMD
+#endif
+
 static constexpr int DSV4_HC = 4;
 
 // tunable: one work-item per (embedding element, token)
@@ -629,6 +634,74 @@ static void dsv4_hc_pre_up_q8_0_sycl(
     });
 }
 
+#ifdef GGML_SYCL_DSV4_HC_HAS_ESIMD
+// GGML_SYCL_FUSE_HC_PRE=2, one token: an ESIMD thread takes NI consecutive embedding elements. For each of the HC
+// streams their NI weight rows are adjacent, so a thread issues one block load of NI * NB * 32 int8 and one of the
+// NI * NB scales per stream, all before any arithmetic, and computes the activation itself: no local memory, no
+// barrier and no cross-lane reductions. The sub-group kernel above loads 4 bytes per lane, ~3 times per row, and
+// spends 4 reductions and a barrier on each element; at 10240 x 320 it streams at ~58% of the VRAM bandwidth.
+template <int HC, int NI, int NB>
+static void dsv4_hc_pre_up_q8_0_esimd(
+        const float * lo, const void * vw, const float * x, float * dst,
+        int64_t n_embd, int64_t sx1,
+        float act_scale, float act_bias, float out_scale,
+        queue_ptr stream) {
+    constexpr int ncols = NB * QK8_0;
+    constexpr int wg    = 16;
+    const int64_t nrows = HC * n_embd;
+    const int8_t *     qs = (const int8_t *) vw;
+    const sycl::half * d  = (const sycl::half *) (qs + nrows * ncols);
+    const int64_t n_thr = n_embd / NI;
+
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(ceil_div(n_thr, wg) * wg), sycl::range<1>(wg)),
+        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            const int64_t i0 = it.get_global_id(0) * NI;
+            if (i0 >= n_embd) {
+                return;
+            }
+
+            simd<int8_t, NI * ncols> q[HC];
+            simd<sycl::half, NI * NB> dh[HC];
+#pragma unroll
+            for (int h = 0; h < HC; ++h) {
+                const int64_t row = i0 + h * n_embd;
+                q[h]  = block_load<int8_t, NI * ncols>(qs + row * ncols);
+                dh[h] = block_load<sycl::half, NI * NB>(d + row * NB, element_aligned_tag{});
+            }
+
+            simd<float, ncols> a = block_load<float, ncols>(lo);
+            a = act_scale * a + act_bias;
+            a = a / (1.0f + exp(-a));
+
+            simd<float, NI> sum = 0.0f;
+#pragma unroll
+            for (int h = 0; h < HC; ++h) {
+                simd<float, NI * NB> df = convert<float>(dh[h]);
+                simd<float, NI>      g;
+#pragma unroll
+                for (int i = 0; i < NI; ++i) {
+                    simd<float, 32> acc = 0.0f;
+#pragma unroll
+                    for (int b = 0; b < NB; ++b) {
+                        simd<int8_t, 32> qb = q[h].template select<32, 1>((i * NB + b) * 32);
+                        acc += convert<float>(qb) * (a.template select<32, 1>(b * 32) * df[i * NB + b]);
+                    }
+                    g[i] = reduce<float>(acc, std::plus<>{});
+                }
+                simd<float, NI> xv = block_load<float, NI>(x + i0 + h * sx1, element_aligned_tag{});
+                sum += xv * (1.0f / (1.0f + exp(-g)));
+            }
+            sum *= out_scale;
+#pragma unroll
+            for (int i = 0; i < NI; ++i) {
+                dst[i0 + i] = sum[i];
+            }
+        });
+}
+#endif
+
 bool ggml_sycl_match_dsv4_hc_pre_up(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_dsv4_hc_pre_up_match & match,
                                     bool any_tokens) {
     if (!g_ggml_sycl_enable_fusion || !g_ggml_sycl_fuse_hc_pre || node_idx + 3 >= cgraph->n_nodes) {
@@ -743,6 +816,26 @@ void ggml_sycl_op_dsv4_hc_pre_up_fused(ggml_backend_sycl_context & ctx, const gg
                 act_scale, act_bias, out_scale, ctx.stream());
     };
 
+#ifdef GGML_SYCL_DSV4_HC_HAS_ESIMD
+    // the ESIMD kernel holds one 10-block row set per stream in registers: decode, and the qwen4exp shape
+    static const int esimd_ni = ggml_sycl_get_env("GGML_SYCL_HC_PRE_UP_NI", 2);
+    if (g_ggml_sycl_fuse_hc_pre >= 2 && g_ggml_sycl_enable_esimd && n_tokens == 1 && lo->ne[0] == 10 * QK8_0 &&
+        n_embd % 4 == 0 && x->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float)) {
+        const auto launch_esimd = [&](auto ni) {
+            dsv4_hc_pre_up_q8_0_esimd<DSV4_HC, decltype(ni)::value, 10>(
+                (const float *) lo->data, w->data, (const float *) x->data, (float *) dst->data, n_embd,
+                x->nb[1] / sizeof(float), act_scale, act_bias, out_scale, ctx.stream());
+        };
+        if (esimd_ni == 1) {
+            launch_esimd(std::integral_constant<int, 1>{});
+        } else if (esimd_ni == 4) {
+            launch_esimd(std::integral_constant<int, 4>{});
+        } else {
+            launch_esimd(std::integral_constant<int, 2>{});
+        }
+        return;
+    }
+#endif
     switch (n_tokens) {
         case 1: launch(std::integral_constant<int, 1>{}); break;
         case 2: launch(std::integral_constant<int, 2>{}); break;
