@@ -134,7 +134,7 @@ int g_ggml_sycl_wide_loads = GGML_SYCL_WIDE_LOADS_DEFAULT;
 int g_ggml_sycl_lightning_indexer = GGML_SYCL_LIGHTNING_INDEXER_DEFAULT;
 int g_ggml_sycl_moe_mmv_rows = 0;
 int g_ggml_sycl_q8_0_mmv_tail = 1;
-int g_ggml_sycl_fuse_hc_pre = 0;
+int g_ggml_sycl_fuse_hc_pre = 1;
 int g_ggml_sycl_moe_esimd = 2;
 int g_ggml_sycl_upload_queue = -1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
@@ -536,7 +536,7 @@ static void ggml_check_sycl() try {
         }
         g_ggml_sycl_moe_esimd = ggml_sycl_get_env("GGML_SYCL_MOE_ESIMD", 2);
         g_ggml_sycl_q8_0_mmv_tail = ggml_sycl_get_env("GGML_SYCL_Q8_0_MMV_TAIL", 1) != 0;
-        g_ggml_sycl_fuse_hc_pre = ggml_sycl_get_env("GGML_SYCL_FUSE_HC_PRE", 0) != 0;
+        g_ggml_sycl_fuse_hc_pre = ggml_sycl_get_env("GGML_SYCL_FUSE_HC_PRE", 1) != 0;
         g_ggml_sycl_upload_queue = ggml_sycl_get_env("GGML_SYCL_UPLOAD_QUEUE", -1);
         g_ggml_sycl_get_mem_api = ggml_sycl_get_env("GGML_SYCL_GET_MEM_API", MEMORY_API_TYPE_LEVEL_ZERO);
         if (g_ggml_sycl_use_level_zero_api == 0) {
