@@ -2339,6 +2339,80 @@ static void q8_0_glu_esimd_launch_rows(const void * vg, const void * vu, const f
     });
 }
 
+// GGML_SYCL_MOE_Q8_0_ESIMD: the routed-expert mat-vec over per-expert reordered Q8_0 slices (the qwen4exp layers
+// whose down experts are Q8_0) on the dense stripes: a work-group of WG threads takes NR rows of one (token, expert),
+// reading the f32 activation row. The MMVQ path quantizes the activation to q8_1 in a launch of its own first.
+template <int WG, int NR>
+static void q8_0_moe_esimd_launch(const void * vx_base, const float * y_base, const int32_t * ids_dev, float * dst_base,
+                                  const int ncols, const int nrows, const int n_experts_used, const int n_tokens,
+                                  const size_t expert_weight_stride, const size_t dst_row_stride,
+                                  const size_t src1_row_stride, const size_t ids_token_stride,
+                                  const size_t dst_token_stride, const size_t src1_token_stride, dpct::queue_ptr stream) {
+    const int            block_num = ceil_div(nrows, NR);
+    const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num);
+    const sycl::range<3> block_dims(1, 1, WG);
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * NR), h);
+        h.parallel_for(
+            sycl::nd_range<3>(block_nums * block_dims, block_dims),
+            [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+                using namespace sycl::ext::intel::esimd;
+                constexpr int STRIPE = 8;
+
+                const int token_idx  = it.get_group(0);
+                const int expert_idx = it.get_group(1);
+                const int i02 = *(const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride +
+                                                    expert_idx * sizeof(int32_t));
+                const int8_t *     qs = (const int8_t *) vx_base + (size_t) i02 * expert_weight_stride;
+                const int          nblk_row = ncols / QK8_0;
+                const sycl::half * d  = (const sycl::half *) (qs + (size_t) nrows * nblk_row * QK8_0);
+                const float *      y  = (const float *) ((const char *) y_base + (size_t) token_idx * src1_token_stride +
+                                                         (size_t) expert_idx * src1_row_stride);
+                float * dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride +
+                                         (size_t) expert_idx * dst_row_stride);
+
+                const int tid  = it.get_local_id(2);
+                const int row0 = it.get_group(2) * NR;
+                size_t    base[NR];
+#pragma unroll
+                for (int r = 0; r < NR; ++r) {
+                    base[r] = (size_t) (row0 + r < nrows ? row0 + r : nrows - 1) * nblk_row;
+                }
+                simd<float, 32> acc[NR];
+#pragma unroll
+                for (int r = 0; r < NR; ++r) {
+                    acc[r] = 0.0f;
+                }
+                int ib = 0;
+                for (; ib + WG * STRIPE <= nblk_row; ib += WG * STRIPE) {
+                    q8_0_mac_stripe_rows<STRIPE, NR>(qs, d, base, ib + tid * STRIPE, y, acc);
+                }
+                for (; ib + WG * 4 <= nblk_row; ib += WG * 4) {
+                    q8_0_mac_stripe_rows<4, NR>(qs, d, base, ib + tid * 4, y, acc);
+                }
+                for (; ib + WG * 2 <= nblk_row; ib += WG * 2) {
+                    q8_0_mac_stripe_rows<2, NR>(qs, d, base, ib + tid * 2, y, acc);
+                }
+                for (int b = ib + tid; b < nblk_row; b += WG) {
+                    q8_0_mac_stripe_rows<1, NR>(qs, d, base, b, y, acc);
+                }
+#pragma unroll
+                for (int r = 0; r < NR; ++r) {
+                    lmem[tid * NR + r] = reduce<float>(acc[r], std::plus<>{});
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                // a work-group may hold more rows than threads
+                for (int r = tid; r < NR && row0 + r < nrows; r += WG) {
+                    float sum = 0.0f;
+                    for (int p = 0; p < WG; ++p) {
+                        sum += lmem[p * NR + r];
+                    }
+                    dst[row0 + r] = sum;
+                }
+            });
+    });
+}
+
 static void dequantize_mul_mat_vec_q8_0_sycl_reorder_esimd(const void *vx, const float *y,
                                                            float *dst, const int ncols,
                                                            const int nrows,
@@ -3595,6 +3669,23 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
     size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
     dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (src0_type == GGML_TYPE_Q8_0 && ncols % QK8_0 == 0) {
+        // GGML_SYCL_MOE_Q8_0_CFG picks threads x rows per work-group, for tuning
+        static const int cfg = ggml_sycl_get_env("GGML_SYCL_MOE_Q8_0_CFG", 24);
+#define Q8_0_MOE_LAUNCH(WG_, NR_) \
+        q8_0_moe_esimd_launch<WG_, NR_>(vx_base, y, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens, \
+            expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride, dst_token_stride, \
+            src1_token_stride, stream); \
+        return true
+        switch (cfg) {
+            case 14: Q8_0_MOE_LAUNCH(1, 4);
+            case 22: Q8_0_MOE_LAUNCH(2, 2);
+            case 28: Q8_0_MOE_LAUNCH(2, 8);
+            case 44: Q8_0_MOE_LAUNCH(4, 4);
+            default: Q8_0_MOE_LAUNCH(2, 4);
+        }
+#undef Q8_0_MOE_LAUNCH
+    }
     if (src0_type != GGML_TYPE_IQ4_NL || ncols % QK4_NL != 0) {
         return false;
     }
