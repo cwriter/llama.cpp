@@ -138,6 +138,7 @@ int g_ggml_sycl_fuse_hc_pre = 1;
 int g_ggml_sycl_moe_esimd = 3;
 int g_ggml_sycl_upload_queue = -1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
+int g_ggml_sycl_fuse_conv_window = 0;
 int g_ggml_sycl_qsa_fa_no_readback = 0;
 int g_ggml_sycl_small_gemm = 1;
 int g_ggml_sycl_mv_fuse = 1;
@@ -499,6 +500,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_grouped_gemm = ggml_sycl_get_env("GGML_SYCL_GROUPED_GEMM", 1);
         g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", 0);
         g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 1);
+        g_ggml_sycl_fuse_conv_window = ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_WINDOW", 0);
         g_ggml_sycl_qsa_fa_no_readback = ggml_sycl_get_env("GGML_SYCL_QSA_FA_NO_READBACK", 0);
         g_ggml_sycl_small_gemm = ggml_sycl_get_env("GGML_SYCL_SMALL_GEMM", 1);
         g_ggml_sycl_mv_fuse = ggml_sycl_get_env("GGML_SYCL_MV_FUSE", 1);
@@ -682,6 +684,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_MMID_SCHED: %d\n", g_ggml_sycl_mmid_sched);
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_CONV_WINDOW: %d\n", g_ggml_sycl_fuse_conv_window);
         GGML_LOG_INFO("  GGML_SYCL_QSA_FA_NO_READBACK: %d\n", g_ggml_sycl_qsa_fa_no_readback);
         GGML_LOG_INFO("  GGML_SYCL_SMALL_GEMM: %d\n", g_ggml_sycl_small_gemm);
         GGML_LOG_INFO("  GGML_SYCL_MV_FUSE: %d\n", g_ggml_sycl_mv_fuse);
@@ -8263,6 +8266,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     ggml_sycl_kq_mask_graph kq_mask;
     ggml_sycl_kq_mask_graph_begin(*sycl_ctx, cgraph, kq_mask);
 
+    ggml_sycl_conv_window_match conv_window;
+
     ggml_sycl_census_graph * census = nullptr;
     if (g_ggml_sycl_census) {
         std::vector<int> absorbed_by(cgraph->n_nodes, -1);
@@ -8325,6 +8330,24 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         // before any ADD fusion can take it: an ADD of the packed mask runs from the bits
         if (node->op == GGML_OP_ADD && kq_mask.readers.size() && ggml_sycl_kq_mask_try_add(*sycl_ctx, node)) {
             continue;
+        }
+
+        // the conv window: skip the concat and the tail cont + cpy, run all of it at the ssm_conv
+        if (conv_window.concat == nullptr && node->op == GGML_OP_CONCAT &&
+            ggml_sycl_match_conv_window(cgraph, i, conv_window)) {
+            continue;
+        }
+        if (conv_window.concat != nullptr) {
+            if (std::find(conv_window.cont, conv_window.cont + conv_window.n_slots, node) != conv_window.cont + conv_window.n_slots ||
+                std::find(conv_window.cpy, conv_window.cpy + conv_window.n_slots, node) != conv_window.cpy + conv_window.n_slots) {
+                continue;
+            }
+            if (node == conv_window.conv) {
+                ggml_sycl_ssm_conv_window(*sycl_ctx, conv_window);
+                i           = conv_window.last_idx;
+                conv_window = {};
+                continue;
+            }
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
@@ -9102,6 +9125,19 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
         if (cgraph->nodes[i]->op == GGML_OP_SCALE && ggml_sycl_match_dsv4_hc_pre_up(cgraph, i, match, /*any_tokens=*/true)) {
             params->add_alloc_dep(params->user_data, match.scale->src[0], match.dst);
         }
+    }
+    // the fused conv window reads state and x at the ssm_conv, after their last use in the graph (the concat)
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_sycl_conv_window_match match;
+        if (cgraph->nodes[i]->op != GGML_OP_CONCAT || !ggml_sycl_match_conv_window(cgraph, i, match)) {
+            continue;
+        }
+        ggml_tensor * until = cgraph->nodes[match.last_idx];
+        for (ggml_tensor * src : { match.concat->src[0], match.concat->src[1] }) {
+            ggml_tensor * t = src->view_src ? src->view_src : src;
+            params->add_alloc_dep(params->user_data, t, until);
+        }
+        i = match.last_idx;
     }
 }
 
