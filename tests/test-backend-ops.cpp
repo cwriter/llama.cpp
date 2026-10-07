@@ -5323,6 +5323,107 @@ struct test_mul_mat_stream : public test_case {
     }
 };
 
+// The decode tail of n_l qwen4exp recurrent layers, each with its own weights so they stream from VRAM:
+// gated_delta_net (state gathered from and written back to the cache) -> rms_norm * w -> * sigmoid(attn_gate x)
+// -> ssm_out, summed. mode 0 replaces the delta net by an input, so the mat-vecs run without its state writes,
+// mode 1 reads the state from an input, mode 2 gathers it from the cache by get_rows as build_rs does.
+struct test_gdn_layer_stream : public test_case {
+    const int64_t S_v;
+    const int64_t H_v;
+    const int64_t H_k;
+    const int64_t n_embd;
+    const int     n_l;
+    const int     mode;
+
+    std::string vars() override {
+        return VARS_TO_STR6(S_v, H_v, H_k, n_embd, n_l, mode);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_LAYER_STREAM";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    test_gdn_layer_stream(int64_t S_v = 128, int64_t H_v = 48, int64_t H_k = 16, int64_t n_embd = 2560, int n_l = 4,
+            int mode = 2)
+        : S_v(S_v), H_v(H_v), H_k(H_k), n_embd(n_embd), n_l(n_l), mode(mode) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = S_v * S_v * H_v;
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+        ggml_set_name(x, "x");
+        ggml_tensor * ids = nullptr;
+        if (mode == 2) {
+            ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+            ggml_set_name(ids, "ids");
+        }
+
+        ggml_tensor * out = nullptr;
+        for (int il = 0; il < n_l; ++il) {
+            ggml_tensor * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_v, 1, 1);
+            ggml_set_name(v, "v");
+            ggml_tensor * attn = v;
+            if (mode != 0) {
+                ggml_tensor * q    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_k, 1, 1);
+                ggml_tensor * k    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S_v, H_k, 1, 1);
+                ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, 1, 1);
+                ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, 1, 1);
+                ggml_set_name(q, "q");
+                ggml_set_name(k, "k");
+                ggml_set_name(g, "g");
+                ggml_set_name(beta, "beta");
+                ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 1);
+                ggml_set_name(cache, "cache");
+                ggml_tensor * state = mode == 2 ? ggml_get_rows(ctx, cache, ids) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, 1);
+                state = ggml_reshape_4d(ctx, state, S_v, S_v, H_v, 1);
+
+                ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+                attn = ggml_view_4d(ctx, gdn, S_v, H_v, 1, 1, ggml_row_size(gdn->type, S_v),
+                        ggml_row_size(gdn->type, S_v * H_v), ggml_row_size(gdn->type, S_v * H_v), 0);
+                ggml_tensor * tail = ggml_view_2d(ctx, gdn, D, 1, ggml_row_size(gdn->type, D),
+                        ggml_row_size(gdn->type, S_v * H_v));
+                // expanded here so the cpy follows the delta net, as in the model, and fuses into it
+                ggml_build_forward_expand(gf, ggml_cpy(ctx, tail, ggml_view_2d(ctx, cache, D, 1, cache->nb[1], 0)));
+            }
+            ggml_tensor * norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S_v);
+            ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, S_v * H_v);
+            ggml_tensor * w_out  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, S_v * H_v, n_embd);
+            ggml_tensor * z = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_gate, x), S_v, H_v, 1, 1);
+            ggml_tensor * y = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, attn, 1e-6f), norm_w), ggml_sigmoid(ctx, z));
+            ggml_tensor * o = ggml_mul_mat(ctx, w_out, ggml_reshape_2d(ctx, y, S_v * H_v, 1));
+            out = out ? ggml_add(ctx, out, o) : o;
+            // layer by layer, so each layer's mat-vecs run right after its delta net
+            ggml_build_forward_expand(gf, out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                const int32_t zero = 0;
+                ggml_backend_tensor_set(t, &zero, 0, sizeof(zero));
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -12268,6 +12369,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   4, 1, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128, 1, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128, 1, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 48, 128, 3, 1, 2));
+    test_cases.emplace_back(new test_gdn_layer_stream(128, 48, 16, 2560, 2, 1));
+    test_cases.emplace_back(new test_gdn_layer_stream(128, 48, 16, 2560, 2, 2));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
@@ -12537,6 +12643,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         const int     n_w    = (int) std::min<int64_t>(40, ((64ll << 20) + w_size - 1) / w_size);
         test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], 1));
         test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], n_w));
+    }
+    // its recurrent layers at decode: the attn_gate and ssm_out mat-vecs after the delta net, without it (mode 0)
+    for (int mode : {0, 1, 2}) {
+        test_cases.emplace_back(new test_gdn_layer_stream(128, 48, 16, 2560, 4, mode));
     }
     // 8 tokens route to ~75 distinct experts, so the weights do not stay in L2 across runs
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 8, 640, 2560,

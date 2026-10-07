@@ -88,6 +88,7 @@ extern int g_ggml_sycl_grouped_gemm;
 extern int g_ggml_sycl_esimd_q8_0;
 extern int g_ggml_sycl_fuse_qsa_fa_mask;
 extern int g_ggml_sycl_fuse_conv_window;
+extern int g_ggml_sycl_gdn_state_store;
 extern int g_ggml_sycl_qsa_fa_no_readback;
 extern int g_ggml_sycl_small_gemm;
 extern int g_ggml_sycl_mv_fuse;
