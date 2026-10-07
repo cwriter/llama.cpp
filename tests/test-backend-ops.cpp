@@ -4447,6 +4447,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const bool    normed;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4454,14 +4455,17 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return normed ? VARS_TO_STR5(n_embd, n_tokens, identity, gated, normed) : VARS_TO_STR4(n_embd, n_tokens, identity, gated);
     }
 
-    // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
+    // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain.
+    // normed: then the grouped RMS norm * gamma of the next hyper-connection mix, which backends can fuse
+    // into the hc_post; the result adds the hc_post output, so both are checked
     bool run_whole_graph() override { return gated; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false,
+                      bool normed = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), normed(normed) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4484,6 +4488,12 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         }
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        if (normed) {
+            ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+            ggml_set_name(gamma, "gamma");
+            ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, out, 1e-6f), gamma);
+            out = ggml_add(ctx, xn, out);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -10252,6 +10262,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    for (int64_t nt : {1, 3}) {
+        test_cases.emplace_back(new test_dsv4_hc_post(2560, nt, true, true, true));
+        test_cases.emplace_back(new test_dsv4_hc_post(512, nt, true, true, true));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -12926,6 +12940,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, n, 1));
         test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n, true));
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true));
+        test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true, true, true));
     }
     for (int n : {1, 2, 4}) {
         test_cases.emplace_back(new test_dsv4_hc_pre_up(2560, 320, n));

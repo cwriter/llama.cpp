@@ -8649,6 +8649,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             memcpy(&gate.b0, (const float *) node->op_params + 1, sizeof(float));
             memcpy(&gate.s1, (const float *) scale1->op_params + 0, sizeof(float));
             memcpy(&gate.b1, (const float *) scale1->op_params + 1, sizeof(float));
+            // and the grouped RMS norm * gamma of the next hyper-connection mix, when that comes next
+            if (i + 5 < cgraph->n_nodes && cgraph->nodes[i + 4]->op == GGML_OP_RMS_NORM &&
+                cgraph->nodes[i + 5]->op == GGML_OP_MUL &&
+                ggml_sycl_dsv4_hc_post_norm_ok(cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5]) &&
+                ggml_can_fuse_subgraph(cgraph, i,
+                    { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL },
+                    { i + 3, i + 5 }) &&
+                ggml_sycl_op_dsv4_hc_post_fused_gate_norm(*sycl_ctx, cgraph->nodes[i + 3], gate, cgraph->nodes[i + 4],
+                                                          cgraph->nodes[i + 5])) {
+                i += 5;
+                continue;
+            }
             ggml_sycl_op_dsv4_hc_post_fused_gate(*sycl_ctx, cgraph->nodes[i + 3], gate);
             i += 3;
             continue;
@@ -9330,6 +9342,18 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
         ggml_sycl_dsv4_hc_pre_up_match match;
         if (cgraph->nodes[i]->op == GGML_OP_SCALE && ggml_sycl_match_dsv4_hc_pre_up(cgraph, i, match, /*any_tokens=*/true)) {
             params->add_alloc_dep(params->user_data, match.scale->src[0], match.dst);
+        }
+    }
+    // the fused hc_post + norm reads x, the residual and the gate input while it writes the norm's output
+    for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
+        ggml_tensor * const * n = cgraph->nodes + i;
+        if (n[0]->op == GGML_OP_SCALE && n[1]->op == GGML_OP_UNARY && n[2]->op == GGML_OP_SCALE &&
+            n[3]->op == GGML_OP_DSV4_HC_POST && n[4]->op == GGML_OP_RMS_NORM && n[5]->op == GGML_OP_MUL &&
+            ggml_sycl_dsv4_hc_post_norm_ok(n[3], n[4], n[5])) {
+            for (ggml_tensor * t : { n[3]->src[0], n[3]->src[1], n[0]->src[0] }) {
+                params->add_alloc_dep(params->user_data, t->view_src ? t->view_src : t, n[5]);
+            }
+            i += 5;
         }
     }
     // a fused mat-vec epilogue reads the activation at the mat-vec and writes the tail's last node

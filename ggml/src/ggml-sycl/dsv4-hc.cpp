@@ -532,6 +532,100 @@ static void dsv4_hc_post_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst
     else                { launch(std::false_type{}, std::false_type{}); }
 }
 
+bool ggml_sycl_dsv4_hc_post_norm_ok(const ggml_tensor * hc_post, const ggml_tensor * rms, const ggml_tensor * mul) {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_FUSE_HC_POST_NORM", 1) != 0;
+    if (!on) {
+        return false;
+    }
+    const ggml_tensor * x        = hc_post->src[0];
+    const ggml_tensor * residual = hc_post->src[1];
+    const ggml_tensor * w        = mul->src[1] == rms ? mul->src[0] : mul->src[1];
+    const int64_t       n_embd   = hc_post->ne[0];
+    const int64_t       hc       = hc_post->ne[1];
+    if (hc_post->src[3] != nullptr || rms->src[0] != hc_post || (mul->src[0] != rms && mul->src[1] != rms) ||
+        hc_post->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 ||
+        rms->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(hc_post) || !ggml_is_contiguous(residual) || !ggml_is_contiguous_rows(x) ||
+        !ggml_is_contiguous(mul) || !ggml_is_contiguous(w) || !ggml_are_same_shape(hc_post, mul) ||
+        w->ne[0] != n_embd || w->ne[1] != hc || ggml_nelements(w) != n_embd * hc ||
+        n_embd % 4 != 0 || n_embd / 4 > 1024 || (n_embd / 4) % WARP_SIZE != 0 ||
+        ((uintptr_t) x->data | (uintptr_t) residual->data | (uintptr_t) hc_post->data | (uintptr_t) mul->data |
+         (uintptr_t) w->data) % 16 != 0 || x->nb[1] % 16 != 0) {
+        return false;
+    }
+    return true;
+}
+
+bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
+                                               const ggml_sycl_dsv4_hc_post_gate & gate, ggml_tensor * rms,
+                                               ggml_tensor * mul) {
+    if (!ggml_sycl_dsv4_hc_post_norm_ok(dst, rms, mul) || gate.src == nullptr || gate.src->type != GGML_TYPE_F32) {
+        return false;
+    }
+    scope_op_debug_print scope_dbg_print(__func__, mul, /*num_src=*/2);
+    const float * x        = (const float *) dst->src[0]->data;
+    const float * residual = (const float *) dst->src[1]->data;
+    const float * post     = (const float *) gate.src->data;
+    const ggml_tensor * wt = mul->src[1] == rms ? mul->src[0] : mul->src[1];
+    const float * w        = (const float *) wt->data;
+    float *       out      = (float *) dst->data;
+    float *       xn       = (float *) mul->data;
+    float         eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t hc       = dst->ne[1];
+    const int64_t n_tokens = dst->ne[2];
+    const int64_t sx1      = dst->src[0]->nb[1] / sizeof(float);
+    const int64_t sp0      = gate.src->nb[0] / sizeof(float);
+    const int64_t sp1      = gate.src->nb[1] / sizeof(float);
+    const sycl::float2 g0(gate.s0, gate.b0);
+    const sycl::float2 g1(gate.s1, gate.b1);
+    const int nv = (int) (n_embd / 4);
+
+    ctx.stream()->parallel_for(
+        sycl::nd_range<3>(sycl::range<3>(n_tokens, hc, nv), sycl::range<3>(1, 1, nv)),
+        [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const int64_t it   = item.get_global_id(0);
+            const int64_t idst = item.get_global_id(1);
+            const int64_t i0   = item.get_local_id(2) * 4;
+
+            // as dsv4_hc_post_f32_vec4_sycl<false, true>
+            float g = post[idst*sp0 + it*sp1];
+            g = g0[0] * g + g0[1];
+            g = 1.0f / (1.0f + op_exp(-g));
+            g = g1[0] * g + g1[1];
+
+            const sycl::float4 xv = *(const sycl::float4 *) (x + i0 + it*sx1);
+            const sycl::float4 rv = *(const sycl::float4 *) (residual + i0 + (idst + it*hc)*n_embd);
+            sycl::float4 sum;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                sum[j] = xv[j] * g;
+                sum[j] += rv[j];
+            }
+            const int64_t row = (idst + it*hc)*n_embd;
+            *(sycl::float4 *) (out + i0 + row) = sum;
+
+            // the grouped RMS norm of norm.cpp: scale = rsqrt(sum(x^2) / n + eps), x * scale * gamma
+            float ss = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                ss += sum[j] * sum[j];
+            }
+            ss = sycl::reduce_over_group(item.get_group(), ss, sycl::plus<float>());
+            const float scale = sycl::rsqrt(ss / n_embd + eps);
+            const sycl::float4 wv = *(const sycl::float4 *) (w + i0 + idst*n_embd);
+            sycl::float4 r;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                r[j] = scale * sum[j] * wv[j];
+            }
+            *(sycl::float4 *) (xn + i0 + row) = r;
+        });
+    return true;
+}
+
 void ggml_sycl_op_dsv4_hc_post(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
     dsv4_hc_post_impl(ctx, dst, /*gate=*/nullptr);
