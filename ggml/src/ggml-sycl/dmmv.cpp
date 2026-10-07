@@ -2693,6 +2693,187 @@ static void iq3_s_moe_glu_esimd_launch(const void * vx_gate_base, const void * v
         });
 }
 
+// Integer variant of the kernel above (GGML_SYCL_MOE_ESIMD=3). The work-group quantizes its activation
+// row into SLM as int8 with one scale per 32 values (the IQ3_S sub-block) and stages iq3s_grid there.
+// A block is then 64 packed 4-byte lanes: an SLM grid gather, the signs folded into the grid bytes and
+// one dp4a per lane, instead of 256 f32 lanes.
+#define IQ3_S_MOE_DP4A_MAX_COLS 4096
+#define IQ3_S_MOE_DP4A_YD_SLM   (512 * sizeof(uint32_t))
+#define IQ3_S_MOE_DP4A_YQ_SLM   (IQ3_S_MOE_DP4A_YD_SLM + IQ3_S_MOE_DP4A_MAX_COLS / 32 * sizeof(float))
+
+// NB consecutive blocks of one row, so the weight loads are NB blocks wide
+template <int NB>
+ESIMD_INLINE void iq3_s_moe_dp4a_blocks(const uint8_t * vx, const size_t nb, const size_t ib,
+                                        const sycl::ext::intel::esimd::simd<int32_t, 64 * NB> & yq,
+                                        const sycl::ext::intel::esimd::simd<float, 8 * NB> & yd,
+                                        sycl::ext::intel::esimd::simd<float, 8> & acc) {
+    using namespace sycl::ext::intel::esimd;
+
+    simd<uint8_t, 64 * NB> qs   = block_load<uint8_t, 64 * NB>(vx + ib * 64);
+    simd<uint8_t, 8 * NB>  qh   = block_load<uint8_t, 8 * NB>(vx + nb * 64 + ib * 8);
+    simd<uint8_t, 32 * NB> sg   = block_load<uint8_t, 32 * NB>(vx + nb * 72 + ib * 32);
+    simd<uint16_t, 3 * NB> meta = block_load<uint16_t, 3 * NB>((const uint16_t *) (vx + nb * 104 + ib * 6), element_aligned_tag{});
+
+    simd<float, 8 * NB> sc;
+    simd<float, 8 * NB> d;
+#pragma unroll
+    for (int k = 0; k < NB; ++k) {
+        simd<uint16_t, 1>   d_bits = meta.template select<1, 1>(3 * k);
+        simd<sycl::half, 1> d_h    = d_bits.template bit_cast_view<sycl::half>();
+        simd<float, 1>      d_f    = d_h;
+        const float         d_k    = d_f[0];
+        simd<uint16_t, 2>   sc_raw = meta.template select<2, 1>(3 * k + 1);
+        simd<uint8_t, 4>    sc_b   = sc_raw.template bit_cast_view<uint8_t>();
+        sc.template select<4, 2>(8 * k)     = sc_b & 0xf;
+        sc.template select<4, 2>(8 * k + 1) = sc_b >> 4;
+        d.template select<8, 1>(8 * k)      = d_k;
+    }
+    sc = (sc * 2.0f + 1.0f) * d * yd;
+
+    // lane k holds elements 4k..4k+3: grid entry k, and sign bits 4(k%2)..4(k%2)+3 of signs[k/2]
+    const simd<uint16_t, 64 * NB> lane(0, 1);
+    simd<uint16_t, 64 * NB> qh64 = qh.template replicate_vs_w_hs<8 * NB, 1, 8, 0>(0);
+    simd<uint32_t, 64 * NB> off  = (qs | (((qh64 >> (lane & 7)) & 1) << 8)) * (uint32_t) sizeof(uint32_t);
+    simd<uint32_t, 64 * NB> grid;
+#pragma unroll
+    for (int k = 0; k < NB; ++k) {
+        grid.template select<64, 1>(64 * k) = slm_gather<uint32_t, 64>(off.template select<64, 1>(64 * k));
+    }
+
+    // spread each sign bit to the low bit of its byte and negate those bytes: grid bytes are 1..15,
+    // so (g ^ 0xff) + 1 never carries into the next byte
+    simd<uint32_t, 64 * NB> sgn = sg.template replicate_vs_w_hs<32 * NB, 1, 2, 0>(0);
+    sgn = (sgn >> ((lane & 1) * 4)) & 0xf;
+    simd<uint32_t, 64 * NB> m01 = (sgn * 0x00204081u) & 0x01010101u;
+    simd<uint32_t, 64 * NB> w   = (grid ^ (m01 * 0xffu)) + m01;
+
+    // 8 lanes per 32-value sub-block
+    simd<int32_t, 64 * NB> p   = dp4a<int32_t, int32_t, int32_t, int32_t, 64 * NB>(
+        simd<int32_t, 64 * NB>(0), yq, w.template bit_cast_view<int32_t>());
+    simd<int32_t, 32 * NB> p32 = p.template select<32 * NB, 2>(0) + p.template select<32 * NB, 2>(1);
+    simd<int32_t, 16 * NB> p16 = p32.template select<16 * NB, 2>(0) + p32.template select<16 * NB, 2>(1);
+    simd<int32_t, 8 * NB>  p8  = p16.template select<8 * NB, 2>(0) + p16.template select<8 * NB, 2>(1);
+    simd<float, 8 * NB>    f   = convert<float>(p8) * sc;
+#pragma unroll
+    for (int k = 0; k < NB; ++k) {
+        acc += f.template select<8, 1>(8 * k);
+    }
+}
+
+template <int NB, int R>
+ESIMD_INLINE void iq3_s_moe_glu_dp4a_step(const uint8_t * vg, const uint8_t * vu, const int row0, const int nrows,
+                                          const int blocks_per_row, const int b,
+                                          sycl::ext::intel::esimd::simd<float, 8 * R> & acc_g,
+                                          sycl::ext::intel::esimd::simd<float, 8 * R> & acc_u) {
+    using namespace sycl::ext::intel::esimd;
+
+    const size_t nb = (size_t) nrows * blocks_per_row;
+    simd<int32_t, 64 * NB> yq = slm_block_load<int32_t, 64 * NB>(IQ3_S_MOE_DP4A_YQ_SLM + b * QK_K);
+    simd<float, 8 * NB>    yd = slm_block_load<float, 8 * NB>(IQ3_S_MOE_DP4A_YD_SLM + b * 8 * sizeof(float));
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        // a tail row past nrows recomputes the last row and is not stored
+        const int    row = row0 + r < nrows ? row0 + r : nrows - 1;
+        const size_t ib  = (size_t) row * blocks_per_row + b;
+        simd<float, 8> ag = acc_g.template select<8, 1>(r * 8);
+        simd<float, 8> au = acc_u.template select<8, 1>(r * 8);
+        iq3_s_moe_dp4a_blocks<NB>(vg, nb, ib, yq, yd, ag);
+        iq3_s_moe_dp4a_blocks<NB>(vu, nb, ib, yq, yd, au);
+        acc_g.template select<8, 1>(r * 8) = ag;
+        acc_u.template select<8, 1>(r * 8) = au;
+    }
+}
+
+template <int R, int WG, int NB>
+ESIMD_INLINE void mul_mat_vec_iq3_s_moe_glu_dp4a_esimd(
+        const void * vx_gate_base, const void * vx_up_base, const void * y_base, float * dst_base,
+        const int32_t * ids_dev, const int ncols, const int nrows, const size_t expert_weight_stride,
+        const size_t dst_row_stride, const size_t src1_row_stride, const size_t ids_token_stride,
+        const size_t dst_token_stride, const size_t src1_token_stride, const sycl::nd_item<3> & it) {
+    using namespace sycl::ext::intel::esimd;
+
+    // SLM: [iq3s_grid] [f32 activation scale per 32 values] [int8 activation]
+    slm_init<IQ3_S_MOE_DP4A_YQ_SLM + IQ3_S_MOE_DP4A_MAX_COLS>();
+
+    const int tid        = it.get_local_id(2);
+    const int token_idx  = it.get_group(0);
+    const int expert_idx = it.get_group(1);
+    const float * y = (const float *) ((const char *) y_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride);
+
+    constexpr int grid_per_thread = 512 / WG;
+    slm_block_store<uint32_t, grid_per_thread>(tid * grid_per_thread * sizeof(uint32_t),
+        block_load<uint32_t, grid_per_thread>(iq3s_grid + tid * grid_per_thread));
+    for (int j = tid; j < ncols / 32; j += WG) {
+        simd<float, 32>  v    = block_load<float, 32>(y + j * 32);
+        const float      amax = hmax<float>(abs(v));
+        const float      id   = amax > 0.0f ? 127.0f / amax : 0.0f;
+        simd<int8_t, 32> q    = convert<int8_t>(rnde<float, 32>(v * id));
+        slm_block_store<int8_t, 32>(IQ3_S_MOE_DP4A_YQ_SLM + j * 32, q);
+        slm_scalar_store<float>(IQ3_S_MOE_DP4A_YD_SLM + j * sizeof(float), amax / 127.0f);
+    }
+    barrier();
+
+    const int row0 = (int) (it.get_group(2) * WG + tid) * R;
+    if (row0 >= nrows) {
+        return;
+    }
+
+    const int i02 = *(const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride + expert_idx * sizeof(int32_t));
+    const uint8_t * vg  = (const uint8_t *) vx_gate_base + (size_t) i02 * expert_weight_stride;
+    const uint8_t * vu  = (const uint8_t *) vx_up_base   + (size_t) i02 * expert_weight_stride;
+    float *         dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+
+    const int blocks_per_row = ncols / QK_K;
+
+    simd<float, 8 * R> acc_g = 0.0f;
+    simd<float, 8 * R> acc_u = 0.0f;
+    int b = 0;
+    for (; b + NB <= blocks_per_row; b += NB) {
+        iq3_s_moe_glu_dp4a_step<NB, R>(vg, vu, row0, nrows, blocks_per_row, b, acc_g, acc_u);
+    }
+    for (; b < blocks_per_row; ++b) {
+        iq3_s_moe_glu_dp4a_step<1, R>(vg, vu, row0, nrows, blocks_per_row, b, acc_g, acc_u);
+    }
+
+    simd<float, R> gate;
+    simd<float, R> up;
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        simd<float, 8> ag = acc_g.template select<8, 1>(r * 8);
+        simd<float, 8> au = acc_u.template select<8, 1>(r * 8);
+        gate[r] = reduce<float>(ag, std::plus<>{});
+        up[r]   = reduce<float>(au, std::plus<>{});
+    }
+    simd<float, R> out = up * gate / (1.0f + exp(-gate));
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (row0 + r < nrows) {
+            dst[row0 + r] = out[r];
+        }
+    }
+}
+
+template <int R, int WG, int NB>
+static void iq3_s_moe_glu_dp4a_esimd_launch(const void * vx_gate_base, const void * vx_up_base, const float * y,
+                                            const int32_t * ids_dev, float * dst_base, const int ncols, const int nrows,
+                                            const int n_experts_used, const int n_tokens, const size_t expert_weight_stride,
+                                            const size_t dst_row_stride, const size_t src1_row_stride,
+                                            const size_t ids_token_stride, const size_t dst_token_stride,
+                                            const size_t src1_token_stride, dpct::queue_ptr stream) {
+    static_assert(512 % (16 * WG) == 0, "each thread stages a multiple of 16 grid entries");
+    GGML_ASSERT(ncols % QK_K == 0 && ncols <= IQ3_S_MOE_DP4A_MAX_COLS);
+    const int            block_num = ceil_div(nrows, R * WG);
+    const sycl::range<3> block_nums((unsigned) n_tokens, (unsigned) n_experts_used, (unsigned) block_num);
+    const sycl::range<3> block_dims(1, 1, WG);
+    stream->parallel_for(
+        sycl::nd_range<3>(block_nums * block_dims, block_dims),
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            mul_mat_vec_iq3_s_moe_glu_dp4a_esimd<R, WG, NB>(vx_gate_base, vx_up_base, y, dst_base, ids_dev, ncols, nrows,
+                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                dst_token_stride, src1_token_stride, it);
+        });
+}
+
 #endif // GGML_SYCL_DMMV_HAS_ESIMD
 
 static void dequantize_mul_mat_vec_q4_K_sycl_reorder(const void *vx, const float *y,
@@ -2976,6 +3157,13 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     if (src0_type != GGML_TYPE_IQ3_S || glu_op != GGML_GLU_OP_SWIGLU || ncols % QK_K != 0) {
         return false;
+    }
+    if (g_ggml_sycl_moe_esimd >= 3 && ncols <= IQ3_S_MOE_DP4A_MAX_COLS) {
+        // 2 rows x 4 blocks per thread measured best on Arc Pro B60 (4 rows x 1 block: same at 8 tokens, 6% slower at 1)
+        iq3_s_moe_glu_dp4a_esimd_launch<2, 8, 4>(vx_gate_base, vx_up_base, y, ids_dev, dst_base, ncols, nrows, n_experts_used,
+            n_tokens, expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride, dst_token_stride,
+            src1_token_stride, stream);
+        return true;
     }
     // 1 and 4 rows per thread and 16 threads per work-group measured no better
     iq3_s_moe_glu_esimd_launch<2, 8>(vx_gate_base, vx_up_base, y, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,

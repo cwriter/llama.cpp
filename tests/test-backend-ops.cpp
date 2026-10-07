@@ -10949,6 +10949,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
         true, 64, 10, false, false, true, false, {1, 1}));
+    // IQ3_S gate/up: rows not divisible by the row group, a tail after the 4-block steps, and a row too
+    // long for the SLM-staged activation of GGML_SYCL_MOE_ESIMD=3
+    for (int n : {1, 3}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, n, 37, 1280,
+            true, 16, 8, true, false, true, false, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 1, 64, 4352,
+        true, 16, 8, false, false, true, false, {1, 1}));
 
     for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, 256, 1, 2));
