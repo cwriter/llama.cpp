@@ -5279,6 +5279,50 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// n_w mat-vecs over distinct [k, m] weights of one shape, summed into one output. With n_w * the
+// weight size well above the GPU L2, every weight is evicted before the next repetition reads it, so
+// perf measures the mat-vec streaming from VRAM, as in a model; a single-weight case stays cached. The time
+// includes the n_w - 1 adds. This holds for loads that allocate in L2 only: loads with a no-allocate cache hint
+// keep hitting whatever earlier runs left in L2.
+struct test_mul_mat_stream : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t k;
+    const int n_w;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, k, n_w);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_STREAM";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    test_mul_mat_stream(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 256, int64_t k = 256, int n_w = 4)
+        : type_a(type_a), m(m), k(k), n_w(n_w) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < n_w; ++i) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+            ggml_tensor * y = ggml_mul_mat(ctx, a, b);
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -10879,6 +10923,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the qwen4exp q8_0 dense shapes {m, k} at decode, and several distinct weights in one graph
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144},
+                                                        {6143, 2560}, {2559, 6144} }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 1, mk[1], { 1, 1 }, { 1, 1 }));
+        test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], 3));
+    }
+
     // 2D quantized weight against a 3D activation (the MTP eh_proj, [K, 4 streams, n_tokens])
     for (int nt : {1, 2, 3, 42}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 4, 512, {1, 1}, {nt, 1}));
@@ -12476,6 +12527,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // of 16 blocks after the 64-block stripes
     for (int64_t m : {40960, 24576}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 1, 2560, {1, 1}, {1, 1}));
+    }
+    // the qwen4exp q8_0 mat-vecs streamed from VRAM: enough distinct weights of each shape for 64 MiB (at
+    // most 40, the harness context holds 128 tensors), and one weight that stays in L2 for comparison
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144},
+                                                        {512, 2560}, {640, 2560}, {2560, 640}, {10240, 320},
+                                                        {320, 10240} }) {
+        const int64_t w_size = mk[0] * (int64_t) ggml_row_size(GGML_TYPE_Q8_0, mk[1]);
+        const int     n_w    = (int) std::min<int64_t>(40, ((64ll << 20) + w_size - 1) / w_size);
+        test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], 1));
+        test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], n_w));
     }
     // 8 tokens route to ~75 distinct experts, so the weights do not stay in L2 across runs
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 8, 640, 2560,

@@ -283,6 +283,8 @@ extern int g_ggml_sycl_moe_esimd;
 // Q8_0 reordered ESIMD mat-vec: take the blocks left after the full 8-block stripes in 4- and
 // 2-block stripes instead of one block at a time (default). 0 keeps the original loop.
 extern int g_ggml_sycl_q8_0_mmv_tail;
+// Q8_0 reordered ESIMD mat-vec: pick rows and threads per work-group by row length (default). 0 keeps 2 rows on 8 threads.
+extern int g_ggml_sycl_q8_0_mmv_shapes;
 // fold scale -> silu -> Q8_0 up mat-vec -> gated dsv4_hc_pre into one kernel (0 = off, default)
 extern int g_ggml_sycl_fuse_hc_pre;
 // ggml_can_fuse_subgraph() takes at most 31 nodes, and the span is 2*n_expert_used.
