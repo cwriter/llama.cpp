@@ -12753,6 +12753,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], 1));
         test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], n_w));
     }
+    // the qwen4exp f32 MoE router 2560 -> 512, streamed (16 weights, 84 MiB) and cached
+    test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_F32, 512, 2560, 1));
+    test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_F32, 512, 2560, 16));
     // its recurrent layers at decode: the attn_gate and ssm_out mat-vecs after the delta net, without it (mode 0)
     for (int mode : {0, 1, 2}) {
         test_cases.emplace_back(new test_gdn_layer_stream(128, 48, 16, 2560, 4, mode));

@@ -40,4 +40,8 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
     size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
     ggml_glu_op glu_op, dpct::queue_ptr stream);
 
+// f32 mat-vec dst[m] = sum_k a[m * lda + k] * b[k] on ESIMD (GGML_SYCL_F32_MMV_ESIMD); false if the shape is not taken
+bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                 dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_DMMV_HPP
