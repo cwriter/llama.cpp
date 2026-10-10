@@ -883,12 +883,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     // rotate q/k/v before they reach a quantized cache, as the dense path does. the indexer
     // has already scored with its own query in build_qsa_sel, so the selection is unaffected.
     if (inp->self_k_rot) {
-        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
-        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->get_k_rot(il));
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->get_k_rot(il));
     }
 
     if (inp->self_v_rot) {
-        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->get_v_rot(il));
     }
 
     // these nodes are added to the graph together so that they are not reordered
@@ -923,7 +923,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // the rotation is its own inverse, so undo it on the value side of the output
     if (inp->self_v_rot) {
-        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->get_v_rot(il));
     }
 
     return cur;
