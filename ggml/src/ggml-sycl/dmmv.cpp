@@ -2531,7 +2531,7 @@ ESIMD_INLINE void esimd_ncols_epilogue(
     }
 }
 
-template <int WG, int NCOLS>
+template <int WG, int NCOLS, bool TAIL>
 ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd_ncols(
         const void * vx, const float * y, float * dst,
         const int ncols, const int nrows, const int stride_col_y, const int stride_col_dst,
@@ -2563,6 +2563,20 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd_ncols(
                                              d + base0 + b, d + base1 + b, has_row1,
                                              y + (size_t) b * QK8_0, stride_col_y, acc0, acc1);
     }
+    if constexpr (TAIL) {
+        for (; ib + WG * 4 <= nblk_row; ib += WG * 4) {
+            const int b = ib + tid * 4;
+            q8_0_mac_stripe_ncols<4, NCOLS>(qs + (base0 + b) * QK8_0, qs + (base1 + b) * QK8_0,
+                                            d + base0 + b, d + base1 + b, has_row1,
+                                            y + (size_t) b * QK8_0, stride_col_y, acc0, acc1);
+        }
+        for (; ib + WG * 2 <= nblk_row; ib += WG * 2) {
+            const int b = ib + tid * 2;
+            q8_0_mac_stripe_ncols<2, NCOLS>(qs + (base0 + b) * QK8_0, qs + (base1 + b) * QK8_0,
+                                            d + base0 + b, d + base1 + b, has_row1,
+                                            y + (size_t) b * QK8_0, stride_col_y, acc0, acc1);
+        }
+    }
     for (int b = ib + tid; b < nblk_row; b += WG) {
         q8_0_mac_stripe_ncols<1, NCOLS>(qs + (base0 + b) * QK8_0, qs + (base1 + b) * QK8_0,
                                         d + base0 + b, d + base1 + b, has_row1,
@@ -2572,8 +2586,8 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd_ncols(
     esimd_ncols_epilogue<WG, NCOLS>(acc0, acc1, dst, row0, has_row1, stride_col_dst, lmem, it);
 }
 
-template <int WG, int NCOLS>
-static void q8_0_esimd_ncols_launch(const void * vx, const float * y, float * dst, const int ncols,
+template <int WG, int NCOLS, bool TAIL>
+static void q8_0_esimd_ncols_launch_tail(const void * vx, const float * y, float * dst, const int ncols,
                                     const int nrows, const int stride_col_y, const int stride_col_dst,
                                     dpct::queue_ptr stream) {
     const int workgroups = (nrows + 1) / 2;
@@ -2582,10 +2596,22 @@ static void q8_0_esimd_ncols_launch(const void * vx, const float * y, float * ds
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t) workgroups * WG), sycl::range<1>(WG)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                dequantize_mul_mat_vec_q8_0_reorder_esimd_ncols<WG, NCOLS>(
+                dequantize_mul_mat_vec_q8_0_reorder_esimd_ncols<WG, NCOLS, TAIL>(
                     vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, lmem, it);
             });
     });
+}
+
+template <int WG, int NCOLS>
+static void q8_0_esimd_ncols_launch(const void * vx, const float * y, float * dst, const int ncols,
+                                    const int nrows, const int stride_col_y, const int stride_col_dst,
+                                    dpct::queue_ptr stream) {
+    const int tail_blocks = (ncols / QK8_0) % (WG * 8);
+    if (g_ggml_sycl_q8_0_mmv_tail && tail_blocks >= WG * 2) {
+        q8_0_esimd_ncols_launch_tail<WG, NCOLS, true>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream);
+    } else {
+        q8_0_esimd_ncols_launch_tail<WG, NCOLS, false>(vx, y, dst, ncols, nrows, stride_col_y, stride_col_dst, stream);
+    }
 }
 
 template <int NCOLS>

@@ -11563,6 +11563,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // multi-column q8_0 tails at each work-group size, including odd output rows
+    for (int64_t k : {480, 992, 2016, 2080, 2304, 2592, 3072, 3104, 3584, 3616}) {
+        for (int n : {2, 3, 4}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 321, n, k, {1, 1}, {1, 1}));
+        }
+    }
+
     // the qwen4exp q8_0 dense shapes {m, k} at decode, and several distinct weights in one graph
     for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144},
                                                         {6143, 2560}, {2559, 6144} }) {
