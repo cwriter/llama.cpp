@@ -351,6 +351,17 @@ bool ggml_sycl_fattn_sparse_applies(const ggml_tensor * dst) {
     return sparse_fa_enabled() && sparse_fa_applicable(dst, n_kv_g);
 }
 
+bool ggml_sycl_fattn_sparse_graph_compatible(int device, const ggml_tensor * dst) {
+    int64_t n_kv_g = 0;
+    if (!sparse_fa_enabled() || !sparse_fa_applicable(dst, n_kv_g)) {
+        return false;
+    }
+    const sparse_fa_node g(dst, n_kv_g, nullptr, nullptr, nullptr);
+    return ggml_sycl_flash_attn_ext_supported(device, &g.dst) &&
+           !ggml_sycl_flash_attn_ext_needs_sync(device, &g.dst) &&
+           !ggml_sycl_flash_attn_ext_uses_onednn(device, &g.dst);
+}
+
 size_t ggml_sycl_fattn_sparse_alloc_size(const ggml_tensor * dst) {
     int64_t n_kv_g = 0;
     if (!sparse_fa_enabled() || !sparse_fa_applicable(dst, n_kv_g)) {
@@ -451,7 +462,7 @@ bool ggml_sycl_flash_attn_ext_sparse(ggml_backend_sycl_context & ctx, ggml_tenso
     sparse_fa_gather_mask(stream, (const sycl::half *) mask->data, d_mask,
                           d_idx, d_cnt, n_kv_g, n_rows_m, n_rows_g, mask_s1);
 
-    if (sparse_fa_debug()) {
+    if (sparse_fa_debug() && stream->ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
         int32_t h_cnt = 0;
         SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(&h_cnt, d_cnt, sizeof(int32_t))));
         SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));

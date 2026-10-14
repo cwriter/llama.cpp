@@ -56,6 +56,12 @@
 #if defined(__INTEL_LLVM_COMPILER)
     #define GGML_SYCL_DMMV_HAS_ESIMD
 #endif
+#if GGML_SYCL_DNNL && defined(GGML_SYCL_GRAPH)
+#    include "dnnl_version.h"
+#    if DNNL_VERSION_MAJOR > 3 || (DNNL_VERSION_MAJOR == 3 && (DNNL_VERSION_MINOR > 12 || (DNNL_VERSION_MINOR == 12 && DNNL_VERSION_PATCH >= 3)))
+#        define GGML_SYCL_GRAPH_DNNL_SUPPORTED
+#    endif
+#endif
 #include <sycl/half_type.hpp>
 
 #include "ggml.h"
@@ -69,6 +75,7 @@
 #include "ggml-sycl/element_wise.hpp"
 #include "ggml-sycl/fwht.hpp"
 #include "ggml-sycl/fused-gemm.hpp"
+#include "ggml-sycl/fattn-sparse.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
 #include "ggml-sycl/mem.hpp"
@@ -8926,68 +8933,50 @@ static bool ggml_sycl_graph_update_required(ggml_sycl_graph * graph, ggml_cgraph
     return res;
 }
 
-// Reports if ggml_sycl_mul_mat() gives this node to oneMKL or oneDNN. Both libraries chain the
-// submission on events made before recording started, which SYCL graphs do not allow.
-static bool mul_mat_uses_library_gemm(ggml_backend_sycl_context * ctx, ggml_tensor * dst,
-                                      const char ** why = nullptr) {
+// Match the oneDNN paths in ggml_sycl_mul_mat() and ggml_sycl_op_mul_mat_sycl().
+static bool mul_mat_uses_onednn(ggml_backend_sycl_context * ctx, ggml_tensor * dst) {
+#if GGML_SYCL_DNNL && !defined(GGML_SYCL_GRAPH_DNNL_SUPPORTED)
+    if (!g_ggml_sycl_enable_dnn || !ggml_sycl_dnnl_has_optimized_gemm(ctx->device)) {
+        return false;
+    }
+
     ggml_tensor * src0 = dst->src[0];
     ggml_tensor * src1 = dst->src[1];
-    const char *  reason = "no";
 
-    // the branch order below follows the dispatch in ggml_sycl_mul_mat()
     if (!ggml_backend_buffer_is_sycl_split(src0->buffer) && src0->type == GGML_TYPE_F16) {
         if (ggml_is_permuted(src0) && ggml_is_permuted(src1) && src1->ne[1] == 1) {
-            const bool lib = !(src0->ne[3] == 1 && src1->ne[3] == 1);
-            if (why) { *why = lib ? "f16 permuted, ne3 != 1" : "no"; }
-            return lib;
+            return !(src0->ne[3] == 1 && src1->ne[3] == 1);
         }
         if (!ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
-            if (why) { *why = "no"; }
             return false;
         }
         if (!ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
-            if (why) { *why = "f16 batched gemm (ne2*ne3 > 1)"; }
             return true;
         }
     }
 
-    // ggml_sycl_op_mul_mat_sycl() is the last resort of the dispatch. The reorder decision that
-    // ggml_sycl_mul_mat() makes between DMMV and MMVQ is left out here: neither uses a library.
-    const bool no_dmmv = !can_use_dequantize_mul_mat_vec(src0, src1, dst);
-    const bool no_mmvq = !can_use_mul_mat_vec_q(src0, src1, dst);
-    const bool no_mmq  = !can_use_mul_mat_q(src0, src1, dst);
-    if (!(no_dmmv && no_mmvq && no_mmq)) {
-        if (why) { *why = "no"; }
+    if (can_use_dequantize_mul_mat_vec(src0, src1, dst) || can_use_mul_mat_vec_q(src0, src1, dst) ||
+        can_use_mul_mat_q(src0, src1, dst)) {
         return false;
     }
 
-    // Reaching op_mul_mat_sycl() is NOT the same as reaching a library: that function tries a native
-    // split-K kernel first and only calls oneMKL if it declines. Saying "library" here anyway made
-    // every hc_inject node (f32, M=4 N=2 K=10240) look like a blocker while the profile shows them
-    // served by small_gemm_f32_launch, 144 dispatches a token. Mirror the dispatch exactly:
-    //   oneDNN takes it   only when DNNL is on and flops are NOT below the split-K bound
-    //   the native kernel takes it when flops are below the bound and the shape/device allow
-    //   oneMKL runs       only if neither did
-    // The bound test uses the same strict < as use_mkl_direct, and M/N are taken at full tensor
-    // extent: a split tensor gives each device fewer rows, so full extent is the conservative side.
-    const int64_t M     = src0->ne[1];
-    const int64_t N     = src1->ne[1];
-    const int64_t K     = src1->ne[0];
-    const int64_t flops = M * N * K;
-    bool          dnnl_takes_it = false;
-#if GGML_SYCL_DNNL
-    dnnl_takes_it = g_ggml_sycl_enable_dnn && !(flops < GGML_SYCL_SK_MAX_MNK) &&
-                    ggml_sycl_dnnl_has_optimized_gemm(ctx->device);
-#endif
-    if (!dnnl_takes_it && g_ggml_sycl_small_gemm && flops < GGML_SYCL_SK_MAX_MNK &&
-        ggml_sycl_small_gemm_f32_shape_ok(M, N, K, src0->ne[0], dst->ne[0]) &&
-        ggml_sycl_small_gemm_f32_device_ok(ctx->stream())) {
-        if (why) { *why = "no: native split-K small gemm"; }
-        return false;
+#if defined(GGML_SYCL_HAS_BF16)
+    if (src0->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0)) {
+        return true;
     }
-    reason = dnnl_takes_it ? "oneDNN row_gemm" : "oneMKL gemm (native split-K declined)";
-    if (why) { *why = reason; }
-    return true;
+#endif
+#ifdef GGML_SYCL_F16
+    if ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && ggml_sycl_src1_f16_ok(dst) &&
+        ggml_is_contiguous(src0) && dst->op_params[0] == GGML_PREC_DEFAULT) {
+        return true;
+    }
+#endif
+    return src0->ne[1] * src1->ne[1] * src0->ne[0] >= GGML_SYCL_SK_MAX_MNK;
+#else
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(dst);
+    return false;
+#endif
 }
 
 // One line per node that makes a cgraph ineligible for graph replay. Replay is worth far more than
@@ -9080,7 +9069,6 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
-        const char *  why  = nullptr;
 
         // skip the nodes that ggml_backend_sycl_graph_compute_impl() does not run
         if (ggml_sycl_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
@@ -9118,14 +9106,17 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
                     n_blockers++;
                 }
                 break;
-            case GGML_OP_OUT_PROD:
-            case GGML_OP_CONV_3D:
-            case GGML_OP_SOLVE_TRI:
-                // these ops always call a oneMKL routine
-                uses_library = true;
-                break;
             case GGML_OP_FLASH_ATTN_EXT:
-                uses_library = ggml_sycl_flash_attn_ext_uses_library(ctx->device, node);
+                if (ggml_sycl_fattn_sparse_graph_compatible(ctx->device, node)) {
+                    break;
+                }
+                if (ggml_sycl_flash_attn_ext_needs_sync(ctx->device, node)) {
+                    log_graph_blocker(node, "attention host-wait path", nullptr);
+                    n_blockers++;
+                }
+#ifndef GGML_SYCL_GRAPH_DNNL_SUPPORTED
+                uses_library = ggml_sycl_flash_attn_ext_uses_onednn(ctx->device, node);
+#endif
                 break;
             case GGML_OP_MUL_MAT:
                 // We cannot use graphs with ggml_sycl_mul_mat() when SYCL async memory allocation extensions are not available,
@@ -9139,14 +9130,12 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
                         __func__, ggml_op_name(node_op));
                     return false;
                 }
-                uses_library = mul_mat_uses_library_gemm(ctx, node, &why);
+                uses_library = mul_mat_uses_onednn(ctx, node);
                 break;
         }
 
         if (uses_library) {
-            // oneMKL and oneDNN chain the submission on events made before recording started,
-            // which SYCL graphs do not allow.
-            log_graph_blocker(node, "uses oneMKL/oneDNN", why);
+            log_graph_blocker(node, "uses unsupported oneDNN", nullptr);
             n_blockers++;
         }
     }

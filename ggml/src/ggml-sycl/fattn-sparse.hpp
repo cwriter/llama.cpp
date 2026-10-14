@@ -13,6 +13,7 @@ bool ggml_sycl_flash_attn_ext_sparse(ggml_backend_sycl_context & ctx, ggml_tenso
 
 // True when ggml_sycl_flash_attn_ext_sparse() takes this node.
 bool ggml_sycl_fattn_sparse_applies(const ggml_tensor * dst);
+bool ggml_sycl_fattn_sparse_graph_compatible(int device, const ggml_tensor * dst);
 
 // Bytes after dst->data the gathered node uses (its output and kernel scratch), 0 if the path does not apply.
 size_t ggml_sycl_fattn_sparse_alloc_size(const ggml_tensor * dst);
