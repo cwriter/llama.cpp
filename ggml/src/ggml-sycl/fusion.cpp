@@ -601,3 +601,53 @@ bool ggml_sycl_can_fuse_rms_norm_scale(const ggml_cgraph * cgraph, int node_idx)
 
     return true;
 }
+
+int ggml_sycl_match_gate_view(const ggml_cgraph * cgraph, int node_idx) {
+    static const int enabled = ggml_sycl_get_env("GGML_SYCL_FUSE_GATE_VIEW", 1);
+    if (!enabled || !g_ggml_sycl_enable_fusion) {
+        return -1;
+    }
+    const ggml_tensor * node = cgraph->nodes[node_idx];
+    const ggml_tensor * cont = node->op == GGML_OP_UNARY ? node->src[0] : node;
+    if (!cont || cont->op != GGML_OP_CONT || cont->type != GGML_TYPE_F32 ||
+        (cont->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) || !ggml_is_contiguous(cont)) {
+        return -1;
+    }
+    const ggml_tensor * x = cont->src[0];
+    if (!x || x->op != GGML_OP_VIEW || x->type != GGML_TYPE_F32 || x->ne[0] <= 1 ||
+        !ggml_is_contiguous_1(x) || ggml_is_contiguous(x) ||
+        x->nb[1] < (size_t) x->ne[0] * sizeof(float) || x->nb[1] % sizeof(float) != 0 ||
+        ggml_nelements(x) != ggml_nelements(cont) || ggml_nelements(x) >= INT32_MAX) {
+        return -1;
+    }
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, cont);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos) ||
+        cgraph->use_counts[pos] != 1) {
+        return -1;
+    }
+    int unary_idx = node_idx;
+    if (node->op == GGML_OP_CONT) {
+        for (++unary_idx; unary_idx < cgraph->n_nodes; ++unary_idx) {
+            const ggml_tensor * n = cgraph->nodes[unary_idx];
+            if (n->op == GGML_OP_UNARY && n->src[0] == cont) {
+                break;
+            }
+        }
+    }
+    if (unary_idx + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * unary = cgraph->nodes[unary_idx];
+    const ggml_tensor * mul   = cgraph->nodes[unary_idx + 1];
+    if (unary->op != GGML_OP_UNARY || unary->src[0] != cont || mul->op != GGML_OP_MUL ||
+        unary->view_src || mul->view_src ||
+        !ggml_sycl_can_fuse(cgraph, unary_idx, { GGML_OP_UNARY, GGML_OP_MUL }, { ggml_get_unary_op(unary) })) {
+        return -1;
+    }
+    const ggml_tensor * other = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+    if (other == unary || !ggml_is_contiguous(other) || !ggml_are_same_shape(cont, unary) ||
+        !ggml_are_same_shape(unary, mul)) {
+        return -1;
+    }
+    return unary_idx;
+}

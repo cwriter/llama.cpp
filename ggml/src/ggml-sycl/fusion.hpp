@@ -23,4 +23,7 @@ bool ggml_sycl_can_fuse_unary_mul_bcast(const ggml_cgraph * cgraph, int node_idx
 // RMS_NORM at `node_idx` feeding a SCALE that exists only to finish an L2 norm.
 bool ggml_sycl_can_fuse_rms_norm_scale(const ggml_cgraph * cgraph, int node_idx);
 
+// CONT of a strided view feeding UNARY + MUL; returns the unary index, or -1.
+int ggml_sycl_match_gate_view(const ggml_cgraph * cgraph, int node_idx);
+
 #endif  // GGML_SYCL_FUSION_HPP

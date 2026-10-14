@@ -8598,6 +8598,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
+        if (node->op == GGML_OP_CONT && ggml_sycl_match_gate_view(cgraph, i) >= 0) {
+            continue;
+        }
+        if (node->op == GGML_OP_UNARY && ggml_sycl_match_gate_view(cgraph, i) >= 0) {
+            ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1], node->src[0]->src[0]);
+            i++;
+            continue;
+        }
+
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);
         if (nodes_to_skip != 0) {
             i += nodes_to_skip;
@@ -9376,6 +9385,9 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 // every predicate here is purely structural, so it holds for every later execution
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
+    if (cgraph->nodes[node_idx]->op == GGML_OP_CONT && ggml_sycl_match_gate_view(cgraph, node_idx) >= 0) {
+        return 1;
+    }
     // the QSA mask chain, which flash attention reads from the selection list instead
     if (const int n = ggml_sycl_qsa_mask_absorbs(cgraph, node_idx)) {
         return n;
@@ -9397,6 +9409,17 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
 static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
                                              ggml_backend_graph_optimize_params * params) {
     GGML_UNUSED(backend);
+    // The skipped copy input must survive until the fused multiply.
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        if (cgraph->nodes[i]->op != GGML_OP_CONT) {
+            continue;
+        }
+        const int unary_idx = ggml_sycl_match_gate_view(cgraph, i);
+        if (unary_idx >= 0) {
+            ggml_tensor * x = cgraph->nodes[i]->src[0];
+            params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, cgraph->nodes[unary_idx + 1]);
+        }
+    }
     // before ggml-alloc sizes anything: a compact KQ mask is only allowed when every reader is taught
     ggml_sycl_kq_mask_compact_check(cgraph);
     // the tail of a packed KQ mask is lent as scratch for the whole split, so the mask must stay

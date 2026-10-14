@@ -5510,6 +5510,41 @@ struct test_mul_mat : public test_case {
     }
 };
 
+struct test_gate_view : public test_case {
+    const int64_t width, heads, tokens;
+    const int mode;
+
+    test_gate_view(int64_t width, int64_t heads, int64_t tokens, int mode = 0)
+        : width(width), heads(heads), tokens(tokens), mode(mode) {}
+
+    std::string vars() override { return VARS_TO_STR4(width, heads, tokens, mode); }
+    std::string op_desc(ggml_tensor *) override { return "GATE_VIEW"; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * base = ggml_scale(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * width, heads, tokens), 0.75f);
+        ggml_tensor * view = ggml_view_3d(ctx, base, width, heads, tokens, base->nb[1], base->nb[2], width * sizeof(float));
+        ggml_tensor * cont = ggml_cont_2d(ctx, view, width * heads, tokens);
+        ggml_set_name(cont, "gate_cont");
+        if (mode == 2) {
+            ggml_set_output(cont);
+        }
+        ggml_tensor * q = ggml_view_3d(ctx, base, width, heads, tokens, base->nb[1], base->nb[2], 0);
+        q = ggml_cont_2d(ctx, q, width * heads, tokens);
+        ggml_tensor * other = ggml_add(ctx, q, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width * heads, tokens));
+        other = ggml_silu(ctx, other);
+        ggml_tensor * unary = ggml_sigmoid(ctx, cont);
+        ggml_tensor * out = ggml_mul(ctx, other, unary);
+        if (mode == 1) {
+            out = ggml_add(ctx, out, cont);
+        }
+        ggml_set_name(out, "gate_out");
+        return out;
+    }
+};
+
 // n_w mat-vecs over distinct [k, m] weights of one shape, summed into one output. With n_w * the
 // weight size well above the GPU L2, every weight is evicted before the next repetition reads it, so
 // perf measures the mat-vec streaming from VRAM, as in a model; a single-weight case stays cached. The time
@@ -11570,6 +11605,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t tokens : {1, 2, 17, 257}) {
+        test_cases.emplace_back(new test_gate_view(256, 24, tokens));
+    }
+    for (int mode : {0, 1, 2}) {
+        test_cases.emplace_back(new test_gate_view(31, 3, 2, mode));
+    }
+
     // the qwen4exp q8_0 dense shapes {m, k} at decode, and several distinct weights in one graph
     for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144},
                                                         {6143, 2560}, {2559, 6144} }) {
@@ -13279,6 +13321,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], 1));
         test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], n_w));
     }
+    for (int64_t tokens : {1, 2, 17, 257}) {
+        test_cases.emplace_back(new test_gate_view(256, 24, tokens));
+    }
+    for (int mode : {0, 1, 2}) {
+        test_cases.emplace_back(new test_gate_view(31, 3, 2, mode));
+    }
+
     // the qwen4exp f32 MoE router 2560 -> 512, streamed (16 weights, 84 MiB) and cached
     test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_F32, 512, 2560, 1));
     test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_F32, 512, 2560, 16));

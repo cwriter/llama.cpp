@@ -1105,10 +1105,10 @@ void ggml_sycl_op_scale_unary_fused(ggml_backend_sycl_context & ctx, ggml_tensor
     }
 }
 
-void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
+void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node, const ggml_tensor * view) {
     scope_op_debug_print scope_dbg_print(__func__, mul_node, /*num_src=*/2);
 
-    const ggml_tensor * x = unary_node->src[0];
+    const ggml_tensor * x = view ? view : unary_node->src[0];
     const ggml_tensor * g = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
 
     // g is picked by elimination; ggml_can_fuse()'s single-use rule rules out MUL(unary, unary)
@@ -1116,8 +1116,8 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     GGML_ASSERT(x->type == g->type && x->type == mul_node->type);
     // the unary side either matches the MUL column for column, or holds one value per row that
     // the MUL broadcasts; ggml_sycl_can_fuse() accepts nothing else
-    const bool bcast_row = x->ne[0] == 1 && mul_node->ne[0] != 1;
-    GGML_ASSERT(bcast_row || ggml_are_same_shape(x, g));
+    const bool bcast_row = !view && x->ne[0] == 1 && mul_node->ne[0] != 1;
+    GGML_ASSERT(view ? ggml_nelements(x) == ggml_nelements(g) : bcast_row || ggml_are_same_shape(x, g));
     GGML_ASSERT(ggml_are_same_shape(g, mul_node));
     GGML_ASSERT(ggml_is_contiguous_1(x) && ggml_is_contiguous_1(g));
     // dst is indexed flat
@@ -1127,18 +1127,18 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
 
     const int64_t k  = ggml_nelements(mul_node);
-    const int64_t n  = mul_node->ne[0];
+    const int64_t n  = view ? x->ne[0] : mul_node->ne[0];
     const int64_t c0 = bcast_row ? 0 : 1;
 
     const auto dispatch_type = [&](auto op) {
         switch (mul_node->type) {
             case GGML_TYPE_F32:
                 unary_mul_sycl((const float *) x->data, (const float *) g->data, (float *) mul_node->data,
-                               k, n, x->nb[1] / sizeof(float), g->nb[1] / sizeof(float), c0, main_stream, op);
+                               k, n, x->nb[1] / sizeof(float), view ? n : g->nb[1] / sizeof(float), c0, main_stream, op);
                 break;
             case GGML_TYPE_F16:
                 unary_mul_sycl((const sycl::half *) x->data, (const sycl::half *) g->data, (sycl::half *) mul_node->data,
-                               k, n, x->nb[1] / sizeof(sycl::half), g->nb[1] / sizeof(sycl::half), c0, main_stream, op);
+                               k, n, x->nb[1] / sizeof(sycl::half), view ? n : g->nb[1] / sizeof(sycl::half), c0, main_stream, op);
                 break;
             default:
                 GGML_ABORT("fused unary+mul: unsupported type %s", ggml_type_name(mul_node->type));
