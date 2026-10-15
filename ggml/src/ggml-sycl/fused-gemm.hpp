@@ -184,6 +184,10 @@ bool ggml_sycl_grouped_dequant_gemm_dev(ggml_type src0_type, const void * src0_b
                                         int64_t n_tiles_max, int64_t M, int64_t K, int64_t total_rows,
                                         bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
+// Merged gate/up -> SwiGLU -> down, using one routing schedule and bounded tile scratch.
+bool ggml_sycl_mmid_tiled_moe(ggml_backend_sycl_context & ctx, const ggml_tensor * gate_up, const ggml_tensor * gate,
+                               const ggml_tensor * glu, ggml_tensor * down, int tile_batch);
+
 // dst[n*ldd + m] = sum_k a[m*lda + k] * b[n*K + k], split-K for small M*N with long K
 // Returns false when the case is not handled (shape too large or device too small).
 bool ggml_sycl_small_gemm_f32(const float * a, const float * b, float * dst, int64_t M, int64_t N, int64_t K,

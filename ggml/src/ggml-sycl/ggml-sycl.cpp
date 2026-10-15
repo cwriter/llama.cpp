@@ -8687,6 +8687,69 @@ static int ggml_sycl_mul_mat_id_multi_mmvq_fused(ggml_backend_sycl_context & ctx
     return last - node_idx;
 }
 
+static int ggml_sycl_mmid_tiled_moe_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i) {
+    static const int tile_batch = ggml_sycl_get_env("GGML_SYCL_MMID_MOE_TILE", 128);
+    if (!tile_batch || !g_ggml_sycl_enable_fusion || i + 3 >= graph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * up = graph->nodes[i];
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * glu = nullptr;
+    ggml_tensor * down = nullptr;
+    int skip = 0;
+    if (ggml_can_fuse_subgraph(graph, i,
+            { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU, GGML_OP_MUL_MAT_ID }, { i + 3 })) {
+        glu = graph->nodes[i + 2];
+        gate = glu->src[0];
+        up = glu->src[1];
+        down = graph->nodes[i + 3];
+        if (!((gate == graph->nodes[i] && up == graph->nodes[i + 1]) ||
+              (up == graph->nodes[i] && gate == graph->nodes[i + 1]))) {
+            return 0;
+        }
+        skip = 3;
+    } else if (i + 4 < graph->n_nodes && ggml_can_fuse_subgraph(graph, i,
+            { GGML_OP_MUL_MAT_ID, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_GLU, GGML_OP_MUL_MAT_ID }, { i + 4 })) {
+        const auto * gate_view = graph->nodes[i + 1];
+        const auto * up_view = graph->nodes[i + 2];
+        glu = graph->nodes[i + 3];
+        down = graph->nodes[i + 4];
+        if (glu->src[0] != gate_view || glu->src[1] != up_view ||
+            gate_view->view_src != up || up_view->view_src != up || gate_view->view_offs != 0 ||
+            up_view->view_offs != (size_t) glu->ne[0] * sizeof(float) ||
+            !ggml_are_same_shape(gate_view, glu) || !ggml_are_same_shape(up_view, glu) ||
+            gate_view->nb[1] != up->nb[1] || gate_view->nb[2] != up->nb[2] ||
+            up_view->nb[1] != up->nb[1] || up_view->nb[2] != up->nb[2]) {
+            return 0;
+        }
+        skip = 4;
+    } else {
+        return 0;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1)) {
+        return 0;
+    }
+    // The down output is written early and must not overwrite an input needed by a later tile.
+    for (const ggml_tensor * input : { up->src[0], up->src[1], up->src[2], down->src[0], gate ? gate->src[0] : nullptr }) {
+        if (input && (ggml_sycl_tensors_overlap(down, input) || ggml_backend_buffer_is_sycl_split(input->buffer))) {
+            return 0;
+        }
+    }
+    for (const ggml_tensor * op : { up, gate, (const ggml_tensor *) down }) {
+        if (op && ggml_sycl_fused_dequant_gemm_reorder_ok(op->src[0]->type)) {
+            opt_for_reorder_id(&ctx, op->src[0]);
+        }
+    }
+    if (!ggml_sycl_mmid_tiled_moe(ctx, up, gate, glu, down, tile_batch)) {
+        return 0;
+    }
+    static std::atomic<int> trace_left{ getenv("GGML_SYCL_MMID_MOE_TRACE") ? 12 : 0 };
+    if (trace_left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[MMID-MOE] fired tokens=%ld tiles_per_batch=%d\n", (long) up->ne[2], tile_batch);
+    }
+    return skip;
+}
+
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx);
 
 // the fused hc_pre reads the up weight in the reordered Q8_0 layout: reorder it here when the
@@ -8826,6 +8889,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             ggml_sycl_op_unary_mul_fused(*sycl_ctx, node, cgraph->nodes[i + 1], node->src[0]->src[0]);
             i++;
             continue;
+        }
+
+        if (node->op == GGML_OP_MUL_MAT_ID) {
+            const int skip = ggml_sycl_mmid_tiled_moe_fused(*sycl_ctx, cgraph, i);
+            if (skip) {
+                i += skip;
+                continue;
+            }
         }
 
         const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);

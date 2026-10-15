@@ -2081,7 +2081,7 @@ static constexpr int FG_PACK_K = 16;
 // per 64 B instead of once per 8 B. The wide one needs every row 32 B aligned. Same packed values.
 // Slotted layout: the columns of an empty tile are not written by the wide pack. The GEMM returns
 // before it reads them, and only the device schedule has empty tiles (its launch bound).
-template <typename S>
+template <typename S, bool SWIGLU = false>
 static void grouped_gemm_pack_b(const ggml_sycl_gg_rows & y, typename S::tsb * packed, const ggml_sycl_gg_tile * tiles,
                                 int Npad, int K, int total_rows, bool tight, bool wide, dpct::queue_ptr stream) {
     using E                  = typename S::EB;
@@ -2130,6 +2130,16 @@ static void grouped_gemm_pack_b(const ggml_sycl_gg_rows & y, typename S::tsb * p
                     const vec8 * src = (const vec8 *) (row_ptr(row) + kg * FG_PACK_K);
                     lo = src[0];
                     hi = src[1];
+                    if constexpr (SWIGLU) {
+                        const vec8 * up = (const vec8 *) (row_ptr(row) + K + kg * FG_PACK_K);
+                        const vec8 up_lo = up[0];
+                        const vec8 up_hi = up[1];
+#pragma unroll
+                        for (int j = 0; j < FG_PACK_K / 2; ++j) {
+                            lo[j] = (lo[j] / (1.0f + sycl::exp(-lo[j]))) * up_lo[j];
+                            hi[j] = (hi[j] / (1.0f + sycl::exp(-hi[j]))) * up_hi[j];
+                        }
+                    }
                 }
                 tsb * out = packed + ((size_t) kg * (FG_PACK_K / V) * Npad + n) * V;
 #pragma unroll
@@ -2158,7 +2168,11 @@ static void grouped_gemm_pack_b(const ggml_sycl_gg_rows & y, typename S::tsb * p
             const float * src = row_ptr(row) + V * kq;
 #pragma unroll
             for (int v = 0; v < V; ++v) {
-                vals[v] = E::cvt(src[v]);
+                float value = src[v];
+                if constexpr (SWIGLU) {
+                    value = (value / (1.0f + sycl::exp(-value))) * src[K + v];
+                }
+                vals[v] = E::cvt(value);
             }
         }
         tsb * out = packed + ((size_t) kq * Npad + n) * V;
@@ -2820,6 +2834,152 @@ bool ggml_sycl_grouped_dequant_gemm_dev(ggml_type src0_type, const void * src0_b
         }
     });
     return launched;
+}
+
+template <typename S>
+static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * down,
+                              int tile_batch, bool up_reordered, bool down_reordered) {
+    const ggml_tensor * wu = up->src[0];
+    const ggml_tensor * wd = down->src[0];
+    const ggml_tensor * wg = gate ? gate->src[0] : nullptr;
+    const bool gr = wg && static_cast<const ggml_tensor_extra_gpu *>(wg->extra) &&
+                    static_cast<const ggml_tensor_extra_gpu *>(wg->extra)->optimized_feature.is_reordered();
+    const ggml_tensor * x = up->src[1];
+    const ggml_tensor * ids = up->src[2];
+    static const bool fuse_swiglu_pack = ggml_sycl_get_env("GGML_SYCL_MMID_SWIGLU_PACK", 1) != 0;
+    const int K = wu->ne[0], F = wd->ne[0], M = wd->ne[1];
+    const int64_t routes = ids->ne[0] * ids->ne[1];
+    const int64_t n_tiles = ggml_sycl_grouped_gemm_max_tiles(routes, wu->ne[2]);
+    const int batch = std::min<int64_t>(tile_batch, n_tiles);
+    const int rows = batch * S::BN;
+    auto stream = ctx.stream();
+    auto & pool = ctx.pool();
+    ggml_sycl_pool_alloc<mmid_row_mapping> route_map(pool, routes);
+    ggml_sycl_pool_alloc<ggml_sycl_gg_tile> schedule(pool, n_tiles);
+    ggml_sycl_pool_alloc<uint32_t> offsets(pool, wu->ne[2] + 1);
+    ggml_sycl_pool_alloc<mmid_row_mapping> tile_map(pool, rows);
+    ggml_sycl_pool_alloc<ggml_sycl_gg_tile> tiles(pool, batch);
+    ggml_sycl_pool_alloc<mmid_row_mapping> dense_map(pool, rows);
+    ggml_sycl_pool_alloc<float> activation(pool, (size_t) rows * 2 * F);
+    ggml_sycl_pool_alloc<typename S::tsb> packed(pool, (size_t) rows * std::max(K, F));
+    GGML_ASSERT(ggml_sycl_build_mmid_schedule((const int32_t *) ids->data, ids->nb[1], wu->ne[2],
+                    ids->ne[0], ids->ne[1], n_tiles, route_map.get(), schedule.get(), offsets.get(), stream));
+    auto * map = tile_map.get();
+    auto * tt = tiles.get();
+    auto * dense = dense_map.get();
+    auto * act = activation.get();
+    const auto * full_map = route_map.get();
+    const auto * full_tiles = schedule.get();
+    const ggml_sycl_gg_rows input = { (char *) x->data, map, x->ne[1], x->nb[1], x->nb[2] };
+    const ggml_sycl_gg_rows output = { (char *) down->data, map, down->ne[1], down->nb[1], down->nb[2] };
+    const ggml_sycl_gg_rows local = { (char *) act, nullptr, 1, (size_t) 2 * F * sizeof(float), 0 };
+    const fg_arms ua = fg_pick_arms(up_reordered), da = fg_pick_arms(down_reordered);
+    const fg_arms ga = fg_pick_arms(gr);
+    const int gm = fg_is_tuned<S>() ? ga.mrows : S::SG_ROWS;
+    const int um = fg_is_tuned<S>() ? ua.mrows : S::SG_ROWS;
+    const int dm = fg_is_tuned<S>() ? da.mrows : S::SG_ROWS;
+    for (int64_t first = 0; first < n_tiles; first += batch) {
+        const int count = std::min<int64_t>(batch, n_tiles - first);
+        stream->parallel_for(sycl::range<1>((size_t) count * S::BN), [=](sycl::id<1> id) {
+            const int row = id[0], t = row / S::BN, col = row % S::BN;
+            const auto src = full_tiles[first + t];
+            if (col == 0) {
+                tt[t] = { src.expert, t * S::BN, t * S::BN + src.n1 - src.n0 };
+            }
+            dense[row] = { 0, row };
+            map[row] = col < src.n1 - src.n0 ? full_map[src.n0 + col] : mmid_row_mapping{0, 0};
+        });
+        grouped_gemm_pack_b<S>(input, packed.get(), tt, rows, K, rows, false,
+                               grouped_gemm_pack_b_wide_ok(input.base, input.nb1, input.nb2, K), stream);
+        const int up_m = gate ? F : 2 * F;
+        const ggml_sycl_gg_rows up_rows = { (char *) (act + F), dense, 1, 0, (size_t) 2 * F * sizeof(float) };
+        const grouped_gemm_launcher<S> up_launch{ (const char *) wu->data, wu->nb[2], tt, packed.get(), act,
+                up_m, rows, K, false, gate ? up_rows : ggml_sycl_gg_rows{}, ua, count, (up_m + um - 1) / um, stream };
+        GGML_ASSERT(fg_visit_type(wu->type, up_reordered, [&](auto tag) {
+            using T = decltype(tag);
+            up_launch.template run<typename T::type, T::reordered>();
+        }));
+        if (gate) {
+            const ggml_sycl_gg_rows gate_rows = { (char *) act, dense, 1, 0, (size_t) 2 * F * sizeof(float) };
+            const grouped_gemm_launcher<S> gate_launch{ (const char *) wg->data, wg->nb[2], tt, packed.get(), nullptr,
+                    F, rows, K, false, gate_rows, ga, count, (F + gm - 1) / gm, stream };
+            GGML_ASSERT(fg_visit_type(wg->type, gr, [&](auto tag) {
+                using T = decltype(tag);
+                gate_launch.template run<typename T::type, T::reordered>();
+            }));
+        }
+        if (fuse_swiglu_pack) {
+            grouped_gemm_pack_b<S, true>(local, packed.get(), tt, rows, F, rows, false,
+                                        grouped_gemm_pack_b_wide_ok(local.base, local.nb1, local.nb2, F), stream);
+        } else {
+            stream->parallel_for(sycl::range<1>((size_t) count * S::BN * F), [=](sycl::id<1> id) {
+                const size_t row = id[0] / F, f = id[0] % F;
+                const auto tile = tt[row / S::BN];
+                if (row < (size_t) tile.n1) {
+                    float * a = act + row * 2 * F;
+                    const float gate = a[f];
+                    a[f] = (gate / (1.0f + sycl::exp(-gate))) * a[F + f];
+                }
+            });
+            grouped_gemm_pack_b<S>(local, packed.get(), tt, rows, F, rows, false,
+                                   grouped_gemm_pack_b_wide_ok(local.base, local.nb1, local.nb2, F), stream);
+        }
+        const grouped_gemm_launcher<S> down_launch{ (const char *) wd->data, wd->nb[2], tt, packed.get(), nullptr,
+                M, rows, F, false, output, da, count, (M + dm - 1) / dm, stream };
+        GGML_ASSERT(fg_visit_type(wd->type, down_reordered, [&](auto tag) {
+            using T = decltype(tag);
+            down_launch.template run<typename T::type, T::reordered>();
+        }));
+    }
+}
+
+bool ggml_sycl_mmid_tiled_moe(ggml_backend_sycl_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
+                               const ggml_tensor * glu, ggml_tensor * down, int tile_batch) {
+    const ggml_tensor * wu = up->src[0];
+    const ggml_tensor * wd = down->src[0];
+    const ggml_tensor * x = up->src[1];
+    const ggml_tensor * ids = up->src[2];
+    if (tile_batch <= 0 || tile_batch > 4096 || x->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        glu->type != GGML_TYPE_F32 || down->type != GGML_TYPE_F32 || ids->nb[0] != sizeof(int32_t) ||
+        x->ne[2] < 32 || x->ne[3] != 1 || !ggml_is_contiguous(x) || !ggml_is_contiguous(up) ||
+        !ggml_is_contiguous(glu) || !ggml_is_contiguous(down) || !ggml_is_contiguous(wu) || !ggml_is_contiguous(wd) ||
+        wu->ne[1] != (gate ? 1 : 2) * wd->ne[0] || wu->ne[2] != wd->ne[2] || wu->ne[3] != 1 || wd->ne[3] != 1 ||
+        ids != down->src[2] || down->src[1] != glu || wu->ne[0] != x->ne[0] ||
+        x->ne[1] != 1 || up->ne[1] != ids->ne[0] || up->ne[2] != ids->ne[1] ||
+        down->ne[0] != wd->ne[1] || down->ne[1] != ids->ne[0] || down->ne[2] != ids->ne[1]) {
+        return false;
+    }
+    const auto reordered = [](const ggml_tensor * w) {
+        const auto * e = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
+        return e && e->optimized_feature.is_reordered();
+    };
+    const bool ur = reordered(wu), dr = reordered(wd);
+    const int64_t routes = ids->ne[0] * ids->ne[1];
+    for (const ggml_tensor * op : { up, gate, (const ggml_tensor *) down }) {
+        if (!op) {
+            continue;
+        }
+        const auto * w = op->src[0];
+        if (!ggml_is_contiguous(w) ||
+            !ggml_sycl_grouped_dequant_gemm_dev_ok(w->type, w->ne[1], w->ne[0], routes, w->ne[2],
+                                                   reordered(w), ggml_sycl_src1_prec(op), ctx.stream())) {
+            return false;
+        }
+    }
+    const int combo = fg_pick_combo(ctx.stream(), GGML_TYPE_F32, ggml_sycl_src1_prec(up), GGML_SYCL_FG_BN);
+    if (combo != fg_pick_combo(ctx.stream(), GGML_TYPE_F32, ggml_sycl_src1_prec(down), GGML_SYCL_FG_BN) ||
+        (gate && (gate->src[1] != x || gate->src[2] != ids || !ggml_are_same_shape(gate, up) ||
+            !ggml_are_same_shape(gate->src[0], wu) ||
+            combo != fg_pick_combo(ctx.stream(), GGML_TYPE_F32, ggml_sycl_src1_prec(gate), GGML_SYCL_FG_BN)))) {
+        return false;
+    }
+    fg_visit_combo(combo, [&](auto s) {
+        using S = decltype(s);
+        if constexpr (S::BN == GGML_SYCL_FG_BN) {
+            fg_tiled_moe_run<S>(ctx, up, gate, down, tile_batch, ur, dr);
+        }
+    });
+    return true;
 }
 
 // split-K f32 GEMM for small M*N and long K: a work-item owns one output and one K slice,
