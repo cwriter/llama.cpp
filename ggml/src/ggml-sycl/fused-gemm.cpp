@@ -2836,7 +2836,7 @@ bool ggml_sycl_grouped_dequant_gemm_dev(ggml_type src0_type, const void * src0_b
     return launched;
 }
 
-template <typename T, bool REORDERED, bool GRF256>
+template <typename T, bool REORDERED, bool GRF256, bool REUSE_C>
 struct fg_gate_up_pack_kernel {
     using S = fg_tuned_combo;
     const char * gate;
@@ -2874,7 +2874,7 @@ struct fg_gate_up_pack_kernel {
                 (const T *) (gate + (size_t) tile.expert * expert_stride),
                 (const T *) (up + (size_t) tile.expert * expert_stride),
             };
-            const uint32_t * grid = fg_stage_grid_slm<T, true, 2 * CF, 0>(tile_c, item);
+            const uint32_t * grid = fg_stage_grid_slm<T, true, (REUSE_C ? CF : 2 * CF), 0>(tile_c, item);
             mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, S::TM, S::TN> acc[2][MT][S::NT];
 #pragma unroll
             for (int q = 0; q < 2; ++q) {
@@ -2947,33 +2947,72 @@ struct fg_gate_up_pack_kernel {
                 if (mt > 0) {
                     sycl::group_barrier(item.get_group());
                 }
+                constexpr int OUTPUTS = S::TM * S::BN / S::WG_SIZE;
+                float gates[REUSE_C ? OUTPUTS : 1];
 #pragma unroll
                 for (int q = 0; q < 2; ++q) {
+                    if constexpr (REUSE_C) {
+                        if (q > 0) {
+                            // All gate reads must finish before the up store reuses tile_c.
+                            sycl::group_barrier(item.get_group());
+                        }
+                    }
 #pragma unroll
                     for (int nt = 0; nt < S::NT; ++nt) {
                         mx::joint_matrix_store(sg, acc[q][mt][nt],
-                            tile_c.template get_multi_ptr<sycl::access::decorated::no>() + q * CF +
+                            tile_c.template get_multi_ptr<sycl::access::decorated::no>() + (REUSE_C ? 0 : q * CF) +
                             split * S::TM * S::BN + nt * S::TN, S::BN, mx::layout::row_major);
                     }
+                    if constexpr (REUSE_C) {
+                        sycl::group_barrier(item.get_group());
+                        if (q == 0) {
+#pragma unroll
+                            for (int j = 0; j < OUTPUTS; ++j) {
+                                const int idx = item.get_local_linear_id() + j * S::WG_SIZE;
+                                const int r = idx / S::BN;
+                                const int c = idx % S::BN;
+                                float g = 0.0f;
+#pragma unroll
+                                for (int k = 0; k < FG_KSPLIT; ++k) {
+                                    g += tile_c[k * S::TM * S::BN + r * S::BN + c];
+                                }
+                                gates[j] = g;
+                            }
+                        }
+                    }
                 }
-                sycl::group_barrier(item.get_group());
-                for (int idx = item.get_local_linear_id(); idx < S::TM * S::BN; idx += S::WG_SIZE) {
+                if constexpr (!REUSE_C) {
+                    sycl::group_barrier(item.get_group());
+                }
+                auto store = [&](const int idx, float g) {
                     const int r = idx / S::BN;
                     const int c = idx % S::BN;
                     const int m = m0 + mt * S::TM + r;
                     if (m < F) {
                         float value = 0.0f;
                         if (c < tile.n1 - tile.n0) {
-                            float g = 0.0f, u = 0.0f;
+                            float u = 0.0f;
 #pragma unroll
-                            for (int s = 0; s < FG_KSPLIT; ++s) {
-                                g += tile_c[s * S::TM * S::BN + r * S::BN + c];
-                                u += tile_c[CF + s * S::TM * S::BN + r * S::BN + c];
+                            for (int k = 0; k < FG_KSPLIT; ++k) {
+                                if constexpr (!REUSE_C) {
+                                    g += tile_c[k * S::TM * S::BN + r * S::BN + c];
+                                }
+                                u += tile_c[(REUSE_C ? 0 : CF) + k * S::TM * S::BN + r * S::BN + c];
                             }
                             value = (g / (1.0f + sycl::exp(-g))) * u;
                         }
                         output[((size_t) (m / S::VNNI) * Npad + t * S::BN + c) * S::VNNI + m % S::VNNI] =
                             S::EB::cvt(value);
+                    }
+                };
+                if constexpr (REUSE_C) {
+#pragma unroll
+                    for (int j = 0; j < OUTPUTS; ++j) {
+                        store(item.get_local_linear_id() + j * S::WG_SIZE, gates[j]);
+                    }
+                } else {
+                    for (int idx = item.get_local_linear_id(); idx < S::TM * S::BN; idx += S::WG_SIZE) {
+                        store(idx, 0.0f);
                     }
                 }
             }
@@ -2989,7 +3028,7 @@ struct fg_gate_up_pack_kernel {
     }
 };
 
-template <typename T, bool REORDERED, bool GRF256>
+template <typename T, bool REORDERED, bool GRF256, bool REUSE_C = false>
 static void fg_gate_up_pack_launch(const ggml_tensor * wu, const ggml_tensor * wg, const ggml_sycl_gg_tile * tiles,
                                     const fg_tuned_combo::tsb * input, fg_tuned_combo::tsb * output,
                                     int F, int K, int Npad, int count, dpct::queue_ptr stream) {
@@ -2997,10 +3036,10 @@ static void fg_gate_up_pack_launch(const ggml_tensor * wu, const ggml_tensor * w
     if constexpr (fg_listed<S::SG>()) {
         stream->submit([&](sycl::handler & cgh) {
             sycl::local_accessor<S::tsa, 1> a(2 * fg_a_image<S::SG_ROWS>(), cgh);
-            sycl::local_accessor<float, 1> c(2 * fg_tile_c_floats<S, true>() + fg_grid_traits<T>::dwords, cgh);
+            sycl::local_accessor<float, 1> c((REUSE_C ? 1 : 2) * fg_tile_c_floats<S, true>() + fg_grid_traits<T>::dwords, cgh);
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(count, ((F + S::SG_ROWS - 1) / S::SG_ROWS) * S::WG_SIZE),
                                               sycl::range<2>(1, S::WG_SIZE)),
-                fg_gate_up_pack_kernel<T, REORDERED, GRF256>{ (const char *) (wg ? wg : wu)->data,
+                fg_gate_up_pack_kernel<T, REORDERED, GRF256, REUSE_C>{ (const char *) (wg ? wg : wu)->data,
                     (const char *) wu->data, wu->nb[2], tiles, input, output, F, K, Npad, wg == nullptr, a, c });
         });
     }
@@ -3009,9 +3048,12 @@ static void fg_gate_up_pack_launch(const ggml_tensor * wu, const ggml_tensor * w
 static bool fg_gate_up_pack(const ggml_tensor * wu, const ggml_tensor * wg, bool reordered, bool grf256,
                              const ggml_sycl_gg_tile * tiles, const fg_tuned_combo::tsb * input,
                              fg_tuned_combo::tsb * output, int F, int K, int Npad, int count, dpct::queue_ptr stream) {
+    static const bool reuse_c = ggml_sycl_get_env("GGML_SYCL_MMID_GATE_UP_REDUCE_REUSE", 1) != 0;
     auto launch = [&](auto tag) {
         using T = decltype(tag);
-        if (grf256) {
+        if (grf256 && reuse_c) {
+            fg_gate_up_pack_launch<typename T::type, T::reordered, true, true>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
+        } else if (grf256) {
             fg_gate_up_pack_launch<typename T::type, T::reordered, true>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
         } else {
             fg_gate_up_pack_launch<typename T::type, T::reordered, false>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
