@@ -2836,6 +2836,195 @@ bool ggml_sycl_grouped_dequant_gemm_dev(ggml_type src0_type, const void * src0_b
     return launched;
 }
 
+template <typename T, bool REORDERED, bool GRF256>
+struct fg_gate_up_pack_kernel {
+    using S = fg_tuned_combo;
+    const char * gate;
+    const char * up;
+    size_t expert_stride;
+    const ggml_sycl_gg_tile * tiles;
+    const S::tsb * input;
+    S::tsb * output;
+    int F;
+    int K;
+    int Npad;
+    bool merged;
+    sycl::local_accessor<S::tsa, 1> tile_a;
+    sycl::local_accessor<float, 1> tile_c;
+
+    [[sycl::reqd_sub_group_size(S::SG)]]
+    void operator()(sycl::nd_item<2> item) const {
+        if constexpr (fg_built<S::SG>()) {
+            constexpr int MT = S::SG_ROWS / S::TM;
+            constexpr int CF = fg_tile_c_floats<S, true>();
+            constexpr int AI = fg_a_image<S::SG_ROWS>();
+            const int t = item.get_group(0);
+            const auto tile = tiles[t];
+            if (tile.n1 <= tile.n0) {
+                return;
+            }
+            const auto sg = item.get_sub_group();
+            const int split = sg.get_group_id()[0];
+            const int lane = sg.get_local_id()[0];
+            const int m0 = item.get_group(1) * S::SG_ROWS;
+            const int row = m0 + lane;
+            const int blocks = K / fg_block_traits<T>::qk;
+            const int nblocks = (merged ? 2 * F : F) * blocks;
+            const T * weights[2] = {
+                (const T *) (gate + (size_t) tile.expert * expert_stride),
+                (const T *) (up + (size_t) tile.expert * expert_stride),
+            };
+            const uint32_t * grid = fg_stage_grid_slm<T, true, 2 * CF, 0>(tile_c, item);
+            mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, S::TM, S::TN> acc[2][MT][S::NT];
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+#pragma unroll
+                for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+                    for (int nt = 0; nt < S::NT; ++nt) {
+                        mx::joint_matrix_fill(sg, acc[q][mt][nt], 0.0f);
+                    }
+                }
+            }
+            const auto bptr = sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                       sycl::access::decorated::no>(input);
+            const int steps = K / FG_BK;
+            for (int kb = split * steps / FG_KSPLIT; kb < (split + 1) * steps / FG_KSPLIT; ++kb) {
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    typename S::EA::pair values[FG_BK / 2];
+                    const int wr = (row < F ? row : 0) + (merged && q == 1 ? F : 0);
+                    if (row < F) {
+                        if constexpr (REORDERED) {
+                            fg_reorder_stage_grid<typename S::EA, T>((const uint8_t *) weights[q], wr * blocks,
+                                                                     nblocks, kb, values, grid);
+                        } else {
+                            fg_stage_a_grid<typename S::EA, T>(weights[q] + (size_t) wr * blocks, kb, values, grid);
+                        }
+                    } else {
+#pragma unroll
+                        for (int j = 0; j < FG_BK / 2; ++j) {
+                            values[j] = S::EA::make(0.0f, 0.0f);
+                        }
+                    }
+                    auto * a = (typename S::EA::pair *) &tile_a[q * AI + split * S::SG_ROWS * FG_BK +
+                                                                               fg_a_row_off<S, true>(lane)];
+#pragma unroll
+                    for (int kt = 0; kt < FG_BK / S::TK; ++kt) {
+#pragma unroll
+                        for (int j = 0; j < S::TK / 2; ++j) {
+                            a[kt * (S::TM * S::TK / 2) + j] = values[kt * (S::TK / 2) + j];
+                        }
+                    }
+                }
+                sycl::group_barrier(sg);
+#pragma unroll
+                for (int kt = 0; kt < FG_BK / S::TK; ++kt) {
+                    mx::joint_matrix<sycl::sub_group, S::tb, mx::use::b, S::TK, S::TN, S::b_layout> b[S::NT];
+#pragma unroll
+                    for (int nt = 0; nt < S::NT; ++nt) {
+                        mx::joint_matrix_load(sg, b[nt], bptr + (size_t) ((kb * FG_BK + kt * S::TK) / S::VNNI) *
+                            Npad * S::VNNI + (t * S::BN + nt * S::TN) * S::VNNI, Npad * S::VNNI);
+                    }
+#pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+#pragma unroll
+                        for (int mt = 0; mt < MT; ++mt) {
+                            mx::joint_matrix<sycl::sub_group, S::ta, mx::use::a, S::TM, S::TK, mx::layout::row_major> a;
+                            mx::joint_matrix_load(sg, a, tile_a.template get_multi_ptr<sycl::access::decorated::no>() +
+                                q * AI + split * S::SG_ROWS * FG_BK + fg_a_tile_off<S, true>(mt, kt), S::TK);
+#pragma unroll
+                            for (int nt = 0; nt < S::NT; ++nt) {
+                                mx::joint_matrix_mad(sg, acc[q][mt][nt], a, b[nt], acc[q][mt][nt]);
+                            }
+                        }
+                    }
+                }
+                sycl::group_barrier(sg);
+            }
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                if (mt > 0) {
+                    sycl::group_barrier(item.get_group());
+                }
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+#pragma unroll
+                    for (int nt = 0; nt < S::NT; ++nt) {
+                        mx::joint_matrix_store(sg, acc[q][mt][nt],
+                            tile_c.template get_multi_ptr<sycl::access::decorated::no>() + q * CF +
+                            split * S::TM * S::BN + nt * S::TN, S::BN, mx::layout::row_major);
+                    }
+                }
+                sycl::group_barrier(item.get_group());
+                for (int idx = item.get_local_linear_id(); idx < S::TM * S::BN; idx += S::WG_SIZE) {
+                    const int r = idx / S::BN;
+                    const int c = idx % S::BN;
+                    const int m = m0 + mt * S::TM + r;
+                    if (m < F) {
+                        float value = 0.0f;
+                        if (c < tile.n1 - tile.n0) {
+                            float g = 0.0f, u = 0.0f;
+#pragma unroll
+                            for (int s = 0; s < FG_KSPLIT; ++s) {
+                                g += tile_c[s * S::TM * S::BN + r * S::BN + c];
+                                u += tile_c[CF + s * S::TM * S::BN + r * S::BN + c];
+                            }
+                            value = (g / (1.0f + sycl::exp(-g))) * u;
+                        }
+                        output[((size_t) (m / S::VNNI) * Npad + t * S::BN + c) * S::VNNI + m % S::VNNI] =
+                            S::EB::cvt(value);
+                    }
+                }
+            }
+        }
+    }
+
+    auto get(syclexp::properties_tag) const {
+        if constexpr (GRF256) {
+            return syclexp::properties{ sycl::ext::intel::experimental::grf_size<256> };
+        } else {
+            return syclexp::properties{};
+        }
+    }
+};
+
+template <typename T, bool REORDERED, bool GRF256>
+static void fg_gate_up_pack_launch(const ggml_tensor * wu, const ggml_tensor * wg, const ggml_sycl_gg_tile * tiles,
+                                    const fg_tuned_combo::tsb * input, fg_tuned_combo::tsb * output,
+                                    int F, int K, int Npad, int count, dpct::queue_ptr stream) {
+    using S = fg_tuned_combo;
+    if constexpr (fg_listed<S::SG>()) {
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<S::tsa, 1> a(2 * fg_a_image<S::SG_ROWS>(), cgh);
+            sycl::local_accessor<float, 1> c(2 * fg_tile_c_floats<S, true>() + fg_grid_traits<T>::dwords, cgh);
+            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(count, ((F + S::SG_ROWS - 1) / S::SG_ROWS) * S::WG_SIZE),
+                                              sycl::range<2>(1, S::WG_SIZE)),
+                fg_gate_up_pack_kernel<T, REORDERED, GRF256>{ (const char *) (wg ? wg : wu)->data,
+                    (const char *) wu->data, wu->nb[2], tiles, input, output, F, K, Npad, wg == nullptr, a, c });
+        });
+    }
+}
+
+static bool fg_gate_up_pack(const ggml_tensor * wu, const ggml_tensor * wg, bool reordered, bool grf256,
+                             const ggml_sycl_gg_tile * tiles, const fg_tuned_combo::tsb * input,
+                             fg_tuned_combo::tsb * output, int F, int K, int Npad, int count, dpct::queue_ptr stream) {
+    auto launch = [&](auto tag) {
+        using T = decltype(tag);
+        if (grf256) {
+            fg_gate_up_pack_launch<typename T::type, T::reordered, true>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
+        } else {
+            fg_gate_up_pack_launch<typename T::type, T::reordered, false>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
+        }
+    };
+    switch (wu->type) {
+        case GGML_TYPE_IQ3_S: return fg_visit_layout<block_iq3_s>(reordered, launch);
+        case GGML_TYPE_Q8_0:  return fg_visit_layout<block_q8_0>(reordered, launch);
+        case GGML_TYPE_Q4_K:  return fg_visit_layout<block_q4_K>(reordered, launch);
+        default:             return false;
+    }
+}
+
 template <typename S>
 static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * down,
                               int tile_batch, bool up_reordered, bool down_reordered) {
@@ -2878,6 +3067,16 @@ static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor 
     const int gm = fg_is_tuned<S>() ? ga.mrows : S::SG_ROWS;
     const int um = fg_is_tuned<S>() ? ua.mrows : S::SG_ROWS;
     const int dm = fg_is_tuned<S>() ? da.mrows : S::SG_ROWS;
+    static const int gate_up_mode = ggml_sycl_get_env("GGML_SYCL_MMID_GATE_UP_PACK", 2);
+    const bool paired = fg_is_tuned<S>() && (gate_up_mode == 1 || gate_up_mode == 2) &&
+        (wu->type == GGML_TYPE_IQ3_S || wu->type == GGML_TYPE_Q8_0 || wu->type == GGML_TYPE_Q4_K) &&
+        (!gate || (wg->type == wu->type && gr == up_reordered));
+    static std::atomic<int> trace_left{ getenv("GGML_SYCL_MMID_MOE_TRACE") ? 6 : 0 };
+    if (paired && trace_left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[MMID-GATE-UP-PACK] fired type=%s merged=%d grf256=%d\n",
+                ggml_type_name(wu->type), gate == nullptr, gate_up_mode == 2);
+    }
+    auto * down_packed = paired ? (typename S::tsb *) act : packed.get();
     for (int64_t first = 0; first < n_tiles; first += batch) {
         const int count = std::min<int64_t>(batch, n_tiles - first);
         stream->parallel_for(sycl::range<1>((size_t) count * S::BN), [=](sycl::id<1> id) {
@@ -2891,40 +3090,47 @@ static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor 
         });
         grouped_gemm_pack_b<S>(input, packed.get(), tt, rows, K, rows, false,
                                grouped_gemm_pack_b_wide_ok(input.base, input.nb1, input.nb2, K), stream);
-        const int up_m = gate ? F : 2 * F;
-        const ggml_sycl_gg_rows up_rows = { (char *) (act + F), dense, 1, 0, (size_t) 2 * F * sizeof(float) };
-        const grouped_gemm_launcher<S> up_launch{ (const char *) wu->data, wu->nb[2], tt, packed.get(), act,
-                up_m, rows, K, false, gate ? up_rows : ggml_sycl_gg_rows{}, ua, count, (up_m + um - 1) / um, stream };
-        GGML_ASSERT(fg_visit_type(wu->type, up_reordered, [&](auto tag) {
-            using T = decltype(tag);
-            up_launch.template run<typename T::type, T::reordered>();
-        }));
-        if (gate) {
-            const ggml_sycl_gg_rows gate_rows = { (char *) act, dense, 1, 0, (size_t) 2 * F * sizeof(float) };
-            const grouped_gemm_launcher<S> gate_launch{ (const char *) wg->data, wg->nb[2], tt, packed.get(), nullptr,
-                    F, rows, K, false, gate_rows, ga, count, (F + gm - 1) / gm, stream };
-            GGML_ASSERT(fg_visit_type(wg->type, gr, [&](auto tag) {
-                using T = decltype(tag);
-                gate_launch.template run<typename T::type, T::reordered>();
-            }));
-        }
-        if (fuse_swiglu_pack) {
-            grouped_gemm_pack_b<S, true>(local, packed.get(), tt, rows, F, rows, false,
-                                        grouped_gemm_pack_b_wide_ok(local.base, local.nb1, local.nb2, F), stream);
+        if (paired) {
+            if constexpr (fg_is_tuned<S>()) {
+                GGML_ASSERT(fg_gate_up_pack(wu, wg, up_reordered, gate_up_mode == 2, tt, packed.get(),
+                                             down_packed, F, K, rows, count, stream));
+            }
         } else {
-            stream->parallel_for(sycl::range<1>((size_t) count * S::BN * F), [=](sycl::id<1> id) {
-                const size_t row = id[0] / F, f = id[0] % F;
-                const auto tile = tt[row / S::BN];
-                if (row < (size_t) tile.n1) {
-                    float * a = act + row * 2 * F;
-                    const float gate = a[f];
-                    a[f] = (gate / (1.0f + sycl::exp(-gate))) * a[F + f];
-                }
-            });
-            grouped_gemm_pack_b<S>(local, packed.get(), tt, rows, F, rows, false,
-                                   grouped_gemm_pack_b_wide_ok(local.base, local.nb1, local.nb2, F), stream);
+            const int up_m = gate ? F : 2 * F;
+            const ggml_sycl_gg_rows up_rows = { (char *) (act + F), dense, 1, 0, (size_t) 2 * F * sizeof(float) };
+            const grouped_gemm_launcher<S> up_launch{ (const char *) wu->data, wu->nb[2], tt, packed.get(), act,
+                    up_m, rows, K, false, gate ? up_rows : ggml_sycl_gg_rows{}, ua, count, (up_m + um - 1) / um, stream };
+            GGML_ASSERT(fg_visit_type(wu->type, up_reordered, [&](auto tag) {
+                using T = decltype(tag);
+                up_launch.template run<typename T::type, T::reordered>();
+            }));
+            if (gate) {
+                const ggml_sycl_gg_rows gate_rows = { (char *) act, dense, 1, 0, (size_t) 2 * F * sizeof(float) };
+                const grouped_gemm_launcher<S> gate_launch{ (const char *) wg->data, wg->nb[2], tt, packed.get(), nullptr,
+                        F, rows, K, false, gate_rows, ga, count, (F + gm - 1) / gm, stream };
+                GGML_ASSERT(fg_visit_type(wg->type, gr, [&](auto tag) {
+                    using T = decltype(tag);
+                    gate_launch.template run<typename T::type, T::reordered>();
+                }));
+            }
+            if (fuse_swiglu_pack) {
+                grouped_gemm_pack_b<S, true>(local, packed.get(), tt, rows, F, rows, false,
+                                            grouped_gemm_pack_b_wide_ok(local.base, local.nb1, local.nb2, F), stream);
+            } else {
+                stream->parallel_for(sycl::range<1>((size_t) count * S::BN * F), [=](sycl::id<1> id) {
+                    const size_t row = id[0] / F, f = id[0] % F;
+                    const auto tile = tt[row / S::BN];
+                    if (row < (size_t) tile.n1) {
+                        float * a = act + row * 2 * F;
+                        const float gate = a[f];
+                        a[f] = (gate / (1.0f + sycl::exp(-gate))) * a[F + f];
+                    }
+                });
+                grouped_gemm_pack_b<S>(local, packed.get(), tt, rows, F, rows, false,
+                                       grouped_gemm_pack_b_wide_ok(local.base, local.nb1, local.nb2, F), stream);
+            }
         }
-        const grouped_gemm_launcher<S> down_launch{ (const char *) wd->data, wd->nb[2], tt, packed.get(), nullptr,
+        const grouped_gemm_launcher<S> down_launch{ (const char *) wd->data, wd->nb[2], tt, down_packed, nullptr,
                 M, rows, F, false, output, da, count, (M + dm - 1) / dm, stream };
         GGML_ASSERT(fg_visit_type(wd->type, down_reordered, [&](auto tag) {
             using T = decltype(tag);
