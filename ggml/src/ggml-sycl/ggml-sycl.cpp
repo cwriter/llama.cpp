@@ -1882,11 +1882,42 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
     GGML_UNUSED(buft);
 }
 
+static bool ggml_sycl_indexer_compact_on() {
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_INDEXER_COMPACT", 0) != 0;
+    return enabled;
+}
+
+struct ggml_sycl_indexer_workspace {
+    size_t scores = 0;
+    size_t selected = 0;
+    size_t size = 0;
+};
+
+static ggml_sycl_indexer_workspace ggml_sycl_indexer_workspace_size(const ggml_tensor * top) {
+    static const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", 0);
+    const ggml_tensor * score = top->src[0];
+    if (!ggml_sycl_indexer_compact_on() || !g_ggml_sycl_enable_fusion || tile < 8 || tile > 4096 ||
+        top->op != GGML_OP_TOP_K || top->type != GGML_TYPE_I32 || !ggml_is_contiguous(top) ||
+        !score || score->op != GGML_OP_LIGHTNING_INDEXER || score->type != GGML_TYPE_F32 ||
+        (score->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(score) ||
+        score->ne[0] <= 0 || score->ne[0] >= 65536 || score->ne[1] <= 0 || score->ne[2] != 1 || score->ne[3] != 1) {
+        return {};
+    }
+    const size_t bytes = ggml_nbytes(top);
+    const size_t scores = (size_t) score->ne[0] * std::min<int64_t>(tile + 7, score->ne[1]) * sizeof(float);
+    if (bytes > (SIZE_MAX - scores - 255) / 2) {
+        return {};
+    }
+    const size_t offset = (bytes + 255) & ~size_t(255);
+    return { offset, offset + scores, offset + scores + bytes };
+}
+
 static size_t ggml_backend_sycl_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     // Reserve the additional scratch so it's visible to the graph allocator
     size_t size = tensor->op == GGML_OP_FLASH_ATTN_EXT
         ? ggml_sycl_flash_attn_ext_get_alloc_size(tensor)
         : ggml_nbytes(tensor);
+    size = std::max(size, ggml_sycl_indexer_workspace_size(tensor).size);
     int64_t ne0 = tensor->ne[0];
 
     if (ggml_is_quantized(tensor->type)) {
@@ -8167,6 +8198,161 @@ static bool ggml_sycl_tensors_overlap(const ggml_tensor * a, const ggml_tensor *
     return ab != nullptr && bb != nullptr && ab < bb + ggml_nbytes(b) && bb < ab + ggml_nbytes(a);
 }
 
+static bool ggml_sycl_match_indexer_topk(const ggml_cgraph * graph, int i,
+                                         ggml_tensor * & view_out, ggml_tensor * & selected_scores_out) {
+    static const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", 0);
+    // Keep compact allocation eligibility stable for the worst-case reservation.
+    auto * score = graph->nodes[i];
+    if (tile < 8 || tile > 4096 || !g_ggml_sycl_enable_fusion || i + 1 >= graph->n_nodes ||
+        score->op != GGML_OP_LIGHTNING_INDEXER || score->type != GGML_TYPE_F32 ||
+        (score->flags & GGML_TENSOR_FLAG_OUTPUT) || !ggml_is_contiguous(score) ||
+        (score->ne[1] <= tile && !ggml_sycl_indexer_compact_on()) || score->ne[2] != 1 || score->ne[3] != 1 || score->ne[0] >= 65536) {
+        return false;
+    }
+    auto * top = graph->nodes[i + 1];
+    const auto * q = score->src[0];
+    const auto * k = score->src[1];
+    const auto * w = score->src[2];
+    const auto * m = score->src[3];
+    if (top->op != GGML_OP_TOP_K || top->src[0] != score || top->type != GGML_TYPE_I32 ||
+        !ggml_is_contiguous(top) || top->ne[1] != score->ne[1] || top->ne[2] != 1 || top->ne[3] != 1 || q->ne[3] != 1 || k->ne[3] != 1 ||
+        q->ne[2] != score->ne[1] || k->ne[2] != score->ne[0] ||
+        w->ne[1] != score->ne[1] || w->ne[2] != 1 || w->ne[3] != 1 ||
+        m->ne[1] < score->ne[1] || m->ne[2] != 1 || m->ne[3] != 1) {
+        return false;
+    }
+    ggml_tensor * view = nullptr;
+    ggml_tensor * selected_scores = nullptr;
+    for (int j = i + 1; j < graph->n_nodes; ++j) {
+        auto * node = graph->nodes[j];
+        for (const auto * src : node->src) {
+            if (src != score || node == top) {
+                continue;
+            }
+            if (view || node->op != GGML_OP_RESHAPE || node->src[0] != score ||
+                (node->flags & GGML_TENSOR_FLAG_OUTPUT) || node->ne[0] != 1 ||
+                node->ne[1] != score->ne[0] || node->ne[2] != score->ne[1] || node->ne[3] != 1) {
+                return false;
+            }
+            view = node;
+        }
+    }
+    if (view) {
+        for (int j = i + 2; j < graph->n_nodes; ++j) {
+            auto * node = graph->nodes[j];
+            for (const auto * src : node->src) {
+                if (src != view) {
+                    continue;
+                }
+                if (selected_scores || node->op != GGML_OP_GET_ROWS || node->src[0] != view || node->src[1] != top ||
+                    node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) ||
+                    ggml_nelements(node) != ggml_nelements(top)) {
+                    return false;
+                }
+                selected_scores = node;
+            }
+        }
+        if (!selected_scores) {
+            return false;
+        }
+    }
+    if (ggml_sycl_indexer_compact_on() ? !ggml_sycl_indexer_workspace_size(top).size
+        : ggml_nbytes(score) < ggml_nbytes(top) * (selected_scores ? 2 : 1)) {
+        return false;
+    }
+    if (selected_scores) {
+        for (int j = i + 2; j < graph->n_nodes && graph->nodes[j] != selected_scores; ++j) {
+            if (graph->nodes[j]->op == GGML_OP_LIGHTNING_INDEXER) {
+                return false;
+            }
+        }
+    }
+    view_out = view;
+    selected_scores_out = selected_scores;
+    return true;
+}
+
+
+static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i,
+                                        ggml_tensor * & selected_scores_out) {
+    ggml_tensor * view = nullptr;
+    ggml_tensor * selected_scores = nullptr;
+    if (!ggml_sycl_match_indexer_topk(graph, i, view, selected_scores)) {
+        return false;
+    }
+    auto * score = graph->nodes[i];
+    auto * top = graph->nodes[i + 1];
+    const auto * q = score->src[0];
+    const auto * k = score->src[1];
+    const auto * w = score->src[2];
+    const auto * m = score->src[3];
+    const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", 0);
+    const auto workspace = ggml_sycl_indexer_workspace_size(top);
+    void * staging = score->data ? score->data : top->data;
+    GGML_ASSERT(staging);
+    if (score->data) {
+        if (ggml_nbytes(score) < ggml_nbytes(top) * (selected_scores ? 2 : 1) ||
+            ggml_sycl_tensors_overlap(score, top)) {
+            return false;
+        }
+        for (const ggml_tensor * input : { q, k, w, m }) {
+            if (ggml_sycl_tensors_overlap(score, input)) {
+                return false;
+            }
+        }
+    }
+    ggml_sycl_pool_alloc<float> scores;
+    float * values = nullptr;
+    float * selected = nullptr;
+    if (score->data) {
+        values = scores.alloc(ctx.pool(), (size_t) score->ne[0] * std::min<int64_t>(tile + 7, score->ne[1]));
+        selected = (float *) ((char *) staging + ggml_nbytes(top));
+    } else {
+        GGML_ASSERT(workspace.size);
+        values = (float *) ((char *) top->data + workspace.scores);
+        selected = (float *) ((char *) top->data + workspace.selected);
+    }
+    for (int64_t first = 0; first < score->ne[1];) {
+        // Keep short tails on the same XMX path as the full query batch.
+        const int64_t count = score->ne[1] - first <= tile + 7 ? score->ne[1] - first : tile;
+        ggml_tensor qt = *q, wt = *w, mt = *m, st = *score, tk = *top;
+        qt.data = (char *) q->data + first * q->nb[2];
+        qt.ne[2] = count;
+        wt.data = (char *) w->data + first * w->nb[1];
+        wt.ne[1] = count;
+        mt.data = (char *) m->data + first * m->nb[1];
+        mt.ne[1] = count;
+        st.data = values;
+        st.ne[1] = count;
+        st.nb[2] = st.nb[3] = st.nb[1] * count;
+        st.src[0] = &qt;
+        st.src[2] = &wt;
+        st.src[3] = &mt;
+        tk.data = (char *) staging + first * top->nb[1];
+        tk.ne[1] = count;
+        tk.src[0] = &st;
+        ggml_sycl_op_lightning_indexer(ctx, &st);
+        ggml_sycl_op_top_k(ctx, &tk);
+        if (selected_scores) {
+            const auto * indices = (const int32_t *) tk.data;
+            auto * selected_tile = selected + first * top->ne[0];
+            const int64_t width = score->ne[0], n_top = top->ne[0];
+            ctx.stream()->parallel_for(sycl::range<1>((size_t) count * n_top), [=](sycl::id<1> id) {
+                const size_t row = id[0] / n_top;
+                selected_tile[id[0]] = values[row * width + indices[id[0]]];
+            });
+        }
+        first += count;
+    }
+    selected_scores_out = selected_scores;
+    static std::atomic<int> trace_left{ getenv("GGML_SYCL_INDEXER_QUERY_TRACE") ? 12 : 0 };
+    if (trace_left.fetch_sub(1) > 0) {
+        fprintf(stderr, "[INDEXER-TILE] fired queries=%ld pools=%ld tile=%d selected_scores=%d\n",
+                (long) score->ne[1], (long) score->ne[0], tile, selected_scores != nullptr);
+    }
+    return true;
+}
+
 // GGML_SYCL_MV_FUSE_TRACE=N is the line budget of each trace below; unset or 0 means silent.
 static int ggml_sycl_mv_fuse_trace_budget() {
     const char * env = getenv("GGML_SYCL_MV_FUSE_TRACE");
@@ -8558,6 +8744,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         ~trace_last() { if (on) f(); }
     } trace_flush{ trace, [&] { trace_node(nullptr); } };
 
+    ggml_tensor * indexer_top = nullptr;
+    void * indexer_data = nullptr;
+    void * indexer_selected_data = nullptr;
+    ggml_tensor * indexer_selected = nullptr;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (trace) {
@@ -8566,10 +8757,33 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (census) {
             ggml_sycl_census_visit(census, i);
         }
+        if (node == indexer_top) {
+            if (node->data != indexer_data) {
+                sycl_ctx->stream()->memcpy(node->data, indexer_data, ggml_nbytes(node));
+            }
+            indexer_top = nullptr;
+            continue;
+        }
+        if (node == indexer_selected) {
+            if (node->data && (node->flags & GGML_TENSOR_FLAG_COMPUTE) && !ggml_sycl_qsa_mask_absorbs(cgraph, i)) {
+                sycl_ctx->stream()->memcpy(node->data, indexer_selected_data, ggml_nbytes(node));
+            }
+            indexer_selected = nullptr;
+            continue;
+        }
         if (ggml_sycl_is_view_or_noop(node)) {
             continue;
         }
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        if (node->op == GGML_OP_LIGHTNING_INDEXER && !indexer_selected &&
+            ggml_sycl_indexer_topk_tiled(*sycl_ctx, cgraph, i, indexer_selected)) {
+            indexer_top = cgraph->nodes[i + 1];
+            indexer_data = node->data ? node->data : indexer_top->data;
+            indexer_selected_data = node->data ? (char *) node->data + ggml_nbytes(indexer_top)
+                : (char *) indexer_top->data + ggml_sycl_indexer_workspace_size(indexer_top).selected;
             continue;
         }
 
@@ -9374,6 +9588,21 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 // every predicate here is purely structural, so it holds for every later execution
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
+    if (ggml_sycl_indexer_compact_on()) {
+        ggml_tensor * view = nullptr;
+        ggml_tensor * selected = nullptr;
+        const auto * node = cgraph->nodes[node_idx];
+        if (node->op == GGML_OP_LIGHTNING_INDEXER && ggml_sycl_match_indexer_topk(cgraph, node_idx, view, selected)) {
+            return 1;
+        }
+        if (node->op == GGML_OP_RESHAPE && node->view_src && node->view_src->op == GGML_OP_LIGHTNING_INDEXER) {
+            for (int i = 0; i < node_idx; ++i) {
+                if (cgraph->nodes[i] == node->view_src && ggml_sycl_match_indexer_topk(cgraph, i, view, selected) && view == node) {
+                    return 1;
+                }
+            }
+        }
+    }
     if (cgraph->nodes[node_idx]->op == GGML_OP_CONT && ggml_sycl_match_gate_view(cgraph, node_idx) >= 0) {
         return 1;
     }
