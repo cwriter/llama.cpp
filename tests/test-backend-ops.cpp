@@ -8004,6 +8004,8 @@ struct test_qsa_sparse_fa : public test_case {
 
     double max_nmse_err() override { return 5e-4; }
     bool run_whole_graph() override { return true; }
+    // the chain is what a backend fuses, so time all of it
+    bool perf_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
 
     // the model's cells used: the rest of the cache is empty and hidden from every token
@@ -13254,7 +13256,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
     // qwen4exp QSA attention chain: dense mask + flash attention, or the SYCL gather mode
-    for (int64_t n_kv : { 8192, 32768, 131072 }) {
+    for (int64_t n_kv : { 2304, 8192, 32768, 131072 }) {
         for (int64_t n_tps : { 1, 1024 }) {
             test_cases.emplace_back(new test_qsa_sparse_fa(n_kv, n_tps, 1, 2051, GGML_TYPE_Q8_0));
         }

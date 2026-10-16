@@ -1,4 +1,5 @@
 #include "fattn-qsa.hpp"
+#include "fattn-qsa-decode.hpp"
 #include "fattn.hpp"
 #include "kq-mask-bits.hpp"
 #include "kv-soa.hpp"
@@ -653,6 +654,11 @@ void ggml_sycl_qsa_sparse_fa(ggml_backend_sycl_context & ctx, ggml_tensor * fa, 
     GGML_ASSERT(mask->data && idx->data);
 
     SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+
+    // decode and short batches read the listed cells straight from the cache (fattn-qsa-decode.cpp)
+    if (ggml_sycl_qsa_decode_fa(ctx, fa, mask, idx)) {
+        return;
+    }
 
     int kind = QSA_KV_F16;
     const bool take = qsa_union_applicable(fa, kind);
