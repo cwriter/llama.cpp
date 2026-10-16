@@ -20,6 +20,10 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
 // Purely structural, so ggml_backend_sycl_fusion_absorbs() can ask it at allocation time.
 bool ggml_sycl_can_fuse_unary_mul_bcast(const ggml_cgraph * cgraph, int node_idx);
 
+// true if a node in (from, to) writes into the storage of t: its base, or an in-place op or view write onto that base.
+// Lifetime deps keep a tensor allocated, not unchanged, so a fusion that reads t later than the graph does must ask this.
+bool ggml_sycl_written_between(const ggml_cgraph * cgraph, const ggml_tensor * t, int from, int to);
+
 // RMS_NORM at `node_idx` feeding a SCALE that exists only to finish an L2 norm.
 bool ggml_sycl_can_fuse_rms_norm_scale(const ggml_cgraph * cgraph, int node_idx);
 

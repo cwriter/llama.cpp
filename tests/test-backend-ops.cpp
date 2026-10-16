@@ -5633,6 +5633,63 @@ struct test_mul_mat_q8_f32_rows : public test_case {
     }
 };
 
+// Valid graphs a backend fusion must leave alone: 2 a gated rms norm whose gate ran earlier in place, 3 GDN q/k norms
+// with a zero scale, 4 raw q overwritten in place after its norm and before the gated delta net. (Hoisting a mat-vec
+// past its computed weight happens in graph_optimize, which only the scheduler runs, so it cannot be checked here.)
+struct test_fusion_guard : public test_case {
+    const int mode;
+
+    test_fusion_guard(int mode) : mode(mode) {}
+
+    std::string vars() override { return VARS_TO_STR1(mode); }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "FUSION_GUARD"; }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (mode == 2) {
+            auto * zw   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 64);
+            auto * zx   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+            auto * gate = ggml_sigmoid_inplace(ctx, ggml_mul_mat(ctx, zw, zx));
+            ggml_build_forward_expand(gf, gate);
+            auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, 4);
+            auto * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 64);
+            return ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), gate);
+        }
+        const int64_t S = 64, H = 4;
+        auto * qr    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+        auto * kr    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+        auto * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, 1, 1);
+        auto * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+        auto * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, 1, 1);
+        auto * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, S, H, 1);
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+        const float scale = mode == 3 ? 0.0f : 1.0f / sqrtf((float) S);
+        auto * q = ggml_scale(ctx, ggml_rms_norm(ctx, qr, 1e-6f / S), scale);
+        if (mode == 4) {
+            ggml_build_forward_expand(gf, q);
+            ggml_build_forward_expand(gf, ggml_scale_inplace(ctx, qr, 0.0f));
+        }
+        auto * k = ggml_scale(ctx, ggml_rms_norm(ctx, kr, 1e-6f / S), scale);
+        // only the attention output: the state it also returns does not depend on q and would hide a wrong one
+        ggml_tensor * out = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+        return ggml_cont(ctx, ggml_view_1d(ctx, out, S * H, 0));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_mul_mat_siblings : public test_case {
     const int64_t k, ma, mb, tokens;
     const int pairs;
@@ -11708,6 +11765,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_siblings(2560, 321, 257, 2));
     // hc_down + hc_inject at decode, odd sizes, the longest row the rows kernel takes, and a batch (not fused)
     test_cases.emplace_back(new test_mul_mat_q8_f32_rows(10240, 320, 4));
+    for (int mode = 2; mode <= 4; ++mode) {
+        test_cases.emplace_back(new test_fusion_guard(mode));
+    }
     test_cases.emplace_back(new test_mul_mat_q8_f32_rows(4096, 33, 1));
     test_cases.emplace_back(new test_mul_mat_q8_f32_rows(6144, 257, 8));
     test_cases.emplace_back(new test_mul_mat_q8_f32_rows(10240, 320, 4, 3));

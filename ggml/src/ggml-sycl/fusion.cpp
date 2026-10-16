@@ -653,6 +653,21 @@ int ggml_sycl_match_gate_view(const ggml_cgraph * cgraph, int node_idx) {
     return unary_idx;
 }
 
+bool ggml_sycl_written_between(const ggml_cgraph * cgraph, const ggml_tensor * t, int from, int to) {
+    const ggml_tensor * tb = t->view_src ? t->view_src : t;
+    for (int n = std::max(from + 1, 0); n < to && n < cgraph->n_nodes; ++n) {
+        const ggml_tensor * c = cgraph->nodes[n];
+        if (ggml_is_empty(c) || c->op == GGML_OP_RESHAPE || c->op == GGML_OP_VIEW || c->op == GGML_OP_PERMUTE ||
+            c->op == GGML_OP_TRANSPOSE || c->op == GGML_OP_NONE) {
+            continue;
+        }
+        if (c == tb || c->view_src == tb) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // RMS_NORM + SCALE at norm_idx whose scale output is read only by gdn as q (src 0) or k (src 1)
 static bool ggml_sycl_is_gdn_l2_norm(const ggml_cgraph * cgraph, int norm_idx, const ggml_tensor * gdn, int src) {
     if (norm_idx < 0 || !ggml_sycl_can_fuse_rms_norm_scale(cgraph, norm_idx)) {
@@ -686,6 +701,12 @@ bool ggml_sycl_match_gdn_qk_norm(const ggml_cgraph * cgraph, int gdn_idx, ggml_s
     if (!ggml_sycl_is_gdn_l2_norm(cgraph, norm_idx[0], gdn, 0) || !ggml_sycl_is_gdn_l2_norm(cgraph, norm_idx[1], gdn, 1)) {
         return false;
     }
+    // the net reads raw q/k at its own node, so nothing may write them after their norms ran
+    for (int s = 0; s < 2; ++s) {
+        if (ggml_sycl_written_between(cgraph, cgraph->nodes[norm_idx[s]]->src[0], norm_idx[s], gdn_idx)) {
+            return false;
+        }
+    }
     const ggml_tensor * nq = cgraph->nodes[norm_idx[0]];
     const ggml_tensor * nk = cgraph->nodes[norm_idx[1]];
     const ggml_tensor * sq = cgraph->nodes[norm_idx[0] + 1];
@@ -694,6 +715,11 @@ bool ggml_sycl_match_gdn_qk_norm(const ggml_cgraph * cgraph, int gdn_idx, ggml_s
     if (memcmp(nq->op_params, nk->op_params, sizeof(float)) != 0 || memcmp(sq->op_params, sk->op_params, sizeof(float)) != 0 ||
         !ggml_are_same_stride(nq->src[0], nk->src[0])) {
         return false;
+    }
+    float scale = 0.0f;
+    memcpy(&scale, sq->op_params, sizeof(float));
+    if (scale == 0.0f) {
+        return false; // the kernel takes a zero scale to mean no norm
     }
     if (out) {
         out->gdn = gdn;
@@ -772,13 +798,24 @@ bool ggml_sycl_match_rms_norm_gate(const ggml_cgraph * cgraph, int node_idx, ggm
     if (!r.out) {
         return false;
     }
-    // the kernel reads the gate input when it runs: a graph input, or a mat-vec (which no fusion skips) before it
+    // the kernel reads the gate input when it runs: a graph input, or a mat-vec (which no fusion skips) before it.
+    // An in-place gate that ran earlier has already overwritten that input with its result.
     const ggml_tensor * g  = r.gate->src[0];
     const ggml_tensor * gb = g->view_src ? g->view_src : g;
+    if (r.gate->view_src) {
+        return false;
+    }
+    int g_idx = -1;
     for (int j = 0; j < cgraph->n_nodes; ++j) {
-        if (cgraph->nodes[j] == gb && (j > node_idx || gb->op != GGML_OP_MUL_MAT)) {
-            return false;
+        if (cgraph->nodes[j] == gb) {
+            if (j > node_idx || gb->op != GGML_OP_MUL_MAT) {
+                return false;
+            }
+            g_idx = j;
         }
+    }
+    if (ggml_sycl_written_between(cgraph, g, g_idx, node_idx)) {
+        return false;
     }
     m = r;
     return true;

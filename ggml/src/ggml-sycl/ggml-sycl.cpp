@@ -9834,6 +9834,23 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
     return 0;
 }
 
+// node j can move right behind node i only if no node in between computes or writes any of its sources
+// (a computed weight as much as the activation)
+static bool ggml_sycl_can_hoist(const ggml_cgraph * cgraph, int i, int j) {
+    const ggml_tensor * moved = cgraph->nodes[j];
+    for (int s = 0; s < GGML_MAX_SRC && moved->src[s]; ++s) {
+        if (ggml_sycl_written_between(cgraph, moved->src[s], i, j)) {
+            return false;
+        }
+        for (int n = i + 1; n < j; ++n) {
+            if (cgraph->nodes[n] == moved->src[s]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 // The MoE reduction reads the mul's operands at the node where the add chain ends, so those
 // tensors have to outlive their last use as the graph sees it. Without this ggml-alloc is free
 // to hand their memory to something in between and the fusion would read its own output.
@@ -9845,7 +9862,6 @@ static void ggml_sycl_hoist_q8_siblings(ggml_cgraph * cgraph) {
     if (!mode || !g_ggml_sycl_enable_fusion) {
         return;
     }
-    auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
     auto feeds_glu = [&](int idx) {
         for (int n = idx + 1; n < cgraph->n_nodes; ++n) {
             const ggml_tensor * c = cgraph->nodes[n];
@@ -9867,17 +9883,13 @@ static void ggml_sycl_hoist_q8_siblings(ggml_cgraph * cgraph) {
         }
         const ggml_tensor * act = a->src[1];
         int j = -1;
-        bool written = false;
         for (int n = i + 1; n < cgraph->n_nodes && n <= i + 96; ++n) {
-            const ggml_tensor * c = cgraph->nodes[n];
-            if (q8_mv(c, act)) {
+            if (q8_mv(cgraph->nodes[n], act)) {
                 j = n;
                 break;
             }
-            // a node that writes into the activation in between pins the order
-            written = written || (!ggml_sycl_is_view_or_noop(c) && base(c) == base(act));
         }
-        if (j < 0 || written || feeds_glu(i) || feeds_glu(j)) {
+        if (j < 0 || !ggml_sycl_can_hoist(cgraph, i, j) || feeds_glu(i) || feeds_glu(j)) {
             continue;
         }
         std::rotate(cgraph->nodes + i + 1, cgraph->nodes + j, cgraph->nodes + j + 1);
@@ -9892,7 +9904,6 @@ static void ggml_sycl_hoist_q8_f32_rows(ggml_cgraph * cgraph) {
     if (!on || !g_ggml_sycl_enable_fusion) {
         return;
     }
-    auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
     auto f32_rows = [](const ggml_tensor * n, const ggml_tensor * act) {
         return n->op == GGML_OP_MUL_MAT && n->src[1] == act && n->src[0]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32 &&
                n->src[0]->ne[1] <= 8 && n->src[0]->ne[2] == 1 && n->src[0]->ne[3] == 1 && n->src[0]->ne[0] == act->ne[0];
@@ -9905,16 +9916,13 @@ static void ggml_sycl_hoist_q8_f32_rows(ggml_cgraph * cgraph) {
         }
         const ggml_tensor * act = a->src[1];
         int j = -1;
-        bool written = false;
         for (int n = i + 1; n < cgraph->n_nodes && n <= i + 64; ++n) {
-            const ggml_tensor * c = cgraph->nodes[n];
-            if (f32_rows(c, act)) {
+            if (f32_rows(cgraph->nodes[n], act)) {
                 j = n;
                 break;
             }
-            written = written || (!ggml_sycl_is_view_or_noop(c) && base(c) == base(act));
         }
-        if (j < 0 || written) {
+        if (j < 0 || !ggml_sycl_can_hoist(cgraph, i, j)) {
             continue;
         }
         std::rotate(cgraph->nodes + i + 1, cgraph->nodes + j, cgraph->nodes + j + 1);
