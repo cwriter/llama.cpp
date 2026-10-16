@@ -32,6 +32,16 @@ bool ggml_sycl_gdn_qk_norm_now(const ggml_tensor * gdn);
 // RMS_NORM at `node_idx` that a matched gated delta net norms itself; returns that net's index, or -1
 int ggml_sycl_gdn_qk_norm_reader(const ggml_cgraph * cgraph, int node_idx);
 
+// RMS_NORM at `node_idx` * a row weight * sigmoid or silu of a gate (build_norm_gated), in one kernel
+struct ggml_sycl_norm_gate_match {
+    const ggml_tensor * rms   = nullptr;
+    const ggml_tensor * mul_w = nullptr;
+    const ggml_tensor * gate  = nullptr; // the UNARY
+    const ggml_tensor * out   = nullptr; // the final MUL
+    int                 last_idx = -1;
+};
+bool ggml_sycl_match_rms_norm_gate(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_norm_gate_match & m);
+
 // CONT of a strided view feeding UNARY + MUL; returns the unary index, or -1.
 int ggml_sycl_match_gate_view(const ggml_cgraph * cgraph, int node_idx);
 

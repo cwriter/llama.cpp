@@ -694,6 +694,46 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
 // dst = rms_norm(x) * s + b, written straight to the SCALE output. The GDN q/k L2 norm is
 // built as ggml_scale(ggml_rms_norm(...)), so this pair is two launches per norm per layer.
+// rms_norm(x) * w * gate(g) for rows of ncols, one sub-group per row, so no barrier; gate is sigmoid or silu
+void ggml_sycl_op_rms_norm_gate_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul_w,
+                                      const ggml_tensor * gate, ggml_tensor * out) {
+    scope_op_debug_print scope_dbg_print(__func__, out, /*num_src=*/2);
+    const ggml_tensor * xt = rms->src[0];
+    const float * x  = (const float *) xt->data;
+    const float * w  = (const float *) (mul_w->src[0] == rms ? mul_w->src[1] : mul_w->src[0])->data;
+    const float * g  = (const float *) gate->src[0]->data;
+    float *       dst = (float *) out->data;
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const bool    sigmoid = ggml_get_unary_op(gate) == GGML_UNARY_OP_SIGMOID;
+    const int     ncols   = (int) xt->ne[0];
+    const int64_t nrows   = ggml_nrows(xt);
+    constexpr int rows_per_wg = 4;
+    const int64_t n_wg = (nrows + rows_per_wg - 1) / rows_per_wg;
+    ctx.stream()->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(n_wg * rows_per_wg * WARP_SIZE), sycl::range<1>(rows_per_wg * WARP_SIZE)),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+            const auto    sg   = it.get_sub_group();
+            const int64_t row  = it.get_group(0) * rows_per_wg + sg.get_group_linear_id();
+            const int     lane = sg.get_local_linear_id();
+            if (row >= nrows) {
+                return;
+            }
+            const float * xr = x + row * ncols;
+            float ss = 0.0f;
+            for (int c = lane; c < ncols; c += WARP_SIZE) {
+                ss += xr[c] * xr[c];
+            }
+            ss = sycl::reduce_over_group(sg, ss, sycl::plus<float>());
+            const float scale = sycl::rsqrt(ss / ncols + eps);
+            for (int c = lane; c < ncols; c += WARP_SIZE) {
+                const float gv = g[row * ncols + c];
+                const float sg_v = 1.0f / (1.0f + sycl::native::exp(-gv));
+                dst[row * ncols + c] = scale * xr[c] * w[c] * (sigmoid ? sg_v : gv * sg_v);
+            }
+        });
+}
+
 void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context & ctx, ggml_tensor * norm_node,
                                        ggml_tensor * scale_node) {
     scope_op_debug_print scope_dbg_print(__func__, scale_node, /*num_src=*/1);

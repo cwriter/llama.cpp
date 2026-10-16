@@ -21,6 +21,10 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context& ctx, ggml_tensor* dst);
 
 void ggml_sycl_op_rms_norm_fused(ggml_backend_sycl_context& ctx, ggml_tensor* dst, ggml_tensor* mul);
 
+// fused RMS_NORM * weight * sigmoid or silu gate; see ggml_sycl_match_rms_norm_gate()
+void ggml_sycl_op_rms_norm_gate_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul_w,
+                                      const ggml_tensor * gate, ggml_tensor * out);
+
 // fused RMS_NORM + SCALE; see ggml_sycl_can_fuse_rms_norm_scale() for the accepted shapes
 void ggml_sycl_op_rms_norm_scale_fused(ggml_backend_sycl_context& ctx, ggml_tensor* norm_node, ggml_tensor* scale_node);
 

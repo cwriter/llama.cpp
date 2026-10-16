@@ -723,3 +723,63 @@ int ggml_sycl_gdn_qk_norm_reader(const ggml_cgraph * cgraph, int node_idx) {
     }
     return -1;
 }
+
+
+bool ggml_sycl_match_rms_norm_gate(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_norm_gate_match & m) {
+    static const int enabled = ggml_sycl_get_env("GGML_SYCL_FUSE_NORM_GATE", 1);
+    if (!enabled || !g_ggml_sycl_enable_fusion) {
+        return false;
+    }
+    const ggml_tensor * rms = cgraph->nodes[node_idx];
+    if (rms->op != GGML_OP_RMS_NORM || rms->type != GGML_TYPE_F32 || rms->src[0]->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(rms->src[0]) || (rms->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, node_idx) != 1) {
+        return false;
+    }
+    auto is_gate = [&](const ggml_tensor * u) {
+        return u->op == GGML_OP_UNARY && (ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(u) == GGML_UNARY_OP_SILU) &&
+               u->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(u->src[0]) && ggml_are_same_shape(u->src[0], rms);
+    };
+    ggml_sycl_norm_gate_match r;
+    r.rms = rms;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && j <= node_idx + 8 && r.out == nullptr; ++j) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE ||
+            t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE) {
+            continue;
+        }
+        const bool once = !(t->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, j) == 1;
+        if (!r.mul_w) {
+            if (t->op != GGML_OP_MUL || t->src[0] != rms || t->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(t->src[1]) ||
+                ggml_nelements(t->src[1]) != rms->ne[0] || !once) {
+                return false;
+            }
+            r.mul_w = t;
+        } else if (!r.gate && is_gate(t) && once) {
+            r.gate = t;
+        } else if (t->op == GGML_OP_MUL && ggml_is_contiguous(t) && (t->src[0] == r.mul_w || t->src[1] == r.mul_w)) {
+            // the gate may also have run earlier: then it stays as it is and the kernel reads its input
+            const ggml_tensor * u = t->src[0] == r.mul_w ? t->src[1] : t->src[0];
+            if ((r.gate && u != r.gate) || (!r.gate && !is_gate(u))) {
+                return false;
+            }
+            r.gate     = u;
+            r.out      = t;
+            r.last_idx = j;
+        } else {
+            return false;
+        }
+    }
+    if (!r.out) {
+        return false;
+    }
+    // the kernel reads the gate input when it runs: a graph input, or a mat-vec (which no fusion skips) before it
+    const ggml_tensor * g  = r.gate->src[0];
+    const ggml_tensor * gb = g->view_src ? g->view_src : g;
+    for (int j = 0; j < cgraph->n_nodes; ++j) {
+        if (cgraph->nodes[j] == gb && (j > node_idx || gb->op != GGML_OP_MUL_MAT)) {
+            return false;
+        }
+    }
+    m = r;
+    return true;
+}

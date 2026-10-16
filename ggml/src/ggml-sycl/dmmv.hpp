@@ -40,6 +40,13 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
     size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
     ggml_glu_op glu_op, dpct::queue_ptr stream);
 
+bool ggml_sycl_q8_0_siblings_esimd(const void * va, const void * vb, const float * y, float * oa, float * ob,
+                                   int64_t k, int64_t ma, int64_t mb, int mode, dpct::queue_ptr stream);
+
+// a reordered Q8_0 mat-vec (rows<16, 2>, K >= 4096) plus up to 8 f32 rows of the same activation, one token, one launch
+bool ggml_sycl_q8_0_f32_rows_esimd(const void * vx, const float * wf, const float * y, float * dst, float * dstf,
+                                   int64_t ncols, int64_t nrows, int64_t nrows_f, dpct::queue_ptr stream);
+
 // SWIGLU(gate, up) of two reordered Q8_0 mat-vecs for one token on ESIMD (GGML_SYCL_Q8_0_GLU_ESIMD); false if not taken
 bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y, float * dst, int64_t ncols,
                               int64_t nrows, dpct::queue_ptr stream);

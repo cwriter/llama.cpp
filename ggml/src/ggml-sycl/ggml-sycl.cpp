@@ -8422,6 +8422,115 @@ static void ggml_sycl_mv_fuse_trace_miss(const ggml_cgraph * cgraph, int node_id
     }
 }
 
+// a reordered Q8_0 mat-vec with K >= 4096 and the f32 mat-vec of at most 8 rows right behind it that reads the same
+// activation (qwen4exp: hc_*_down and hc_*_inject, see ggml_sycl_hoist_q8_f32_rows), one token, in one launch
+static bool ggml_sycl_q8_f32_rows_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i) {
+    static const int on = ggml_sycl_get_env("GGML_SYCL_Q8_0_F32_ROWS", 0);
+    if (!on || !g_ggml_sycl_enable_fusion || !g_ggml_sycl_enable_esimd || !g_ggml_sycl_q8_0_mmv_shapes ||
+        !ggml_sycl_supports_reorder_esimd(GGML_TYPE_Q8_0) || g_ggml_sycl_prioritize_dmmv || i + 1 >= graph->n_nodes) {
+        return false;
+    }
+    ggml_tensor * a = graph->nodes[i];
+    ggml_tensor * b = graph->nodes[i + 1];
+    const ggml_tensor * act = a->src[1];
+    if (b->op != GGML_OP_MUL_MAT || !(b->flags & GGML_TENSOR_FLAG_COMPUTE) || b->src[1] != act ||
+        act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || act->ne[1] != 1 || act->ne[2] != 1 || act->ne[3] != 1) {
+        return false;
+    }
+    const ggml_tensor * wa = a->src[0];
+    const ggml_tensor * wb = b->src[0];
+    if (wa->type != GGML_TYPE_Q8_0 || ggml_backend_buffer_is_sycl_split(wa->buffer) || !ggml_is_contiguous(wa) ||
+        wa->ne[2] != 1 || wa->ne[3] != 1 || wa->ne[0] != act->ne[0] || !can_use_dequantize_mul_mat_vec(wa, act, a) ||
+        wb->type != GGML_TYPE_F32 || ggml_backend_buffer_is_sycl_split(wb->buffer) || !ggml_is_contiguous(wb) ||
+        wb->ne[0] != act->ne[0] || wb->ne[1] > 8 || wb->ne[2] != 1 || wb->ne[3] != 1 ||
+        a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) ||
+        ggml_sycl_tensors_overlap(a, b) || ggml_sycl_tensors_overlap(b, act) || ggml_sycl_tensors_overlap(a, act)) {
+        return false;
+    }
+    opt_for_reorder(&ctx, a->src[0], act, a, mul_mat_algo::DMMV);
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(wa->extra);
+    if (!extra || !extra->optimized_feature.is_reordered()) {
+        return false;
+    }
+    scope_op_debug_print scope_dbg_print(__func__, b, /*num_src=*/2);
+    return ggml_sycl_q8_0_f32_rows_esimd(wa->data, (const float *) wb->data, (const float *) act->data, (float *) a->data,
+                                         (float *) b->data, act->ne[0], wa->ne[1], wb->ne[1], ctx.stream());
+}
+
+static ggml_tensor * ggml_sycl_q8_sibling_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i) {
+    static const int mode = ggml_sycl_get_env("GGML_SYCL_Q8_0_SIBLINGS", 1);
+    if ((mode != 1 && mode != 2) || !g_ggml_sycl_enable_fusion || !g_ggml_sycl_enable_esimd ||
+        !g_ggml_sycl_q8_0_mmv_shapes || !ggml_sycl_supports_reorder_esimd(GGML_TYPE_Q8_0) ||
+        g_ggml_sycl_prioritize_dmmv) {
+        return nullptr;
+    }
+    auto * first = graph->nodes[i];
+    const auto * act = first->src[1];
+    if (act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || act->ne[1] != 1 || act->ne[2] != 1 ||
+        act->ne[3] != 1 || act->ne[0] < 2048 || act->ne[0] >= 4096 || act->ne[0] % QK8_0) {
+        return nullptr;
+    }
+    auto eligible = [&](ggml_tensor * node) {
+        if (node->op != GGML_OP_MUL_MAT || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+            node->src[1] != act || node->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(node) || node->ne[1] != 1 || node->ne[2] != 1 || node->ne[3] != 1) {
+            return false;
+        }
+        const auto * w = node->src[0];
+        return w->type == GGML_TYPE_Q8_0 && !ggml_backend_buffer_is_sycl_split(w->buffer) &&
+            ggml_is_contiguous(w) && w->ne[0] == act->ne[0] && w->ne[1] == node->ne[0] &&
+            w->ne[1] > 0 && w->ne[1] <= INT32_MAX - 3 && w->ne[2] == 1 && w->ne[3] == 1 &&
+            can_use_dequantize_mul_mat_vec(w, act, node);
+    };
+    if (!eligible(first)) { return nullptr; }
+    for (int j = i + 1; j < graph->n_nodes && j <= i + 96; ++j) {
+        auto * second = graph->nodes[j];
+        if (!eligible(second)) { continue; }
+        // Do not bypass the existing gate/up/GLU fusion.
+        bool safe = true;
+        for (int n = j + 1; n < graph->n_nodes && safe; ++n) {
+            auto * consumer = graph->nodes[n];
+            if (consumer->op == GGML_OP_GLU && (consumer->src[0] == second || consumer->src[1] == second)) {
+                safe = false;
+            }
+        }
+        ggml_tensor * pair[] = {first, second};
+        for (auto * out : pair) {
+            for (auto * in : {act, (const ggml_tensor *) first->src[0], (const ggml_tensor *) second->src[0]}) {
+                safe = safe && !ggml_sycl_tensors_overlap(out, in);
+            }
+        }
+        safe = safe && !ggml_sycl_tensors_overlap(first, second);
+        // The later output must stay live across every intervening read and write, including aliases.
+        for (int n = i + 1; n < j && safe; ++n) {
+            const auto * between = graph->nodes[n];
+            if (ggml_sycl_is_view_or_noop(between) || !(between->flags & GGML_TENSOR_FLAG_COMPUTE)) { continue; }
+            safe = !ggml_sycl_tensors_overlap(second, between);
+            for (int t = 0; t < GGML_MAX_SRC && safe; ++t) {
+                if (between->src[t]) { safe = !ggml_sycl_tensors_overlap(second, between->src[t]); }
+                if (second->src[t] && safe) { safe = !ggml_sycl_tensors_overlap(second->src[t], between); }
+            }
+        }
+        if (!safe) {
+            ggml_sycl_mv_fuse_trace_miss(graph, i);
+            return nullptr;
+        }
+        for (auto * node : pair) {
+            opt_for_reorder(&ctx, node->src[0], act, node, mul_mat_algo::DMMV);
+            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(node->src[0]->extra);
+            if (!extra || !extra->optimized_feature.is_reordered()) { return nullptr; }
+        }
+        if (!ggml_sycl_q8_0_siblings_esimd(first->src[0]->data, second->src[0]->data, (const float *) act->data,
+                                          (float *) first->data, (float *) second->data, act->ne[0], first->ne[0],
+                                          second->ne[0], mode, ctx.stream())) {
+            return nullptr;
+        }
+        ggml_sycl_mv_fuse_trace("q8_esimd", pair, 2, j - i + 1);
+        return second;
+    }
+    return nullptr;
+}
+
 // Group adjacent mat-vecs that read the same activation: one quantize and one launch serve
 // them all. Returns the number of extra graph nodes consumed, or 0 if it declined.
 static int ggml_sycl_mul_mat_multi_mmvq_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int node_idx) {
@@ -8807,6 +8916,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         ~trace_last() { if (on) f(); }
     } trace_flush{ trace, [&] { trace_node(nullptr); } };
 
+    ggml_tensor * q8_sibling_pending = nullptr;
     ggml_tensor * indexer_top = nullptr;
     void * indexer_data = nullptr;
     void * indexer_selected_data = nullptr;
@@ -8819,6 +8929,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         if (census) {
             ggml_sycl_census_visit(census, i);
+        }
+        if (node == q8_sibling_pending) {
+            q8_sibling_pending = nullptr;
+            continue;
         }
         if (node == indexer_top) {
             if (node->data != indexer_data) {
@@ -8945,6 +9059,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             const int gdn_idx = ggml_sycl_gdn_qk_norm_reader(cgraph, i);
             if (gdn_idx >= 0 && ggml_sycl_gdn_qk_norm_now(cgraph->nodes[gdn_idx])) {
                 i++;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_RMS_NORM) {
+            ggml_sycl_norm_gate_match ng;
+            if (ggml_sycl_match_rms_norm_gate(cgraph, i, ng)) {
+                ggml_sycl_op_rms_norm_gate_fused(*sycl_ctx, ng.rms, ng.mul_w, ng.gate, const_cast<ggml_tensor *>(ng.out));
+                i = ng.last_idx;
                 continue;
             }
         }
@@ -9136,6 +9258,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 i += 2;
                 continue;
             }
+        }
+
+        if (node->op == GGML_OP_MUL_MAT && ggml_sycl_q8_f32_rows_fused(*sycl_ctx, cgraph, i)) {
+            i++;
+            continue;
+        }
+        if (node->op == GGML_OP_MUL_MAT && !q8_sibling_pending) {
+            q8_sibling_pending = ggml_sycl_q8_sibling_fused(*sycl_ctx, cgraph, i);
+            if (q8_sibling_pending) { continue; }
         }
 
         // after the GLU fusion above: that one also absorbs the GLU, so it wins when both match
@@ -9706,9 +9837,96 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
 // The MoE reduction reads the mul's operands at the node where the add chain ends, so those
 // tensors have to outlive their last use as the graph sees it. Without this ggml-alloc is free
 // to hand their memory to something in between and the fusion would read its own output.
+// Move the next Q8_0 mat-vec that reads the same activation right behind the first one, so the sibling
+// kernel can run both at once and ggml-alloc gives the second output its buffer at that point.
+// Only the order changes: the moved node reads a weight and an activation that is already computed.
+static void ggml_sycl_hoist_q8_siblings(ggml_cgraph * cgraph) {
+    static const int mode = ggml_sycl_get_env("GGML_SYCL_Q8_0_SIBLINGS", 1);
+    if (!mode || !g_ggml_sycl_enable_fusion) {
+        return;
+    }
+    auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    auto feeds_glu = [&](int idx) {
+        for (int n = idx + 1; n < cgraph->n_nodes; ++n) {
+            const ggml_tensor * c = cgraph->nodes[n];
+            if (c->op == GGML_OP_GLU && (c->src[0] == cgraph->nodes[idx] || c->src[1] == cgraph->nodes[idx])) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto q8_mv = [](const ggml_tensor * n, const ggml_tensor * act) {
+        return n->op == GGML_OP_MUL_MAT && n->src[0]->type == GGML_TYPE_Q8_0 && n->src[1] == act &&
+               n->type == GGML_TYPE_F32 && n->src[0]->ne[2] == 1 && n->src[0]->ne[3] == 1 &&
+               n->src[0]->ne[0] >= 2048 && n->src[0]->ne[0] < 4096; // the rows the sibling kernel takes
+    };
+    for (int i = 0; i < cgraph->n_nodes - 1; ++i) {
+        const ggml_tensor * a = cgraph->nodes[i];
+        if (a->op != GGML_OP_MUL_MAT || a->src[1]->type != GGML_TYPE_F32 || !q8_mv(a, a->src[1]) || q8_mv(cgraph->nodes[i + 1], a->src[1])) {
+            continue;
+        }
+        const ggml_tensor * act = a->src[1];
+        int j = -1;
+        bool written = false;
+        for (int n = i + 1; n < cgraph->n_nodes && n <= i + 96; ++n) {
+            const ggml_tensor * c = cgraph->nodes[n];
+            if (q8_mv(c, act)) {
+                j = n;
+                break;
+            }
+            // a node that writes into the activation in between pins the order
+            written = written || (!ggml_sycl_is_view_or_noop(c) && base(c) == base(act));
+        }
+        if (j < 0 || written || feeds_glu(i) || feeds_glu(j)) {
+            continue;
+        }
+        std::rotate(cgraph->nodes + i + 1, cgraph->nodes + j, cgraph->nodes + j + 1);
+        ++i;
+    }
+}
+
+// Move a small f32 mat-vec (at most 8 rows) right behind the Q8_0 mat-vec with K >= 4096 that reads the same
+// activation, so both run in one launch (ggml_sycl_q8_f32_rows_fused). Only the order changes.
+static void ggml_sycl_hoist_q8_f32_rows(ggml_cgraph * cgraph) {
+    static const int on = ggml_sycl_get_env("GGML_SYCL_Q8_0_F32_ROWS", 0);
+    if (!on || !g_ggml_sycl_enable_fusion) {
+        return;
+    }
+    auto base = [](const ggml_tensor * t) { return t->view_src ? t->view_src : t; };
+    auto f32_rows = [](const ggml_tensor * n, const ggml_tensor * act) {
+        return n->op == GGML_OP_MUL_MAT && n->src[1] == act && n->src[0]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32 &&
+               n->src[0]->ne[1] <= 8 && n->src[0]->ne[2] == 1 && n->src[0]->ne[3] == 1 && n->src[0]->ne[0] == act->ne[0];
+    };
+    for (int i = 0; i < cgraph->n_nodes - 1; ++i) {
+        const ggml_tensor * a = cgraph->nodes[i];
+        if (a->op != GGML_OP_MUL_MAT || a->src[0]->type != GGML_TYPE_Q8_0 || a->src[0]->ne[0] < 4096 ||
+            a->src[1]->type != GGML_TYPE_F32 || f32_rows(cgraph->nodes[i + 1], a->src[1])) {
+            continue;
+        }
+        const ggml_tensor * act = a->src[1];
+        int j = -1;
+        bool written = false;
+        for (int n = i + 1; n < cgraph->n_nodes && n <= i + 64; ++n) {
+            const ggml_tensor * c = cgraph->nodes[n];
+            if (f32_rows(c, act)) {
+                j = n;
+                break;
+            }
+            written = written || (!ggml_sycl_is_view_or_noop(c) && base(c) == base(act));
+        }
+        if (j < 0 || written) {
+            continue;
+        }
+        std::rotate(cgraph->nodes + i + 1, cgraph->nodes + j, cgraph->nodes + j + 1);
+        ++i;
+    }
+}
+
 static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
                                              ggml_backend_graph_optimize_params * params) {
     GGML_UNUSED(backend);
+    ggml_sycl_hoist_q8_siblings(cgraph);
+    ggml_sycl_hoist_q8_f32_rows(cgraph);
     // The skipped copy input must survive until the fused multiply.
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         if (cgraph->nodes[i]->op != GGML_OP_CONT) {
@@ -9777,6 +9995,16 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
         if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && ggml_sycl_match_gdn_qk_norm(cgraph, i, &m)) {
             for (const ggml_tensor * x : { m.q, m.k }) {
                 params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x->view_src ? x->view_src : x), cgraph->nodes[i]);
+            }
+        }
+    }
+    // the fused gated norm reads x and the gate input at the norm but writes the final mul
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_sycl_norm_gate_match ng;
+        if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM && ggml_sycl_match_rms_norm_gate(cgraph, i, ng)) {
+            for (const ggml_tensor * t : { ng.rms->src[0], ng.gate->src[0] }) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(t->view_src ? t->view_src : t),
+                                      const_cast<ggml_tensor *>(ng.out));
             }
         }
     }
