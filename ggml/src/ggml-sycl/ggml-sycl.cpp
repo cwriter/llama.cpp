@@ -8929,11 +8929,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
         if (node->op == GGML_OP_GATED_DELTA_NET) {
+            if (!ggml_sycl_gdn_qk_norm_now(node) || !ggml_sycl_match_gdn_qk_norm(cgraph, i, &sycl_ctx->gdn_qk_norm)) {
+                sycl_ctx->gdn_qk_norm = {};
+            }
             ggml_sycl_gated_delta_net_fused_cache fused_state_cpy;
             const int gdn_nodes_to_skip = ggml_sycl_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
             if (gdn_nodes_to_skip > 0) {
                 ggml_sycl_op_gated_delta_net_fused_cache(*sycl_ctx, node, fused_state_cpy);
                 i += gdn_nodes_to_skip;
+                continue;
+            }
+        }
+        // a q/k L2 norm (rms_norm + scale) that its gated delta net does itself
+        if (node->op == GGML_OP_RMS_NORM) {
+            const int gdn_idx = ggml_sycl_gdn_qk_norm_reader(cgraph, i);
+            if (gdn_idx >= 0 && ggml_sycl_gdn_qk_norm_now(cgraph->nodes[gdn_idx])) {
+                i++;
                 continue;
             }
         }
@@ -9758,6 +9769,15 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_tensor * x = em.mm->src[1];
             params->add_alloc_dep(params->user_data, x->view_src ? x->view_src : x, em.last);
             i = em.last_idx;
+        }
+    }
+    // a gated delta net that norms its own q/k reads the raw rows, so they must live until it runs
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_sycl_gdn_qk_norm m;
+        if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET && ggml_sycl_match_gdn_qk_norm(cgraph, i, &m)) {
+            for (const ggml_tensor * x : { m.q, m.k }) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x->view_src ? x->view_src : x), cgraph->nodes[i]);
+            }
         }
     }
     // a skipped state gather is read at its gated delta net, so its row ids must live that long.

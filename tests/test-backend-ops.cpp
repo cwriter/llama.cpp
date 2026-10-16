@@ -5091,19 +5091,20 @@ struct test_gated_delta_net : public test_case {
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
     const int64_t gather; // > 0: s0 is a GET_ROWS of a state cache with this many rows, as build_rs makes it
+    const bool    rms_l2; // q/k L2 norm as rms_norm + scale, as build_gdn_l2_norm makes it
 
     std::string vars() override {
-        return VARS_TO_STR10(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, gather);
+        return VARS_TO_STR11(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K, gather, rms_l2);
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
             int64_t head_count = 4, int64_t head_size = 16, int64_t n_seq_tokens = 1, int64_t n_seqs = 1,
-            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, int64_t gather = 0)
+            int v_repeat = 1, bool permuted = false, bool kda = false, int64_t K = 1, int64_t gather = 0, bool rms_l2 = false)
         : type(type), head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
-          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), gather(gather) {}
+          v_repeat(v_repeat), permuted(permuted), kda(kda), K(K), gather(gather), rms_l2(rms_l2) {}
 
-    // a backend may skip the gather and read the cache rows inside the gated delta net
-    bool run_whole_graph() override { return gather > 0; }
+    // a backend may skip the gather or the q/k norms and do them inside the gated delta net
+    bool run_whole_graph() override { return gather > 0 || rms_l2; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
@@ -5139,8 +5140,13 @@ struct test_gated_delta_net : public test_case {
         ggml_set_name(beta,  "beta");
         ggml_set_name(state, "state");
         // q/k are L2-normalised in qwen35/kimi-linear before delta_net
-        q = ggml_l2_norm(ctx, q, 1e-6f);
-        k = ggml_l2_norm(ctx, k, 1e-6f);
+        if (rms_l2) {
+            q = ggml_scale(ctx, ggml_rms_norm(ctx, q, 1e-6f / head_size), 1.0f / sqrtf((float) head_size));
+            k = ggml_scale(ctx, ggml_rms_norm(ctx, k, 1e-6f / head_size), 1.0f / sqrtf((float) head_size));
+        } else {
+            q = ggml_l2_norm(ctx, q, 1e-6f);
+            k = ggml_l2_norm(ctx, k, 1e-6f);
+        }
         ggml_tensor * out   = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
         return out;
     }
@@ -12984,6 +12990,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
+    // q/k L2 norms as rms_norm + scale: qwen4exp decode (16 k heads, 48 v heads), a batch, rollback slots, permuted, KDA
+    for (int64_t n_tokens : {1, 4}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, false, false, 1, 3, true));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2, 1, 3, false, false, 2, 3, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 33, 1, 3, false, false, 1, 0, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true, false, 1, 0, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 3, 2, 1, false, true, 1, 0, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 1, 1, 2, false, false, 1, 0, true));
     // KDA (vector gate)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 2, 1, false, true));

@@ -682,11 +682,21 @@ struct ggml_sycl_gdn_state_gather {
     int64_t             row_stride = 0; // floats
 };
 
+// a gated delta net whose q/k L2 norms (rms_norm + scale) were skipped: it reads the raw rows and norms them itself
+struct ggml_sycl_gdn_qk_norm {
+    const ggml_tensor * gdn   = nullptr;
+    const ggml_tensor * q     = nullptr;
+    const ggml_tensor * k     = nullptr;
+    float               eps   = 0.0f;
+    float               scale = 0.0f;
+};
+
 struct ggml_backend_sycl_context {
     int device;
     std::string name;
     device_opt_feature opt_feature;
     ggml_sycl_gdn_state_gather gdn_gather;
+    ggml_sycl_gdn_qk_norm gdn_qk_norm;
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 

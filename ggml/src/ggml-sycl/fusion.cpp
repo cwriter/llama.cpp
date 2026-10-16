@@ -2,6 +2,7 @@
 #include "binbcast.hpp"
 
 #include <algorithm>
+#include <cstring>
 
 // mul_mat(gate) + mul_mat(up) + GLU: graph shape and tensor properties only. Backend state
 // (weight layout, split buffers, DMMV) is checked by ggml_sycl_mul_mat_glu_mmvq_fused().
@@ -650,4 +651,75 @@ int ggml_sycl_match_gate_view(const ggml_cgraph * cgraph, int node_idx) {
         return -1;
     }
     return unary_idx;
+}
+
+// RMS_NORM + SCALE at norm_idx whose scale output is read only by gdn as q (src 0) or k (src 1)
+static bool ggml_sycl_is_gdn_l2_norm(const ggml_cgraph * cgraph, int norm_idx, const ggml_tensor * gdn, int src) {
+    if (norm_idx < 0 || !ggml_sycl_can_fuse_rms_norm_scale(cgraph, norm_idx)) {
+        return false;
+    }
+    const ggml_tensor * norm  = cgraph->nodes[norm_idx];
+    const ggml_tensor * scale = cgraph->nodes[norm_idx + 1];
+    float bias = 0.0f;
+    memcpy(&bias, (const float *) scale->op_params + 1, sizeof(float));
+    return gdn->src[src] == scale && bias == 0.0f && !(scale->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+           ggml_node_get_use_count(cgraph, norm_idx + 1) == 1 && norm->src[0]->ne[0] == gdn->src[2]->ne[0];
+}
+
+bool ggml_sycl_match_gdn_qk_norm(const ggml_cgraph * cgraph, int gdn_idx, ggml_sycl_gdn_qk_norm * out) {
+    static const int enabled = ggml_sycl_get_env("GGML_SYCL_GDN_QK_NORM", 1);
+    if (!enabled || !g_ggml_sycl_enable_fusion) {
+        return false;
+    }
+    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32) {
+        return false;
+    }
+    int norm_idx[2] = { -1, -1 };
+    for (int j = gdn_idx - 1; j >= 1 && j >= gdn_idx - 64; --j) {
+        for (int s = 0; s < 2; ++s) {
+            if (cgraph->nodes[j] == gdn->src[s]) {
+                norm_idx[s] = j - 1;
+            }
+        }
+    }
+    if (!ggml_sycl_is_gdn_l2_norm(cgraph, norm_idx[0], gdn, 0) || !ggml_sycl_is_gdn_l2_norm(cgraph, norm_idx[1], gdn, 1)) {
+        return false;
+    }
+    const ggml_tensor * nq = cgraph->nodes[norm_idx[0]];
+    const ggml_tensor * nk = cgraph->nodes[norm_idx[1]];
+    const ggml_tensor * sq = cgraph->nodes[norm_idx[0] + 1];
+    const ggml_tensor * sk = cgraph->nodes[norm_idx[1] + 1];
+    // one eps and one scale for both rows, and the kernel walks q and k with the same strides
+    if (memcmp(nq->op_params, nk->op_params, sizeof(float)) != 0 || memcmp(sq->op_params, sk->op_params, sizeof(float)) != 0 ||
+        !ggml_are_same_stride(nq->src[0], nk->src[0])) {
+        return false;
+    }
+    if (out) {
+        out->gdn = gdn;
+        out->q   = nq->src[0];
+        out->k   = nk->src[0];
+        memcpy(&out->eps, nq->op_params, sizeof(float));
+        memcpy(&out->scale, sq->op_params, sizeof(float));
+    }
+    return true;
+}
+
+bool ggml_sycl_gdn_qk_norm_now(const ggml_tensor * gdn) {
+    // a long batch walks its tokens one by one, and every column would redo the norms of each token
+    return gdn->src[2]->ne[2] <= 8;
+}
+
+int ggml_sycl_gdn_qk_norm_reader(const ggml_cgraph * cgraph, int node_idx) {
+    if (cgraph->nodes[node_idx]->op != GGML_OP_RMS_NORM || node_idx + 1 >= cgraph->n_nodes) {
+        return -1;
+    }
+    const ggml_tensor * scale = cgraph->nodes[node_idx + 1];
+    for (int j = node_idx + 2; j < cgraph->n_nodes && j <= node_idx + 64; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_GATED_DELTA_NET && (n->src[0] == scale || n->src[1] == scale)) {
+            return ggml_sycl_match_gdn_qk_norm(cgraph, j, nullptr) ? j : -1;
+        }
+    }
+    return -1;
 }

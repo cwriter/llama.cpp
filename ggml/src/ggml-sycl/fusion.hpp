@@ -23,6 +23,15 @@ bool ggml_sycl_can_fuse_unary_mul_bcast(const ggml_cgraph * cgraph, int node_idx
 // RMS_NORM at `node_idx` feeding a SCALE that exists only to finish an L2 norm.
 bool ggml_sycl_can_fuse_rms_norm_scale(const ggml_cgraph * cgraph, int node_idx);
 
+// GATED_DELTA_NET at `gdn_idx` whose q and k are both L2 norms (RMS_NORM + SCALE) read by nothing else
+bool ggml_sycl_match_gdn_qk_norm(const ggml_cgraph * cgraph, int gdn_idx, ggml_sycl_gdn_qk_norm * out);
+
+// a matched gated delta net norms its q/k only for a short batch; the norm nodes keep their dst for the rest
+bool ggml_sycl_gdn_qk_norm_now(const ggml_tensor * gdn);
+
+// RMS_NORM at `node_idx` that a matched gated delta net norms itself; returns that net's index, or -1
+int ggml_sycl_gdn_qk_norm_reader(const ggml_cgraph * cgraph, int node_idx);
+
 // CONT of a strided view feeding UNARY + MUL; returns the unary index, or -1.
 int ggml_sycl_match_gate_view(const ggml_cgraph * cgraph, int node_idx);
 
