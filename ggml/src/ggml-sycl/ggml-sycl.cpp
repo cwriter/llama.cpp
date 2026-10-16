@@ -8425,7 +8425,7 @@ static void ggml_sycl_mv_fuse_trace_miss(const ggml_cgraph * cgraph, int node_id
 // a reordered Q8_0 mat-vec with K >= 4096 and the f32 mat-vec of at most 8 rows right behind it that reads the same
 // activation (qwen4exp: hc_*_down and hc_*_inject, see ggml_sycl_hoist_q8_f32_rows), one token, in one launch
 static bool ggml_sycl_q8_f32_rows_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i) {
-    static const int on = ggml_sycl_get_env("GGML_SYCL_Q8_0_F32_ROWS", 0);
+    static const int on = ggml_sycl_get_env("GGML_SYCL_Q8_0_F32_ROWS", 1);
     if (!on || !g_ggml_sycl_enable_fusion || !g_ggml_sycl_enable_esimd || !g_ggml_sycl_q8_0_mmv_shapes ||
         !ggml_sycl_supports_reorder_esimd(GGML_TYPE_Q8_0) || g_ggml_sycl_prioritize_dmmv || i + 1 >= graph->n_nodes) {
         return false;
@@ -9888,7 +9888,7 @@ static void ggml_sycl_hoist_q8_siblings(ggml_cgraph * cgraph) {
 // Move a small f32 mat-vec (at most 8 rows) right behind the Q8_0 mat-vec with K >= 4096 that reads the same
 // activation, so both run in one launch (ggml_sycl_q8_f32_rows_fused). Only the order changes.
 static void ggml_sycl_hoist_q8_f32_rows(ggml_cgraph * cgraph) {
-    static const int on = ggml_sycl_get_env("GGML_SYCL_Q8_0_F32_ROWS", 0);
+    static const int on = ggml_sycl_get_env("GGML_SYCL_Q8_0_F32_ROWS", 1);
     if (!on || !g_ggml_sycl_enable_fusion) {
         return;
     }

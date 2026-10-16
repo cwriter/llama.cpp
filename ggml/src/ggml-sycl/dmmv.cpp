@@ -2273,7 +2273,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd_rows(
         const void * vx, const float * y, float * dst,
         const int ncols, const int nrows,
         sycl::local_accessor<float, 1> lmem,
-        const sycl::nd_item<1> & it) {
+        const sycl::nd_item<1> & it, int group = -1) {
     using namespace sycl::ext::intel::esimd;
 
     constexpr int STRIPE = 8;
@@ -2284,7 +2284,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd_rows(
     const sycl::half * d        = (const sycl::half *) (qs + nb * QK8_0);
 
     const int tid  = it.get_local_id(0);
-    const int row0 = it.get_group(0) * NR;
+    const int row0 = (group < 0 ? (int) it.get_group(0) : group) * NR;
 
     // rows past the end read the last row again and are not stored
     size_t base[NR];
@@ -2348,11 +2348,23 @@ ESIMD_INLINE void f32_row_dot_esimd(const float * w, const float * y, float * ds
                                     sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
     const int tid = it.get_local_id(0);
-    simd<float, 32> acc = 0.0f;
-    for (int c = tid * 32; c < ncols; c += WG * 32) {
-        acc += block_load<float, 32>(w + c) * block_load<float, 32>(y + c);
+    // four stripes per round keep more loads in flight; the row is the slowest work-group of the launch
+    simd<float, 32> acc[4];
+#pragma unroll
+    for (int u = 0; u < 4; ++u) {
+        acc[u] = 0.0f;
     }
-    lmem[tid] = reduce<float>(acc, std::plus<>{});
+    int c = tid * 32;
+    for (; c + 3 * WG * 32 < ncols; c += 4 * WG * 32) {
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            acc[u] += block_load<float, 32>(w + c + u * WG * 32) * block_load<float, 32>(y + c + u * WG * 32);
+        }
+    }
+    for (; c < ncols; c += WG * 32) {
+        acc[0] += block_load<float, 32>(w + c) * block_load<float, 32>(y + c);
+    }
+    lmem[tid] = reduce<float>(acc[0] + acc[1] + acc[2] + acc[3], std::plus<>{});
     it.barrier(sycl::access::fence_space::local_space);
     if (tid == 0) {
         float sum = 0.0f;
@@ -2373,11 +2385,12 @@ static void q8_0_esimd_launch_rows_f32(const void * vx, const float * y, float *
         h.parallel_for(
             sycl::nd_range<1>(sycl::range<1>((size_t) (workgroups + nrows_f) * WG), sycl::range<1>(WG)),
             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                // the f32 rows take the first groups, so they start first and run beside the Q8_0 rows
                 const int g = it.get_group(0);
-                if (g < workgroups) {
-                    dequantize_mul_mat_vec_q8_0_reorder_esimd_rows<WG, NR>(vx, y, dst, ncols, nrows, lmem, it);
+                if (g >= nrows_f) {
+                    dequantize_mul_mat_vec_q8_0_reorder_esimd_rows<WG, NR>(vx, y, dst, ncols, nrows, lmem, it, g - nrows_f);
                 } else {
-                    f32_row_dot_esimd<WG>(wf + (size_t) (g - workgroups) * ncols, y, dstf + (g - workgroups), ncols, lmem, it);
+                    f32_row_dot_esimd<WG>(wf + (size_t) g * ncols, y, dstf + g, ncols, lmem, it);
                 }
             });
     });
