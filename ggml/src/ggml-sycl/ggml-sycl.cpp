@@ -1010,8 +1010,9 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
                 tensor->extra                 = extra;
                 ctx->tensor_extras.push_back(extra);
                 // llama.cpp names the KV cache tensors cache_k_l* / cache_v_l*; nothing else in
-                // a non-weight buffer carries that prefix
-                if (strncmp(tensor->name, "cache_", 6) == 0 &&
+                // a non-weight buffer carries that prefix. The QSA indexer cache (cache_idx_*) is
+                // written and read in half rows (raw | pooled key), less than a span, so it stays canonical
+                if (strncmp(tensor->name, "cache_", 6) == 0 && strncmp(tensor->name, "cache_idx_", 10) != 0 &&
                     ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                     ggml_sycl_kv_soa_mark(tensor);
                 }
