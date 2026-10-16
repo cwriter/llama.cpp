@@ -1247,11 +1247,11 @@ static void launch_fattn_tile_case(ggml_backend_sycl_context & ctx, ggml_tensor 
         if (ggml_sycl_fattn_tile_use_q8_0(dst)) {
             if (mbits) {
                 launch_fattn<DV, cols_per_block/ncols2, ncols2,
-                    flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true, true, warp_size>, warp_size>
+                    flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true, true, warp_size>, warp_size, true>
                     (ctx, dst, nwarps, nbytes_shared, nbatch_fa, false, false, false);
             } else {
                 launch_fattn<DV, cols_per_block/ncols2, ncols2,
-                    flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true, false, warp_size>, warp_size>
+                    flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, true, false, warp_size>, warp_size, true>
                     (ctx, dst, nwarps, nbytes_shared, nbatch_fa, false, false, false);
             }
             return;
@@ -1260,11 +1260,11 @@ static void launch_fattn_tile_case(ggml_backend_sycl_context & ctx, ggml_tensor 
 
     if (mbits) {
         launch_fattn<DV, cols_per_block/ncols2, ncols2,
-            flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, false, true, warp_size>, warp_size>
+            flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, false, true, warp_size>, warp_size, true>
             (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
     } else {
         launch_fattn<DV, cols_per_block/ncols2, ncols2,
-            flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, false, false, warp_size>, warp_size>
+            flash_attn_tile<DKQ, DV, cols_per_block/ncols2, ncols2, use_logit_softcap, false, false, warp_size>, warp_size, true>
             (ctx, dst, nwarps, nbytes_shared, nbatch_fa, true, true, false);
     }
 }

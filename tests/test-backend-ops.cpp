@@ -13683,6 +13683,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // qwen4exp attention decode: 2 kv heads, 12 query heads each, q8_0 cache
     for (int kv : { 2048, 8192, 32768, 65536, 131072 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
