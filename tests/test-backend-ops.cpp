@@ -10207,9 +10207,10 @@ struct test_lightning_indexer : public test_case {
     const int64_t nm; // ne[3] of mask
 
     const ggml_type type_K;
+    const bool      pool;  // a 0/-inf mask named like qwen4exp's pool mask, which a backend may pack
 
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K) + (pool ? ",pool=1" : "");
     }
 
     double max_nmse_err() override {
@@ -10221,8 +10222,9 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1,
+                           ggml_type type_K = GGML_TYPE_F16, bool pool = false)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), pool(pool) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -10239,7 +10241,7 @@ struct test_lightning_indexer : public test_case {
 
         ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nm);
         ggml_set_param(m);
-        ggml_set_name(m, "m");
+        ggml_set_name(m, pool ? "inp_pool_mask" : "m");
 
         ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
         ggml_set_name(out, "out");
@@ -10251,6 +10253,18 @@ struct test_lightning_indexer : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "inp_pool_mask") == 0) {
+                // every token sees a prefix of the pools, as llama_memory_hybrid_idx fills it
+                std::mt19937 rng(42);
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f), drop = ggml_fp32_to_fp16(-INFINITY);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    const int64_t nv = rng() % (t->ne[0] + 1);
+                    for (int64_t c = 0; c < t->ne[0]; ++c) {
+                        data[r*t->ne[0] + c] = c < nv ? keep : drop;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -13587,6 +13601,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_lightning_indexer(128, 4, 1000, 33, 2, 1, type_K));
     }
+    // the qwen4exp pool mask, packed to bits by backends that can: decode, tails and a prefill ubatch
+    for (int kv : { 255, 4097, 32832 }) {
+        for (int bs : { 1, 7, 33, 1024 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F32, true));
+        }
+    }
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 1000, 33, 2, 2, GGML_TYPE_F32, true));
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 1000, 33, 2, 1, GGML_TYPE_F32, true));
 
     return test_cases;
 }

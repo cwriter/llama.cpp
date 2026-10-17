@@ -1,8 +1,18 @@
 #include "lightning-indexer.hpp"
 #include "dequantize.hpp"
+#include "kq-mask-bits.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 
 namespace mx = sycl::ext::oneapi::experimental::matrix;
+
+// mask value of pool i in a row: dense f16, or the packed form of kq-mask-bits.hpp (bit set = keep)
+static inline float li_mask_val(const char * row, int64_t i, bool bits) {
+    if (bits) {
+        const uint32_t w = ((const uint32_t *) row)[i >> 5];
+        return (w >> (i & 31)) & 1u ? 0.0f : -INFINITY;
+    }
+    return static_cast<float>(((const sycl::half *) row)[i]);
+}
 
 static void lightning_indexer_f32_sycl(
         const char * q, const char * k, const char * w, const char * m, float * dst,
@@ -11,7 +21,7 @@ static void lightning_indexer_f32_sycl(
         int64_t nbq1, int64_t nbq2, int64_t nbq3,
         int64_t nbk2, int64_t nbk3,
         int64_t nbw1, int64_t nbw3,
-        int64_t nbm1, int64_t nbm3,
+        int64_t nbm1, int64_t nbm3, bool mbits,
         int64_t nb1, int64_t nb3,
         ggml_type k_type,
         queue_ptr stream) {
@@ -138,11 +148,11 @@ static void lightning_indexer_f32_sycl(
             }
 
             if (lane == 0) {
-                const sycl::half * m_base = (const sycl::half *) (m + i_batch*nbm1 + (i_stream % nem3)*nbm3);
+                const char * m_base = m + i_batch*nbm1 + (i_stream % nem3)*nbm3;
                 // flat-index store: storing through a strided base pointer
                 // hangs/misroutes writes on this stack when n_batch*n_stream > 1
                 const int64_t dst_idx = i_kv + i_batch*(nb1/sizeof(float)) + i_stream*(nb3/sizeof(float));
-                dst[dst_idx] = score + static_cast<float>(m_base[i_kv]);
+                dst[dst_idx] = score + li_mask_val(m_base, i_kv, mbits);
             }
         });
 }
@@ -183,7 +193,7 @@ static void lightning_indexer_vec_sycl(
         size_t nbq1, size_t nbq2, size_t nbq3,
         size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw3,
-        size_t nbm1, size_t nbm3,
+        size_t nbm1, size_t nbm3, bool mbits,
         size_t nb1, size_t nb3,
         queue_ptr stream) {
 
@@ -252,9 +262,9 @@ static void lightning_indexer_vec_sycl(
 
             const int i_kv = kv0 + lane/2;
             if (lane % 2 == 0 && i_kv < n_kv) {
-                const sycl::half * m_row = (const sycl::half *) (m + (size_t) i_batch*nbm1 + (size_t) (i_stream % nem3)*nbm3);
+                const char * m_row = m + (size_t) i_batch*nbm1 + (size_t) (i_stream % nem3)*nbm3;
                 float * dst_row = (float *) (dst + (size_t) i_batch*nb1 + (size_t) i_stream*nb3);
-                dst_row[i_kv] = score + static_cast<float>(m_row[i_kv]);
+                dst_row[i_kv] = score + li_mask_val(m_row, i_kv, mbits);
             }
         });
 }
@@ -298,7 +308,7 @@ static void lightning_indexer_xmx_sycl(
         size_t nbq1, size_t nbq2, size_t nbq3,
         size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw3,
-        size_t nbm1, size_t nbm3,
+        size_t nbm1, size_t nbm3, bool mbits,
         size_t nb1, size_t nb3,
         queue_ptr stream) {
 
@@ -426,9 +436,9 @@ static void lightning_indexer_xmx_sycl(
                         for (int t = 0; t < LI_XMX_TOK; ++t) {
                             if (t < n_t) {
                                 const size_t i_batch = t0 + t;
-                                const sycl::half * m_row = (const sycl::half *) (m + i_batch*nbm1 + (size_t) (i_stream % nem3)*nbm3);
+                                const char * m_row = m + i_batch*nbm1 + (size_t) (i_stream % nem3)*nbm3;
                                 float * dst_row = (float *) (dst + i_batch*nb1 + (size_t) i_stream*nb3);
-                                dst_row[i_kv] = score[t] + static_cast<float>(m_row[i_kv]);
+                                dst_row[i_kv] = score[t] + li_mask_val(m_row, i_kv, mbits);
                             }
                         }
                     }
@@ -438,7 +448,8 @@ static void lightning_indexer_xmx_sycl(
 }
 
 template <typename k_t>
-static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, bool use_xmx) {
+static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, bool use_xmx,
+                                        size_t nbm1, size_t nbm3, bool mbits) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * w = dst->src[2];
@@ -454,13 +465,13 @@ static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_te
         lightning_indexer_xmx_sycl<k_t>(ctx,
             (const char *) q->data, (const char *) k->data, (const char *) w->data, (const char *) m->data, (char *) dst->data,
             n_head, n_batch, n_stream, n_kv, nem3,
-            q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], m->nb[1], m->nb[3], dst->nb[1], dst->nb[3],
+            q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], nbm1, nbm3, mbits, dst->nb[1], dst->nb[3],
             ctx.stream());
     } else {
         lightning_indexer_vec_sycl<k_t>(
             (const char *) q->data, (const char *) k->data, (const char *) w->data, (const char *) m->data, (char *) dst->data,
             n_head, n_batch, n_stream, n_kv, nem3,
-            q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], m->nb[1], m->nb[3], dst->nb[1], dst->nb[3],
+            q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], nbm1, nbm3, mbits, dst->nb[1], dst->nb[3],
             ctx.stream());
     }
 }
@@ -504,12 +515,22 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
 
     GGML_ASSERT(n_embd == WARP_SIZE * 8);
 
+    // a packed mask keeps its f16 shape but stores ggml_sycl_kq_mask_row_bytes() per row
+    const bool mbits = ggml_sycl_kq_mask_is_bits(m);
+    size_t     sm1   = nbm1;
+    size_t     sm3   = nbm3;
+    if (mbits) {
+        sm1 = ggml_sycl_kq_mask_row_bytes(nem0);
+        sm3 = sm1 * nem1 * nem2;
+        ggml_sycl_kq_mask_taught(ctx, dst);
+    }
+
     if (g_ggml_sycl_lightning_indexer > 0) {
         const bool use_xmx = g_ggml_sycl_lightning_indexer >= 2 && n_batch >= 8 && li_xmx_supported(ctx.stream());
         switch (k->type) {
-            case GGML_TYPE_F32:  lightning_indexer_fast_sycl<float>(ctx, dst, use_xmx); return;
-            case GGML_TYPE_F16:  lightning_indexer_fast_sycl<sycl::half>(ctx, dst, use_xmx); return;
-            case GGML_TYPE_BF16: lightning_indexer_fast_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst, use_xmx); return;
+            case GGML_TYPE_F32:  lightning_indexer_fast_sycl<float>(ctx, dst, use_xmx, sm1, sm3, mbits); return;
+            case GGML_TYPE_F16:  lightning_indexer_fast_sycl<sycl::half>(ctx, dst, use_xmx, sm1, sm3, mbits); return;
+            case GGML_TYPE_BF16: lightning_indexer_fast_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst, use_xmx, sm1, sm3, mbits); return;
             default: break;
         }
     }
@@ -521,7 +542,7 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
             nbq1, nbq2, nbq3,
             nbk2, nbk3,
             nbw1, nbw3,
-            nbm1, nbm3,
+            sm1, sm3, mbits,
             nb1, nb3,
             k->type,
             ctx.stream());

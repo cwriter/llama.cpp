@@ -8337,7 +8337,9 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
         qt.ne[2] = count;
         wt.data = (char *) w->data + first * w->nb[1];
         wt.ne[1] = count;
-        mt.data = (char *) m->data + first * m->nb[1];
+        // a packed mask (kq-mask-bits.hpp) keeps its f16 nb[] but stores packed rows
+        const size_t m_row = ggml_sycl_kq_mask_is_bits(m) ? ggml_sycl_kq_mask_row_bytes(m->ne[0]) : m->nb[1];
+        mt.data = (char *) m->data + first * m_row;
         mt.ne[1] = count;
         st.data = values;
         st.ne[1] = count;
@@ -8349,6 +8351,9 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
         tk.ne[1] = count;
         tk.src[0] = &st;
         ggml_sycl_op_lightning_indexer(ctx, &st);
+        if (ggml_sycl_kq_mask_is_bits(m)) {
+            ggml_sycl_kq_mask_taught(ctx, score);  // the op reported the tile copy, the graph knows the node
+        }
         ggml_sycl_op_top_k(ctx, &tk);
         if (selected_scores) {
             const auto * indices = (const int32_t *) tk.data;

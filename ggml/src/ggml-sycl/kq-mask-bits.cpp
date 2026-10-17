@@ -30,8 +30,11 @@ bool ggml_sycl_kq_mask_eligible(const ggml_tensor * t) {
     if ((g_ggml_sycl_kq_mask_bits & GGML_SYCL_KQ_MASK_COMPACT) && !ggml_sycl_kq_mask_compact_on()) {
         return false;  // COMPACT was vetoed: the mask stays dense f16
     }
-    // the scheduler names its copy "<backend>#<src name>#<n>", so match anywhere in the name
-    if (strstr(t->name, "kq_mask") == nullptr) {
+    // the scheduler names its copy "<backend>#<src name>#<n>", so match anywhere in the name.
+    // The QSA indexer's pool mask (0/-inf per pool and token) packs the same way; it is only
+    // compacted, never lent out as tail scratch, which assumes one mask per graph
+    const bool pool = strstr(t->name, "pool_mask") != nullptr;
+    if (strstr(t->name, "kq_mask") == nullptr && !(pool && (g_ggml_sycl_kq_mask_bits & GGML_SYCL_KQ_MASK_COMPACT))) {
         return false;
     }
     // a packed row must fit inside the f16 row it replaces
@@ -505,6 +508,9 @@ static bool kq_mask_reader_taught(const ggml_tensor * n, int j, const ggml_tenso
         case GGML_OP_CPY:
             // a cast or copy of the whole mask
             return j == 0 && kq_mask_cpy_dst(n->src[0], n->src[1] ? n->src[1] : n, owner) == owner;
+        case GGML_OP_LIGHTNING_INDEXER:
+            // lightning-indexer.cpp reads the bits, from the whole mask only
+            return j == 3 && kq_mask_whole(n->src[3], owner);
         case GGML_OP_FLASH_ATTN_EXT:
             {
                 // fattn.cpp reads the bits or expands them itself, from the whole mask only. ALiBi
