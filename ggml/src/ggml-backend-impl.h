@@ -162,6 +162,10 @@ extern "C" {
         // their dst, so that ggml-alloc can skip reserving them. must be exact and must not depend on
         // mutable state: a node reported here is guaranteed to have data == NULL at compute time
         int (*fusion_absorbs)(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int node_idx);
+
+        // (optional) false when the backend would fuse node_idx - 1 and node_idx, so a device boundary
+        // placed between them loses that fusion; used by GGML_BACKEND_SCHED_SEAM_RESPECT_FUSIONS
+        bool (*graph_cut_ok)(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int node_idx);
     };
 
     struct ggml_backend {

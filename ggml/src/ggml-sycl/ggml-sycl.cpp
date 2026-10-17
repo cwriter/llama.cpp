@@ -10155,6 +10155,39 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 }
 
+// GGML_BACKEND_SCHED_SEAM_RESPECT_FUSIONS: false when this backend would fuse node_idx - 1 with node_idx,
+// so a device boundary between them would cost that fusion. Best effort: the absorbed spans, the gated
+// hc_post + norm, rms norm * w (+ rope) and the elementwise pairs; a fusion missing here is cut silently.
+static bool ggml_backend_sycl_graph_cut_ok(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
+    if (node_idx <= 0 || node_idx >= cgraph->n_nodes || !g_ggml_sycl_enable_fusion) {
+        return true;
+    }
+    // an absorbed node runs inside a later node: the cut would separate them
+    if (ggml_backend_sycl_fusion_absorbs(backend, cgraph, node_idx - 1) > 0) {
+        return false;
+    }
+    for (int j = std::max(0, node_idx - 5); j < node_idx; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_SCALE && ggml_sycl_hc_post_norm_at(cgraph, j) && j + 5 >= node_idx) {
+            return false;
+        }
+    }
+    const ggml_tensor * a = cgraph->nodes[node_idx - 1];
+    const ggml_tensor * b = cgraph->nodes[node_idx];
+    if (a->op == GGML_OP_RMS_NORM && b->op == GGML_OP_MUL && ggml_can_fuse(cgraph, node_idx - 1, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        return false;
+    }
+    if (node_idx >= 2 && b->op == GGML_OP_ROPE && a->op == GGML_OP_MUL && cgraph->nodes[node_idx - 2]->op == GGML_OP_RMS_NORM &&
+        ggml_can_fuse(cgraph, node_idx - 2, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE })) {
+        return false;
+    }
+    if ((a->op == GGML_OP_MUL && b->op == GGML_OP_ADD) || (a->op == GGML_OP_ADD && b->op == GGML_OP_ADD)) {
+        if (ggml_can_fuse(cgraph, node_idx - 1, { a->op, b->op })) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_name                = */ ggml_backend_sycl_get_name,
     /* .free                    = */ ggml_backend_sycl_free,
@@ -10175,6 +10208,7 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .event_wait              = */ ggml_backend_sycl_event_wait,
     /* .graph_optimize          = */ ggml_backend_sycl_graph_optimize,
     /* .fusion_absorbs          = */ ggml_backend_sycl_fusion_absorbs,
+    /* .graph_cut_ok            = */ ggml_backend_sycl_graph_cut_ok,
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {

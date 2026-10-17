@@ -21,6 +21,8 @@
 #include <string.h>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
+#include <climits>
 #include <vector>
 
 #ifdef __APPLE__
@@ -959,6 +961,7 @@ struct ggml_backend_sched {
     // hash map of the nodes in the graph
     struct ggml_hash_set  hash_set;
     int                 * hv_tensor_backend_ids; // [hash_set.size]
+    uint8_t             * hv_tensor_user;        // [hash_set.size], 1 when the caller assigned the backend
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
     size_t              * hv_copies_used;        // the [id][backend] entries of hv_tensor_copies that are set
     size_t                n_hv_copies_used;
@@ -1000,6 +1003,8 @@ struct ggml_backend_sched {
     size_t context_buffer_size;
 
     bool op_offload;
+
+    enum ggml_backend_sched_seam_mode seam_mode;
 
     int debug;
 
@@ -1324,6 +1329,203 @@ static void ggml_backend_sched_build_fusion_plan(ggml_backend_sched_t sched) {
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+// Seam minimization (ggml_backend_sched_set_seam_mode), between pass 4 and pass 5: at every boundary
+// between two non-CPU backends, try moving the boundary over the weight-free nodes around it and keep the
+// cut where the fewest bytes leave the sending backend: tensors produced before the cut and read after it,
+// plus the graph inputs each side then has to receive. Layer and weight placement never change, a node the
+// caller assigned is never moved, and the default seam stays unless a strictly cheaper cut exists.
+
+static const ggml_tensor * ggml_sched_seam_owner(const ggml_tensor * t) {
+    while (t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static bool ggml_sched_seam_reads_weight(const ggml_tensor * node) {
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        const ggml_tensor * s = node->src[j];
+        if (!s) {
+            continue;
+        }
+        const ggml_tensor * o = ggml_sched_seam_owner(s);
+        if (o->buffer && ggml_backend_buffer_get_usage(o->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void ggml_backend_sched_minimize_seams(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (sched->seam_mode == GGML_BACKEND_SCHED_SEAM_OFF || sched->n_backends < 3) {
+        return;
+    }
+    const int cpu = sched->n_backends - 1;  // the lowest priority backend never takes part
+    const int W   = 192;                    // nodes searched on each side of a boundary
+    const int R   = 1024;                   // how far after the cut a read still counts
+    static int n_logged = 0;
+    std::unordered_set<const ggml_tensor *> moved;
+
+    // the non-view nodes in order, with their backends
+    std::vector<int> idx;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        if (!ggml_is_view_op(graph->nodes[i]->op)) {
+            idx.push_back(i);
+        }
+    }
+    auto be = [&](int k) { return tensor_backend_id(graph->nodes[idx[k]]); };
+
+    // the producing node (position in idx) of every non-view tensor
+    std::unordered_map<const ggml_tensor *, int> pos;
+    for (int k = 0; k < (int) idx.size(); k++) {
+        pos[graph->nodes[idx[k]]] = k;
+    }
+
+    for (int kb = 1; kb < (int) idx.size(); kb++) {
+        const int A = be(kb - 1), B = be(kb);
+        if (A == B || A == cpu || B == cpu || A < 0 || B < 0) {
+            continue;
+        }
+        // the two segments around the boundary
+        int a0 = kb - 1;
+        while (a0 > 0 && be(a0 - 1) == A) {
+            a0--;
+        }
+        int b1 = kb;
+        while (b1 + 1 < (int) idx.size() && be(b1 + 1) == B) {
+            b1++;
+        }
+        // how far the cut may move: over weight-free nodes the caller did not place, which the other side supports
+        auto movable = [&](int k, int to) {
+            ggml_tensor * n = graph->nodes[idx[k]];
+            return !sched->hv_tensor_user[hash_id(n)] && !ggml_sched_seam_reads_weight(n) &&
+                   ggml_backend_supports_op(sched->backends[to], n);
+        };
+        int lo = kb;
+        while (lo > a0 && kb - lo < W && movable(lo - 1, B)) {
+            lo--;
+        }
+        int hi = kb;
+        while (hi <= b1 && hi - kb < W && movable(hi, A)) {
+            hi++;
+        }
+        if (lo == kb && hi == kb) {
+            continue;
+        }
+        const int c_end = std::min(b1 + 1, hi + R);
+
+        // cost of a cut before position p in [lo, hi]: an activation crosses it when it is produced before p
+        // and last read at or after p (reads up to c_end); a graph input is received by the sending side when
+        // it reads it before p (or before the window), by the receiving side when it reads it at or after p
+        const int nc = hi - lo + 1;
+        std::vector<int64_t> diff(nc + 1, 0);
+        std::unordered_map<const ggml_tensor *, int> last;
+        struct input_reads { int first = INT_MAX, last = -1; bool before = false; };
+        std::unordered_map<const ggml_tensor *, input_reads> inputs;
+        for (int k = a0; k < c_end; k++) {
+            const ggml_tensor * n = graph->nodes[idx[k]];
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (!n->src[j]) {
+                    continue;
+                }
+                const ggml_tensor * o = ggml_sched_seam_owner(n->src[j]);
+                if (o->flags & GGML_TENSOR_FLAG_INPUT) {
+                    auto & r = inputs[o];
+                    if (k < lo) {
+                        r.before = true;
+                    } else {
+                        r.first = std::min(r.first, k);
+                        r.last  = std::max(r.last, k);
+                    }
+                } else if (k >= lo) {
+                    auto it = pos.find(o);
+                    if (it != pos.end() && it->second < hi) {
+                        int & l = last[o];
+                        l = std::max(l, k);
+                    }
+                }
+            }
+        }
+        for (const auto & [o, l] : last) {
+            // crosses p for p in (produced, l], clipped to [lo, hi]
+            const int p0 = std::max(lo, pos[o] + 1), p1 = std::min(hi, l);
+            if (p0 <= p1) {
+                diff[p0 - lo] += (int64_t) ggml_nbytes(o);
+                diff[p1 - lo + 1] -= (int64_t) ggml_nbytes(o);
+            }
+        }
+        std::vector<int64_t> x_cost(nc);
+        for (int q = 0; q < nc; q++) {
+            x_cost[q] = (q ? x_cost[q - 1] : 0) + diff[q];
+        }
+        auto cost = [&](int p) {
+            size_t bytes = (size_t) x_cost[p - lo];
+            for (const auto & [o, r] : inputs) {
+                const bool on_a = r.before || r.first < p;
+                const bool on_b = r.last >= p;
+                bytes += ggml_nbytes(o) * ((on_a ? 1 : 0) + (on_b ? 1 : 0));
+            }
+            return bytes;
+        };
+        // respecting fusions: no cut where either backend would fuse across it
+        auto cut_ok = [&](int p) {
+            if (sched->seam_mode != GGML_BACKEND_SCHED_SEAM_RESPECT_FUSIONS || p == kb) {
+                return true;
+            }
+            for (int b : { A, B }) {
+                ggml_backend_t bk = sched->backends[b];
+                if (bk->iface.graph_cut_ok && !bk->iface.graph_cut_ok(bk, graph, idx[p])) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        const size_t base = cost(kb);
+        size_t best = base;
+        int    best_p = kb;
+        for (int p = lo; p <= hi; p++) {
+            if (p == kb || !cut_ok(p)) {
+                continue;
+            }
+            const size_t c = cost(p);
+            if (c < best || (c == best && std::abs(p - kb) < std::abs(best_p - kb))) {
+                best = c;
+                best_p = p;
+            }
+        }
+        if (best_p == kb || best >= base) {
+            continue;
+        }
+        for (int k = std::min(best_p, kb); k < std::max(best_p, kb); k++) {
+            ggml_tensor * n = graph->nodes[idx[k]];
+            tensor_backend_id(n) = best_p < kb ? B : A;
+            moved.insert(n);
+            SET_CAUSE(n, "seam");
+        }
+        if (sched->debug || n_logged < 8) {
+            n_logged++;
+            GGML_LOG_INFO("%s: %s -> %s: cut moved %+d nodes, before %s: %.2f -> %.2f MiB received (inputs included)\n", __func__,
+                ggml_backend_name(sched->backends[A]), ggml_backend_name(sched->backends[B]), best_p - kb,
+                graph->nodes[idx[best_p]]->name, base / 1048576.0, best / 1048576.0);
+        }
+        kb = std::max(kb, best_p);
+    }
+    // views of a moved tensor follow it
+    if (moved.empty()) {
+        return;
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ggml_tensor * n = graph->nodes[i];
+        if (n->view_src && ggml_is_view_op(n->op)) {
+            ggml_tensor * o = const_cast<ggml_tensor *>(ggml_sched_seam_owner(n));
+            if (moved.count(o)) {
+                tensor_backend_id(n) = tensor_backend_id(o);
+            }
+        }
+    }
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -1554,6 +1756,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         }
         GGML_ASSERT(*cur_backend_id != -1);
     }
+
+    ggml_backend_sched_minimize_seams(sched, graph);
 
     // pass 5: split graph, find tensors that need to be copied
     {
@@ -2096,6 +2300,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    sched->hv_tensor_user        = (uint8_t *) calloc(sched->hash_set.size, sizeof(sched->hv_tensor_user[0]));
+    {
+        const char * e = getenv("GGML_SCHED_SEAM");
+        sched->seam_mode = (enum ggml_backend_sched_seam_mode) (e ? atoi(e) : 0);
+    }
     sched->hv_tensor_copies      = (ggml_tensor **) calloc(sched->hash_set.size * sched->n_backends * sched->n_copies, sizeof(struct ggml_tensor *));
     sched->hv_copies_used        = (size_t *) malloc(sched->hash_set.size * sched->n_backends * sizeof(size_t));
     sched->n_hv_copies_used      = 0;
@@ -2159,6 +2368,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->splits);
     free(sched->graph_inputs);
     free(sched->hv_tensor_backend_ids);
+    free(sched->hv_tensor_user);
     free(sched->hv_tensor_copies);
     free(sched->hv_copies_used);
     free(sched->fusion_absorbed);
@@ -2178,6 +2388,7 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
         memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+        memset(sched->hv_tensor_user, 0, sched->hash_set.size * sizeof(sched->hv_tensor_user[0]));
         // clear only the copies that were set, the table is large with many copies
         for (size_t i = 0; i < sched->n_hv_copies_used; i++) {
             memset(&sched->hv_tensor_copies[sched->hv_copies_used[i] * sched->n_copies], 0, sched->n_copies * sizeof(struct ggml_tensor *));
@@ -2321,11 +2532,17 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
+void ggml_backend_sched_set_seam_mode(ggml_backend_sched_t sched, enum ggml_backend_sched_seam_mode mode) {
+    GGML_ASSERT(sched);
+    sched->seam_mode = mode;
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
     tensor_backend_id(node) = backend_index;
+    sched->hv_tensor_user[hash_id(node)] = 1;
     SET_CAUSE(node, "usr");
     sched->is_reset = false;
 }

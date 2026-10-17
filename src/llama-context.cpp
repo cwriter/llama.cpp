@@ -359,6 +359,7 @@ llama_context::llama_context(
     cparams.op_offload     = params.op_offload;
     cparams.kv_unified     = params.kv_unified;
     cparams.moe_cache_size = params.moe_cache_size;
+    cparams.seam_mode      = params.seam_mode;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -746,6 +747,9 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+    if (cparams.seam_mode != 0) {
+        ggml_backend_sched_set_seam_mode(sched.get(), (enum ggml_backend_sched_seam_mode) cparams.seam_mode);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -784,6 +788,9 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
+                if (cparams.seam_mode != 0) {
+                    ggml_backend_sched_set_seam_mode(sched.get(), (enum ggml_backend_sched_seam_mode) cparams.seam_mode);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -4107,6 +4114,7 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
+        /*.seam_mode                   =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

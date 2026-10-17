@@ -373,6 +373,17 @@ extern "C" {
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);
 
+    // Seam minimization at the boundaries between devices: without moving any weight or any node the
+    // caller assigned, move the boundary to the cut through the graph where the fewest bytes cross
+    // (each crossing tensor is copied, and kept n_copies times in pipeline mode). The default seam is
+    // kept unless a strictly cheaper cut exists.
+    enum ggml_backend_sched_seam_mode {
+        GGML_BACKEND_SCHED_SEAM_OFF             = 0,
+        GGML_BACKEND_SCHED_SEAM_FIRST           = 1, // place the seams, then the backends fuse within the splits
+        GGML_BACKEND_SCHED_SEAM_RESPECT_FUSIONS = 2, // never cut where a backend reports a fusion
+    };
+    GGML_API void                 ggml_backend_sched_set_seam_mode(ggml_backend_sched_t sched, enum ggml_backend_sched_seam_mode mode);
+
     //
     // Meta backend
     //

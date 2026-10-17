@@ -2957,6 +2957,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
+        {"--minimize-multidevice-seam"}, "[off|seam-first|respect-fusions]",
+        "at each boundary between devices, move the weight-free ops around it to the cut where the fewest bytes\n"
+        "cross (and are kept per pipeline copy); layer and weight placement do not change, and the default\n"
+        "seam is kept unless a cheaper cut exists. seam-first: place the seams, then the backends fuse within\n"
+        "the splits; respect-fusions: never cut where a backend reports a fusion (default: off)",
+        [](common_params & params, const std::string & value) {
+            if (value == "off" || value == "0") {
+                params.seam_mode = 0;
+            } else if (value == "seam-first" || value == "1") {
+                params.seam_mode = 1;
+            } else if (value == "respect-fusions" || value == "2") {
+                params.seam_mode = 2;
+            } else {
+                throw std::invalid_argument("invalid value for --minimize-multidevice-seam: " + value);
+            }
+        }
+    ).set_env("LLAMA_ARG_MINIMIZE_MULTIDEVICE_SEAM"));
+    add_opt(common_arg(
         {"--op-offload"},
         {"--no-op-offload"},
         string_format("whether to offload host tensor operations to device (default: %s)", params.no_op_offload ? "false" : "true"),
