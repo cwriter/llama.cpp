@@ -52,6 +52,14 @@ bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y,
                               int64_t nrows, dpct::queue_ptr stream);
 
 // f32 mat-vec for one token with an epilogue (1: sigmoid, 2: softplus(x + bias[m]) * scale[m]) on ESIMD
+// two one-token f32 mat-vecs over the same activation b in one launch, each with its own epilogue
+// (0 none, 1 sigmoid, 2 softplus(x + bias) * scale); false when not supported
+bool ggml_sycl_f32_mat_vec2_epi_esimd(const float * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
+                                      const float * bias0, const float * scale0,
+                                      const float * a1, float * dst1, int64_t M1, int64_t lda1, int epi1,
+                                      const float * bias1, const float * scale1,
+                                      const float * b, int64_t K, dpct::queue_ptr stream);
+
 bool ggml_sycl_f32_mat_vec_epi_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
                                      int epi, const float * bias, const float * scale, dpct::queue_ptr stream);
 

@@ -9133,6 +9133,39 @@ struct test_matvec_epi : public test_case {
     }
 };
 
+// the shared-expert gate (sigmoid of a one-row f32 mat-vec) right before the f32 router over the same activation,
+// as a backend may order them to run both in one launch
+struct test_f32_siblings : public test_case {
+    const int64_t k;
+    const int64_t m;
+    const int64_t n_tokens;
+    ggml_tensor * gate   = nullptr;
+    ggml_tensor * logits = nullptr;
+
+    std::string vars() override { return VARS_TO_STR3(k, m, n_tokens); }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "F32_SIBLINGS";
+    }
+    double max_nmse_err() override { return 1e-5; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { gate, logits }; }
+
+    test_f32_siblings(int64_t k = 2560, int64_t m = 512, int64_t n_tokens = 1) : k(k), m(m), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w_sh  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_tensor * w_inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
+        gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_sh, x));
+        ggml_build_forward_expand(gf, gate);
+        logits = ggml_mul_mat(ctx, w_inp, x);
+        ggml_set_name(logits, "logits");
+        return ggml_add(ctx, logits, ggml_repeat(ctx, gate, logits));
+    }
+};
+
 // GGML_OP_SUM
 struct test_sum : public test_case {
     const ggml_type type;
@@ -13497,6 +13530,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // odd row count for the row tail.
     test_cases.emplace_back(new test_glu_stream(GGML_TYPE_Q8_0, 1, 640, 2560, 2));
     for (int64_t nt : {1, 2}) {
+    test_cases.emplace_back(new test_f32_siblings(2560, 512, 1));
+    test_cases.emplace_back(new test_f32_siblings(2560, 512, 3));
+    test_cases.emplace_back(new test_f32_siblings(1024, 48, 1));
         test_cases.emplace_back(new test_matvec_epi(2560, 48, nt));
         test_cases.emplace_back(new test_matvec_epi(512, 7, nt));
     }

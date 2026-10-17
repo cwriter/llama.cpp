@@ -8895,6 +8895,61 @@ static int ggml_sycl_mmid_tiled_moe_fused(ggml_backend_sycl_context & ctx, ggml_
 
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx);
 
+// GGML_SYCL_F32_SIBLINGS: two one-token f32 mat-vecs that read the same activation, each with the epilogue it
+// fuses (sigmoid, softplus * scale) or none, back to back in node order, in one launch (qwen4exp: the router
+// and the shared-expert gate, the GDN alpha and beta gates). graph_optimize moves the second one next to the
+// first and keeps the activation live until the second output, which the launch writes early.
+struct ggml_sycl_f32_mv_run {
+    ggml_tensor *       mm    = nullptr;
+    ggml_tensor *       out   = nullptr;  // the epilogue's last node, or mm
+    const ggml_tensor * bias  = nullptr;
+    const ggml_tensor * scale = nullptr;
+    int                 epi   = 0;
+    int                 last  = -1;
+};
+
+static bool ggml_sycl_f32_siblings_on() {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_F32_SIBLINGS", 1) != 0;
+    return on && g_ggml_sycl_enable_fusion && g_ggml_sycl_enable_esimd;
+}
+
+static bool ggml_sycl_f32_mv_run_at(const ggml_cgraph * g, int i, ggml_sycl_f32_mv_run & r, bool any_tokens) {
+    ggml_tensor * n = g->nodes[i];
+    if (n->op != GGML_OP_MUL_MAT || n->type != GGML_TYPE_F32 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    const ggml_tensor * a = n->src[0];
+    const ggml_tensor * x = n->src[1];
+    if (a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || a->ne[2] != 1 || a->ne[3] != 1 || x->type != GGML_TYPE_F32 ||
+        !ggml_is_contiguous(x) || a->ne[0] != x->ne[0] || a->ne[0] % 128 != 0 || !ggml_is_contiguous(n) ||
+        (!any_tokens && ggml_nrows(x) != 1)) {
+        return false;
+    }
+    ggml_sycl_matvec_epi_match em;
+    if (ggml_sycl_match_matvec_epilogue(g, i, em, any_tokens)) {
+        r = { em.mm, em.last, em.bias, em.scale, em.epi, em.last_idx };
+    } else {
+        r = { n, n, nullptr, nullptr, 0, i };
+    }
+    return true;
+}
+
+// the run at i and the run right after it (view nodes in between are skipped) read the same activation
+static bool ggml_sycl_f32_siblings_at(const ggml_cgraph * g, int i, ggml_sycl_f32_mv_run & r0, ggml_sycl_f32_mv_run & r1,
+                                      bool any_tokens) {
+    if (!ggml_sycl_f32_siblings_on() || !ggml_sycl_f32_mv_run_at(g, i, r0, any_tokens)) {
+        return false;
+    }
+    int j = r0.last + 1;
+    auto is_view = [](ggml_op op) {
+        return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+    };
+    while (j < g->n_nodes && is_view(g->nodes[j]->op)) {
+        ++j;
+    }
+    return j < g->n_nodes && ggml_sycl_f32_mv_run_at(g, j, r1, any_tokens) && r1.mm->src[1] == r0.mm->src[1];
+}
+
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
 
 // GGML_SYCL_MOE_DOWN_REDUCE outside the tiled prefill path: the down projection writes the experts to
@@ -9307,6 +9362,23 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        if (node->op == GGML_OP_MUL_MAT) {
+            ggml_sycl_f32_mv_run r0, r1;
+            if (ggml_sycl_f32_siblings_at(cgraph, i, r0, r1, /*any_tokens=*/false)) {
+                scope_op_debug_print scope_dbg_print("ggml_sycl_f32_siblings_fused", r1.out, /*num_src=*/0);
+                const ggml_tensor * a0 = r0.mm->src[0];
+                const ggml_tensor * a1 = r1.mm->src[0];
+                if (ggml_sycl_f32_mat_vec2_epi_esimd(
+                        (const float *) a0->data, (float *) r0.out->data, a0->ne[1], a0->ne[0], r0.epi,
+                        r0.bias ? (const float *) r0.bias->data : nullptr, r0.scale ? (const float *) r0.scale->data : nullptr,
+                        (const float *) a1->data, (float *) r1.out->data, a1->ne[1], a1->ne[0], r1.epi,
+                        r1.bias ? (const float *) r1.bias->data : nullptr, r1.scale ? (const float *) r1.scale->data : nullptr,
+                        (const float *) r0.mm->src[1]->data, a0->ne[0], sycl_ctx->stream())) {
+                    i = r1.last;
+                    continue;
+                }
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT) {
             ggml_sycl_matvec_epi_match em;
             if (ggml_sycl_match_matvec_epilogue(cgraph, i, em, /*any_tokens=*/false)) {
@@ -10039,11 +10111,74 @@ static void ggml_sycl_hoist_q8_f32_rows(ggml_cgraph * cgraph) {
     }
 }
 
+// Move an f32 mat-vec run (the mat-vec and its fused epilogue) right in front of an earlier f32 mat-vec run
+// that reads the same activation, so ggml_sycl_f32_siblings_at finds them back to back. In front, not behind:
+// the first run's consumers (the router's top-k) stay right after it. Only the order changes.
+static void ggml_sycl_hoist_f32_siblings(ggml_cgraph * cgraph) {
+    if (!ggml_sycl_f32_siblings_on()) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes - 1; ++i) {
+        ggml_sycl_f32_mv_run a, b;
+        if (!ggml_sycl_f32_mv_run_at(cgraph, i, a, /*any_tokens=*/true) ||
+            ggml_sycl_f32_siblings_at(cgraph, i, a, b, /*any_tokens=*/true)) {
+            continue;
+        }
+        const ggml_tensor * act = a.mm->src[1];
+        int j = -1;
+        for (int n = a.last + 1; n < cgraph->n_nodes && n <= a.last + 64; ++n) {
+            if (ggml_sycl_f32_mv_run_at(cgraph, n, b, /*any_tokens=*/true) && b.mm->src[1] == act) {
+                j = n;
+                break;
+            }
+        }
+        if (j < 0) {
+            continue;
+        }
+        // the run's sources must exist before i and stay unwritten until j; sources inside the run move with it
+        bool ok = true;
+        for (int k = j; k <= b.last && ok; ++k) {
+            const ggml_tensor * moved = cgraph->nodes[k];
+            for (int s = 0; s < GGML_MAX_SRC && moved->src[s] && ok; ++s) {
+                const ggml_tensor * src = moved->src[s];
+                bool in_run = false;
+                for (int q = j; q < k; ++q) {
+                    in_run = in_run || cgraph->nodes[q] == src || cgraph->nodes[q] == src->view_src;
+                }
+                if (in_run) {
+                    continue;
+                }
+                if (ggml_sycl_written_between(cgraph, src, i - 1, j)) {
+                    ok = false;
+                }
+                for (int q = i; q < j && ok; ++q) {
+                    ok = cgraph->nodes[q] != src && cgraph->nodes[q] != src->view_src;
+                }
+            }
+        }
+        if (!ok) {
+            continue;
+        }
+        std::rotate(cgraph->nodes + i, cgraph->nodes + j, cgraph->nodes + b.last + 1);
+        i += b.last - j + 1 + a.last - i;  // past both runs
+    }
+}
+
 static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph,
                                              ggml_backend_graph_optimize_params * params) {
     GGML_UNUSED(backend);
     ggml_sycl_hoist_q8_siblings(cgraph);
     ggml_sycl_hoist_q8_f32_rows(cgraph);
+    ggml_sycl_hoist_f32_siblings(cgraph);
+    // the f32 sibling launch writes the second output at the first mat-vec: the activation must outlive it
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        ggml_sycl_f32_mv_run r0, r1;
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && ggml_sycl_f32_siblings_at(cgraph, i, r0, r1, /*any_tokens=*/true)) {
+            ggml_tensor * act = r0.mm->src[1];
+            params->add_alloc_dep(params->user_data, act->view_src ? act->view_src : act, r1.out);
+            i = r1.last;
+        }
+    }
     // The skipped copy input must survive until the fused multiply.
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         if (cgraph->nodes[i]->op != GGML_OP_CONT) {

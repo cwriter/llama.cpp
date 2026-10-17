@@ -3914,6 +3914,72 @@ static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * d
             }
         });
 }
+
+// Two f32 mat-vecs that read the same activation, in one launch (ggml_sycl_f32_mat_vec2_epi_esimd): rows
+// [0, M0) of a0 then [0, M1) of a1, each with its own epilogue (0 none, 1 sigmoid, 2 softplus(+bias)*scale)
+struct f32_mv_seg {
+    const float * a;
+    float *       dst;
+    const float * bias;
+    const float * scale;
+    int           M;
+    int           lda;
+    int           epi;
+};
+
+template <int KS, int RG, int CH>
+static void f32_mat_vec2_esimd_launch(f32_mv_seg s0, f32_mv_seg s1, const float * b, const int K,
+                                      dpct::queue_ptr stream) {
+    constexpr int WG = KS * RG;
+    const int     n_wg = ceil_div(s0.M + s1.M, RG);
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) n_wg * WG), sycl::range<1>(WG)),
+        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            slm_init<WG * sizeof(float)>();
+            const int  tid = it.get_local_id(0);
+            const int  rg  = tid / KS;
+            const int  ks  = tid % KS;
+            const int  r   = it.get_group(0) * RG + rg;
+            const bool in1 = r >= s0.M;
+            const int  m   = in1 ? r - s0.M : r;
+            const int  M   = in1 ? s1.M : s0.M;
+            const int  nch = K / 128;
+
+            simd<float, 128> acc = 0.0f;
+            if (m < M) {
+                const float * arow = (in1 ? s1.a : s0.a) + (size_t) m * (in1 ? s1.lda : s0.lda);
+                int c = ks * CH;
+                for (; c + CH <= nch; c += KS * CH) {
+                    simd<float, 128 * CH> av = block_load<float, 128 * CH>(arow + c * 128);
+                    simd<float, 128 * CH> bv = block_load<float, 128 * CH>(b + c * 128);
+#pragma unroll
+                    for (int i = 0; i < CH; ++i) {
+                        acc += av.template select<128, 1>(i * 128) * bv.template select<128, 1>(i * 128);
+                    }
+                }
+                for (int i = 0; i < CH && c + i < nch; ++i) {
+                    acc += block_load<float, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
+                }
+            }
+            slm_scalar_store<float>(tid * sizeof(float), reduce<float>(acc, std::plus<>{}));
+            barrier();
+            if (ks == 0 && m < M) {
+                simd<float, KS> part = slm_block_load<float, KS>(tid * sizeof(float));
+                float v = reduce<float>(part, std::plus<>{});
+                const int epi = in1 ? s1.epi : s0.epi;
+                if (epi == 1) {
+                    v = 1.0f / (1.0f + sycl::exp(-v));
+                } else if (epi == 2) {
+                    v += (in1 ? s1.bias : s0.bias)[m];
+                    const float vmax = v > 0.0f ? v : 0.0f;
+                    const float vabs = v < 0.0f ? -v : v;
+                    v = (vmax + sycl::log1p(sycl::exp(-vabs))) * (in1 ? s1.scale : s0.scale)[m];
+                }
+                (in1 ? s1.dst : s0.dst)[m] = v;
+            }
+        });
+}
 #endif
 
 bool ggml_sycl_q8_0_siblings_esimd(const void * va, const void * vb, const float * y, float * oa, float * ob,
@@ -3974,6 +4040,32 @@ bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y,
     return true;
 #else
     GGML_UNUSED_VARS(vg, vu, y, dst, ncols, nrows, stream);
+    return false;
+#endif
+}
+
+bool ggml_sycl_f32_mat_vec2_epi_esimd(const float * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
+                                      const float * bias0, const float * scale0,
+                                      const float * a1, float * dst1, int64_t M1, int64_t lda1, int epi1,
+                                      const float * bias1, const float * scale1,
+                                      const float * b, int64_t K, dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (!g_ggml_sycl_enable_esimd || K % 128 != 0 || lda0 % 4 != 0 || lda1 % 4 != 0 || M0 <= 0 || M1 <= 0 ||
+        M0 + M1 > INT32_MAX || K > INT32_MAX || ((uintptr_t) a0 | (uintptr_t) a1 | (uintptr_t) b) % 16 != 0 ||
+        epi0 < 0 || epi0 > 2 || epi1 < 0 || epi1 > 2) {
+        return false;
+    }
+    const f32_mv_seg s0 = { a0, dst0, bias0, scale0, (int) M0, (int) lda0, epi0 };
+    const f32_mv_seg s1 = { a1, dst1, bias1, scale1, (int) M1, (int) lda1, epi1 };
+    // the shapes of the single launches: few rows spread a row over more threads
+    if (M0 + M1 < 128) {
+        f32_mat_vec2_esimd_launch<10, 4, 2>(s0, s1, b, (int) K, stream);
+    } else {
+        f32_mat_vec2_esimd_launch<2, 16, 5>(s0, s1, b, (int) K, stream);
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(a0, dst0, M0, lda0, epi0, bias0, scale0, a1, dst1, M1, lda1, epi1, bias1, scale1, b, K, stream);
     return false;
 #endif
 }
