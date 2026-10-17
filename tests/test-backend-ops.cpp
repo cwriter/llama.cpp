@@ -8131,6 +8131,95 @@ struct test_qsa_sparse_fa : public test_case {
     }
 };
 
+// qwen4exp QSA selection list: which slots are live, each dead slot parked in its own dump row
+// (build_indexer), from the picked pools' scores, the selected cells and the tail cells
+struct test_qsa_live : public test_case {
+    const int64_t n_kv;
+    const int64_t n_top;
+    const int64_t kpool;
+    const int64_t n_tail;
+    const int64_t n_tps;
+    const bool    plain;  // scores are >= 0 or -inf, as the indexer's rectified sums are
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_LIVE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_kv, n_top, kpool, n_tail, n_tps, plain);
+    }
+
+    test_qsa_live(int64_t n_kv = 2048, int64_t n_top = 64, int64_t kpool = 4, int64_t n_tail = 3, int64_t n_tps = 1,
+                  bool plain = true)
+        : n_kv(n_kv), n_top(n_top), kpool(kpool), n_tail(n_tail), n_tps(n_tps), plain(plain) {}
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_sel = kpool*n_top + n_tail;
+
+        // the picked pools' scores are gathered inside the chain, as the model does it
+        const int64_t n_pool = 2*n_top;
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_pool, n_tps);
+        ggml_set_name(score, "score");
+        ggml_tensor * top_k = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top, n_tps);
+        ggml_set_name(top_k, "top_k");
+        ggml_tensor * sel_idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, n_tps);
+        ggml_set_name(sel_idx, "sel_idx");
+        ggml_tensor * tail_idxs = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tail, n_tps);
+        ggml_set_name(tail_idxs, "tail_idxs");
+
+        // the chain exactly as build_indexer emits it
+        ggml_tensor * top_score = ggml_get_rows(ctx, ggml_reshape_3d(ctx, score, 1, n_pool, n_tps), top_k);
+        ggml_tensor * live_pool = ggml_clamp(ctx, ggml_scale_bias(ctx, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
+        live_pool = ggml_reshape_2d(ctx, ggml_repeat_4d(ctx, live_pool, kpool, n_top, n_tps, 1), kpool*n_top, n_tps);
+        ggml_tensor * live_tail = ggml_cast(ctx, tail_idxs, GGML_TYPE_F32);
+        live_tail = ggml_clamp(ctx, ggml_scale_bias(ctx, live_tail, -1.0f, (float) n_kv), 0.0f, 1.0f);
+        ggml_tensor * live = ggml_concat(ctx, live_pool, live_tail, 0);
+
+        ggml_tensor * dump  = ggml_scale_bias(ctx, ggml_cumsum(ctx, ggml_fill(ctx, live, 1.0f)), 1.0f, (float) (n_kv - 1));
+        ggml_tensor * idx_f = ggml_cast(ctx, sel_idx, GGML_TYPE_F32);
+        idx_f = ggml_add(ctx, ggml_mul(ctx, ggml_sub(ctx, idx_f, dump), live), dump);
+        out   = ggml_cast(ctx, idx_f, GGML_TYPE_I32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(4321);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            std::vector<int32_t> idata(ggml_nelements(t));
+            if (strcmp(t->name, "score") == 0) {
+                // a few invisible pools; otherwise a rectified sum, or any value when not plain
+                std::uniform_real_distribution<float> u(plain ? 0.0f : -2.0f, plain ? 10.0f : 2.0f);
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); ++i) {
+                    data[i] = rng() % 5 == 0 ? -INFINITY : u(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+                continue;
+            } else if (strcmp(t->name, "top_k") == 0) {
+                for (auto & v : idata) {
+                    v = (int32_t) (rng() % (2*n_top));
+                }
+            } else if (strcmp(t->name, "sel_idx") == 0 || strcmp(t->name, "tail_idxs") == 0) {
+                // cells, with the n_kv sentinel of padded blocks and missing tail cells
+                for (auto & v : idata) {
+                    v = rng() % 4 == 0 ? (int32_t) n_kv : (int32_t) (rng() % n_kv);
+                }
+            }
+            ggml_backend_tensor_set(t, idata.data(), 0, idata.size()*sizeof(int32_t));
+        }
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -12587,6 +12676,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
     // a 0/-inf mask, which a backend may pack: the fused top-k and the small-k unfused path
+
+    // qwen4exp QSA selection list: 64 pools of 4 plus a 3-cell tail
+    test_cases.emplace_back(new test_qsa_live(2048,   64, 4, 3, 1));
+    test_cases.emplace_back(new test_qsa_live(131072, 64, 4, 3, 1));
+    test_cases.emplace_back(new test_qsa_live(8192,   64, 4, 3, 4));
+    test_cases.emplace_back(new test_qsa_live(4096,   64, 4, 3, 512));
+    test_cases.emplace_back(new test_qsa_live(1000,   7,  3, 5, 9, false));
 
     // qwen4exp QSA attention chain: 24/2 heads, head size 256, width 2051
     for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
