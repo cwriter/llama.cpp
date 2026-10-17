@@ -1,4 +1,5 @@
 #include "fwht.hpp"
+#include "kv-soa.hpp"
 
 #include <cmath>
 #define P 1.0f
@@ -413,4 +414,143 @@ bool ggml_sycl_op_fwht(ggml_backend_sycl_context & ctx, const ggml_tensor * src,
         default:
             return false;
     }
+}
+
+// GGML_SYCL_FUSE_FWHT_SET_ROWS: a Hadamard MUL_MAT whose only reader is a SET_ROWS into a q8_0 cache (qwen4exp:
+// the rotated V rows), in one launch: one work-group per row rotates it with the butterflies above (same order)
+// and quantizes its blocks straight into the cache row. The rotated tensor is never written.
+static int32_t fwht_uses(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[pos];
+}
+
+// The SET_ROWS into a q8_0 cache that is the only reader of the Hadamard MUL_MAT at i (through single-use
+// views), or -1. It may come some nodes later (qwen4exp: V is rotated before the K norm, rope, rotation and
+// write, and written after them); nothing in between touches that cache, so it is written at the MUL_MAT.
+static constexpr int FWHT_SET_ROWS_WINDOW = 64;
+
+static int fwht_set_rows_match(const ggml_cgraph * cgraph, int i) {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_FUSE_FWHT_SET_ROWS", 1) != 0;
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (!on || !g_ggml_sycl_enable_fusion || mm->op != GGML_OP_MUL_MAT ||
+        ggml_get_op_params_i32(mm, 1) != GGML_HINT_SRC0_IS_HADAMARD || mm->type != GGML_TYPE_F32 ||
+        fwht_uses(cgraph, mm) != 1) {
+        return -1;
+    }
+    const ggml_tensor * x = mm->src[1];
+    const int64_t       N = x->ne[0];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_are_same_shape(x, mm) || N < 32 || N > 1024 ||
+        (N & (N - 1)) != 0 || N % QK8_0 != 0) {
+        return -1;
+    }
+    for (int k = i + 1; k < cgraph->n_nodes && k <= i + FWHT_SET_ROWS_WINDOW; ++k) {
+        const ggml_tensor * sr = cgraph->nodes[k];
+        if (sr->op != GGML_OP_SET_ROWS) {
+            continue;
+        }
+        const ggml_tensor * sv   = sr->src[0];
+        const ggml_tensor * root = sv;
+        while (root && root != mm && (root->op == GGML_OP_RESHAPE || root->op == GGML_OP_VIEW) && fwht_uses(cgraph, root) == 1) {
+            root = root->src[0];
+        }
+        if (root != mm) {
+            continue;
+        }
+        if (sr->type != GGML_TYPE_Q8_0 || ggml_sycl_kv_is_soa(sr) || (sr->view_src && ggml_sycl_kv_is_soa(sr->view_src)) ||
+            !ggml_is_contiguous(sv) || sv->ne[0] % N != 0 || ggml_nrows(x) != (sv->ne[0] / N) * ggml_nrows(sv) ||
+            sr->ne[0] != sv->ne[0] || sr->nb[0] != sizeof(block_q8_0) || sr->ne[2] != 1 || sr->ne[3] != 1 || !sr->src[1] ||
+            !ggml_is_contiguous(sr->src[1]) || (sr->src[1]->type != GGML_TYPE_I64 && sr->src[1]->type != GGML_TYPE_I32) ||
+            ggml_nelements(sr->src[1]) != ggml_nrows(sv)) {
+            return -1;
+        }
+        // the cache rows are written at the MUL_MAT: nothing up to the SET_ROWS may touch that cache or its indices
+        const ggml_tensor * cache = sr->view_src ? sr->view_src : sr;
+        for (int q = i + 1; q < k; ++q) {
+            const ggml_tensor * n = cgraph->nodes[q];
+            if (n == sr->src[1] || n->view_src == cache || n == cache) {
+                return -1;
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (n->src[s] && (n->src[s] == cache || n->src[s]->view_src == cache)) {
+                    return -1;
+                }
+            }
+        }
+        return k;
+    }
+    return -1;
+}
+
+bool ggml_sycl_fwht_set_rows_done(const ggml_cgraph * cgraph, int k) {
+    if (cgraph->nodes[k]->op != GGML_OP_SET_ROWS) {
+        return false;
+    }
+    for (int i = k - 1; i >= 0 && i >= k - FWHT_SET_ROWS_WINDOW; --i) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT && fwht_set_rows_match(cgraph, i) == k) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int ggml_sycl_fwht_set_rows(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph, int i) {
+    const int k = fwht_set_rows_match(cgraph, i);
+    if (k < 0) {
+        return 0;
+    }
+    const ggml_tensor * mm = cgraph->nodes[i];
+    const ggml_tensor * x  = mm->src[1];
+    const int64_t       N  = x->ne[0];
+    const ggml_tensor * sr = cgraph->nodes[k];
+    const ggml_tensor * sv = sr->src[0];
+    scope_op_debug_print scope_dbg_print(__func__, sr, 2, " (hadamard -> q8_0 cache)");
+
+    const float * xd    = (const float *) x->data;
+    char *        cache = (char *) sr->data;
+    const size_t  crow  = sr->nb[1];
+    const void *  cidx  = sr->src[1]->data;
+    const bool    i64   = sr->src[1]->type == GGML_TYPE_I64;
+    const int     n     = (int) N;
+    const int     per   = (int) (sv->ne[0] / N);  // rows per cache row
+    const int     rows  = (int) ggml_nrows(x);
+    const float   hs    = 1.0f / sycl::sqrt((float) N);
+
+    ctx.stream()->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> zs(sycl::range<1>(N), cgh);
+        cgh.parallel_for(sycl::nd_range<1>((size_t) rows * N, N), [=](sycl::nd_item<1> it) {
+            const int t = (int) it.get_local_id(0);
+            const int r = (int) it.get_group(0);
+            float     v = xd[(size_t) r * n + t] * hs;
+            for (int h = 1; h < n; h <<= 1) {
+                sycl::group_barrier(it.get_group());
+                zs[t] = v;
+                sycl::group_barrier(it.get_group());
+                const float q = zs[t ^ h];
+                v             = (t & h) == 0 ? v + q : q - v;
+            }
+            sycl::group_barrier(it.get_group());
+            zs[t] = v;
+            sycl::group_barrier(it.get_group());
+            if (t % QK8_0 == 0) {
+                float amax = 0.0f;
+                for (int j = 0; j < QK8_0; ++j) {
+                    amax = sycl::fmax(amax, sycl::fabs(zs[t + j]));
+                }
+                const float   d   = amax / ((1 << 7) - 1);
+                const float   id  = d ? 1.0f / d : 0.0f;
+                const int     tok = r / per;
+                const int64_t row = i64 ? ((const int64_t *) cidx)[tok] : ((const int32_t *) cidx)[tok];
+                char * blk = cache + (size_t) row * crow + (size_t) (((r % per) * n + t) / QK8_0) * sizeof(block_q8_0);
+                *(sycl::half *) blk = (sycl::half) d;
+                int8_t * qs = (int8_t *) (blk + sizeof(sycl::half));
+                for (int j = 0; j < QK8_0; ++j) {
+                    qs[j] = (int8_t) sycl::round(zs[t + j] * id);
+                }
+            }
+        });
+    });
+    return 1;  // the SET_ROWS is skipped where it stands, see ggml_sycl_fwht_set_rows_done
 }

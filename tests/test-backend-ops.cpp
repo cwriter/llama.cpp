@@ -8375,6 +8375,7 @@ struct test_norm_rope : public test_case {
     const int     mode;
     const bool    strided;  // x is every other half row of a wider projection
     const bool    ff;       // with frequency factors
+    const int     rot;      // then a Hadamard rotation of every head row (1), written into a q8_0 cache (2)
     ggml_tensor * out {};
 
     std::string op_desc(ggml_tensor * t) override {
@@ -8383,12 +8384,16 @@ struct test_norm_rope : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR7(D, n_head, n_tok, n_rot, mode, strided, ff);
+        return VARS_TO_STR7(D, n_head, n_tok, n_rot, mode, strided, ff) + (rot ? ",rot=" + std::to_string(rot) : "");
     }
 
     test_norm_rope(int64_t D = 256, int64_t n_head = 24, int64_t n_tok = 1, int n_rot = 64,
-                   int mode = GGML_ROPE_TYPE_IMROPE, bool strided = false, bool ff = false)
-        : D(D), n_head(n_head), n_tok(n_tok), n_rot(n_rot), mode(mode), strided(strided), ff(ff) {}
+                   int mode = GGML_ROPE_TYPE_IMROPE, bool strided = false, bool ff = false, int rot = 0)
+        : D(D), n_head(n_head), n_tok(n_tok), n_rot(n_rot), mode(mode), strided(strided), ff(ff), rot(rot) {}
+
+    // the norm's rsqrt and the CPU's 1/sqrt differ in the last bit, which the rope carries into ~1e-7;
+    // the rotated keys then go through q8_0, where a last-bit difference can move a quant
+    double max_nmse_err() override { return rot == 2 ? 1e-5 : 1e-6; }
 
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
@@ -8421,6 +8426,23 @@ struct test_norm_rope : public test_case {
         } else {
             out = ggml_rope_ext(ctx, y, pos, freq, n_rot, mode, 4096, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
         }
+        if (rot) {
+            // as llama_mul_mat_hadamard builds it
+            ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, D);
+            ggml_set_name(h, "hadamard");
+            ggml_tensor * r = ggml_mul_mat(ctx, h, ggml_reshape_2d(ctx, out, D, n_head*n_tok));
+            ggml_mul_mat_set_hint(r, GGML_HINT_SRC0_IS_HADAMARD);
+            out = ggml_reshape_4d(ctx, r, D, n_head, n_tok, 1);
+            if (rot == 2) {
+                const int64_t n_cells = 64;
+                ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, D*n_head, n_cells);
+                ggml_set_name(cache, "rot_cache");
+                ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tok);
+                ggml_set_name(idx, "rot_idx");
+                ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache, ggml_view_2d(ctx, out, D*n_head, n_tok, out->nb[2], 0), idx));
+                out = ggml_get_rows(ctx, cache, ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) n_cells, 1.0f), GGML_TYPE_I32));
+            }
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -8437,6 +8459,24 @@ struct test_norm_rope : public test_case {
                     p = (int32_t) (rng() % 20000);
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "rot_idx") == 0) {
+                std::vector<int64_t> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) {
+                    v[i] = (int64_t) ((i * 7 + 3) % 64);  // distinct cells
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int64_t));
+            } else if (strcmp(t->name, "hadamard") == 0) {
+                // the normalized Sylvester Hadamard matrix, which a backend may apply as a fast transform
+                std::vector<float> v(ggml_nelements(t));
+                const float s = 1.0f / std::sqrt((float) D);
+                for (int64_t i = 0; i < D; ++i) {
+                    for (int64_t j = 0; j < D; ++j) {
+                        v[i*D + j] = (__builtin_popcountll(i & j) & 1) ? -s : s;
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else if (t->type == GGML_TYPE_Q8_0) {
+                init_tensor_uniform(t);
             } else if (strcmp(t->name, "freq") == 0) {
                 init_tensor_uniform(t, 0.9f, 1.1f);
             } else {
@@ -9130,6 +9170,70 @@ struct test_matvec_epi : public test_case {
         ggml_tensor * out = ggml_add(ctx, ggml_mul(ctx, beta, alpha), ggml_reshape_4d(ctx, ggml_repeat_4d(ctx, sh, m, n_tokens, 1, 1), 1, m, n_tokens, 1));
         ggml_set_name(out, "out");
         return out;
+    }
+};
+
+// a Hadamard rotation of every row (llama_mul_mat_hadamard) written into a q8_0 cache, as the rotated V rows are
+struct test_fwht_cache : public test_case {
+    const int64_t n;
+    const int64_t n_head;
+    const int64_t n_tok;
+    ggml_tensor * out = nullptr;
+
+    std::string vars() override { return VARS_TO_STR3(n, n_head, n_tok); }
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FWHT_CACHE";
+    }
+    double max_nmse_err() override { return 1e-5; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    test_fwht_cache(int64_t n = 64, int64_t n_head = 8, int64_t n_tok = 1) : n(n), n_head(n_head), n_tok(n_tok) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_cells = 64;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n, n_head, n_tok);
+        ggml_set_name(x, "x");
+        ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, n);
+        ggml_set_name(h, "hadamard");
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n*n_head, n_cells);
+        ggml_set_name(cache, "rot_cache");
+        ggml_tensor * idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tok);
+        ggml_set_name(idx, "rot_idx");
+        ggml_tensor * r = ggml_mul_mat(ctx, h, ggml_reshape_2d(ctx, x, n, n_head*n_tok));
+        ggml_mul_mat_set_hint(r, GGML_HINT_SRC0_IS_HADAMARD);
+        r = ggml_reshape_3d(ctx, r, n, n_head, n_tok);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache, ggml_view_2d(ctx, r, n*n_head, n_tok, r->nb[2], 0), idx));
+        out = ggml_get_rows(ctx, cache, ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) n_cells, 1.0f), GGML_TYPE_I32));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "rot_idx") == 0) {
+                std::vector<int64_t> v(ggml_nelements(t));
+                for (size_t i = 0; i < v.size(); ++i) {
+                    v[i] = (int64_t) ((i * 7 + 3) % 64);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int64_t));
+            } else if (strcmp(t->name, "hadamard") == 0) {
+                std::vector<float> v(ggml_nelements(t));
+                const float sc = 1.0f / std::sqrt((float) n);
+                for (int64_t i = 0; i < n; ++i) {
+                    for (int64_t j = 0; j < n; ++j) {
+                        v[i*n + j] = (__builtin_popcountll(i & j) & 1) ? -sc : sc;
+                    }
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -13036,6 +13140,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_norm_rope(128, 8,  7,   128, GGML_ROPE_TYPE_MROPE));
     test_cases.emplace_back(new test_norm_rope(128, 8,  5,   128, GGML_ROPE_TYPE_NEOX));
     test_cases.emplace_back(new test_norm_rope(128, 8,  5,   64,  GGML_ROPE_TYPE_NEOX, false, true));
+    // then the Hadamard rotation of every head row (Q), and its q8_0 cache write (K)
+    test_cases.emplace_back(new test_norm_rope(256, 24, 1,   64, GGML_ROPE_TYPE_IMROPE, false, false, 1));
+    test_cases.emplace_back(new test_norm_rope(256, 2,  1,   64, GGML_ROPE_TYPE_IMROPE, false, false, 2));
+    test_cases.emplace_back(new test_norm_rope(256, 2,  33,  64, GGML_ROPE_TYPE_IMROPE, false, false, 2));
+    test_cases.emplace_back(new test_norm_rope(128, 4,  7,   64, GGML_ROPE_TYPE_NEOX,   false, false, 1));
 
     // qwen4exp QSA indexer key cache: decode, a short batch and a prefill ubatch
     test_cases.emplace_back(new test_qsa_kpool(64,   1,   1,  4, 64));
@@ -13530,6 +13639,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // odd row count for the row tail.
     test_cases.emplace_back(new test_glu_stream(GGML_TYPE_Q8_0, 1, 640, 2560, 2));
     for (int64_t nt : {1, 2}) {
+    test_cases.emplace_back(new test_fwht_cache(64, 8, 1));
+    test_cases.emplace_back(new test_fwht_cache(64, 8, 17));
+    test_cases.emplace_back(new test_fwht_cache(256, 2, 3));
     test_cases.emplace_back(new test_f32_siblings(2560, 512, 1));
     test_cases.emplace_back(new test_f32_siblings(2560, 512, 3));
     test_cases.emplace_back(new test_f32_siblings(1024, 48, 1));

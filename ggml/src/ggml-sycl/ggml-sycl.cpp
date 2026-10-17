@@ -9092,6 +9092,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // a q8_0 cache write already done at its Hadamard MUL_MAT
+        if (node->op == GGML_OP_SET_ROWS && ggml_sycl_fwht_set_rows_done(cgraph, i)) {
+            continue;
+        }
         // the QSA indexer key cache writes, each chain computed at its SET_ROWS
         if (ggml_sycl_qsa_kpool_absorbs(cgraph, i)) {
             continue;
@@ -9362,6 +9366,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        if (node->op == GGML_OP_MUL_MAT) {
+            if (const int n = ggml_sycl_fwht_set_rows(*sycl_ctx, cgraph, i)) {
+                i += n - 1;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT) {
             ggml_sycl_f32_mv_run r0, r1;
             if (ggml_sycl_f32_siblings_at(cgraph, i, r0, r1, /*any_tokens=*/false)) {
@@ -10170,6 +10180,20 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_sycl_hoist_q8_siblings(cgraph);
     ggml_sycl_hoist_q8_f32_rows(cgraph);
     ggml_sycl_hoist_f32_siblings(cgraph);
+    // the norm + rope fusion that continues through the rotation (and the cache write) reads the norm's input
+    // at the norm and writes the span's last node, which ggml-alloc must not place over that input
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * x    = nullptr;
+        const ggml_tensor * last = nullptr;
+        if (cgraph->nodes[i]->op == GGML_OP_RMS_NORM) {
+            const int n = ggml_sycl_rms_norm_rope_span(cgraph, i, &x, &last);
+            if (n > 3) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x->view_src ? x->view_src : x),
+                                      const_cast<ggml_tensor *>(last));
+                i += n - 1;
+            }
+        }
+    }
     // the f32 sibling launch writes the second output at the first mat-vec: the activation must outlive it
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_sycl_f32_mv_run r0, r1;
