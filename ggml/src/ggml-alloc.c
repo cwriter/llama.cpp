@@ -821,8 +821,11 @@ static void ggml_gallocr_release_parent(ggml_gallocr_t galloc, struct ggml_tenso
         ggml_gallocr_free_node(galloc, parent);
     }
 
-    // fusions are a handful of nodes, so the cap only guards against a malformed plan
-    if (depth >= GGML_MAX_SRC) {
+    // only guards against a malformed plan: each step goes to a source, so a real chain ends on its
+    // own. It must outlast the longest absorbed chain, or the tensors past it are never freed - an
+    // MoE reduction absorbed whole (mul, one view per expert, the add chain, the add after it) is
+    // about n_expert_used + 3 deep, and a cap of GGML_MAX_SRC kept every layer's expert outputs live.
+    if (depth >= 64) {
         return;
     }
     // an absorbed view never ran either, so its consumer is the real reader of what it read
