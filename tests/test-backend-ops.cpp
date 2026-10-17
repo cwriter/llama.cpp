@@ -4542,7 +4542,8 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const bool    identity;
     const bool    gated;
     const bool    normed;
-    const int     tail;  // x is the MoE weighted sum of 10 expert outputs (1), plus a gated shared expert (2)
+    const int     tail;  // x is the MoE weighted sum of 10 expert outputs (1), plus a gated shared expert (2),
+                         // with the expert outputs from a q8_0 down MUL_MAT_ID (3)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4565,13 +4566,44 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
                       bool normed = false, int tail = 0)
         : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), normed(normed), tail(tail) {}
 
+    // a q8_0 expert projection differs from the CPU's in the last bits of every output
+    double max_nmse_err() override { return tail == 3 ? 5e-4 : 1e-7; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_dsv4_hc::initialize_tensors(ctx);
+        // distinct experts per token for the down projection
+        if (ggml_tensor * ids = ggml_get_tensor(ctx, "ids")) {
+            std::mt19937 rng(5);
+            std::vector<int32_t> v(ggml_nelements(ids));
+            for (int64_t r = 0; r < ids->ne[1]; ++r) {
+                std::vector<int32_t> perm(ids->ne[0]);
+                std::iota(perm.begin(), perm.end(), 0);
+                std::shuffle(perm.begin(), perm.end(), rng);
+                std::copy(perm.begin(), perm.end(), v.begin() + r * ids->ne[0]);
+            }
+            ggml_backend_tensor_set(ids, v.data(), 0, v.size()*sizeof(int32_t));
+        }
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x;
         if (tail) {
             // the MoE layer tail as llama-graph builds it, then the shared expert as qwen4exp adds it
             const int64_t n_used  = 10;
-            ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
-            ggml_set_name(experts, "x");
+            ggml_tensor * experts;
+            if (tail == 3) {
+                const int64_t n_ff = 128, n_mats = 16;
+                ggml_tensor * glu  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, n_tokens);
+                ggml_set_name(glu, "x");
+                ggml_tensor * ids  = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+                ggml_set_name(ids, "ids");
+                ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+                ggml_tensor * w_down = ggml_new_tensor_3d(ctx, GGML_TYPE_Q8_0, n_ff, n_embd, n_mats);
+                experts = ggml_mul_mat_id(ctx, w_down, glu, ids);
+            } else {
+                experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+                ggml_set_name(experts, "x");
+            }
             ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
             ggml_set_name(weights, "weights");
             experts = ggml_mul(ctx, experts, weights);
@@ -4584,7 +4616,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
             for (int64_t e = 1; e < n_used; ++e) {
                 x = ggml_add(ctx, x, views[e]);
             }
-            if (tail == 2) {
+            if (tail >= 2) {
                 ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
                 ggml_set_name(shexp, "residual");
                 ggml_tensor * sgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
@@ -11270,6 +11302,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // the FFN output computed inside the fused kernel
         test_cases.emplace_back(new test_dsv4_hc_post(2560, nt, true, true, true, 2));
         test_cases.emplace_back(new test_dsv4_hc_post(512, nt, true, true, true, 1));
+        // the expert outputs from the down projection, which a backend may never materialize
+        test_cases.emplace_back(new test_dsv4_hc_post(2560, nt, true, true, true, 3));
     }
     // a prefill ubatch
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1024, true, true, true, 2));

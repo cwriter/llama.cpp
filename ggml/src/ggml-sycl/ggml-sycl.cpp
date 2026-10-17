@@ -8952,19 +8952,52 @@ static bool ggml_sycl_f32_siblings_at(const ggml_cgraph * g, int i, ggml_sycl_f3
 
 static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
 
+// Expert rows the down projection left in pool scratch for the hc_post + norm FFN tail to sum itself, keyed
+// by the reduction output that is then never written. Lives from the down projection to the tail kernel.
+struct ggml_sycl_moe_scratch {
+    std::unique_ptr<ggml_sycl_pool_alloc<char>> mem;
+    ggml_tensor                                 experts;
+    const ggml_tensor *                         weights = nullptr;
+};
+static std::unordered_map<const ggml_tensor *, ggml_sycl_moe_scratch> g_ggml_sycl_moe_scratch;
+
+// the hc_post + norm FFN tail that reads the reduction output red, if one follows within the window
+static bool ggml_sycl_moe_tail_reads(const ggml_cgraph * cgraph, int i, const ggml_tensor * red) {
+    for (int k = i + 1; k < cgraph->n_nodes && k <= i + 96; ++k) {
+        if (cgraph->nodes[k]->op != GGML_OP_SCALE || k + 3 >= cgraph->n_nodes || cgraph->nodes[k + 3]->op != GGML_OP_DSV4_HC_POST) {
+            continue;
+        }
+        ggml_sycl_hc_ffn_tail tail;
+        if (ggml_sycl_match_hc_ffn_tail(cgraph, k, tail) && tail.x.reduced == red) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // GGML_SYCL_MOE_DOWN_REDUCE outside the tiled prefill path: the down projection writes the experts to
-// pool scratch (decode: n_expert_used rows), then the weighted reduction writes its output from there
+// pool scratch (decode: n_expert_used rows), then the weighted reduction writes its output from there -
+// or, when an hc_post + norm FFN tail reads that output, the tail sums the scratch rows itself and the
+// reduction never launches (GGML_SYCL_MOE_TAIL_SCRATCH)
 static bool ggml_sycl_moe_down_reduce_run(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool tail_scratch = ggml_sycl_get_env("GGML_SYCL_MOE_TAIL_SCRATCH", 1) != 0;
     ggml_sycl_moe_reduce_match rm;
     if (!ggml_sycl_match_moe_down_reduce(cgraph, i, rm)) {
         return false;
     }
     ggml_tensor * d = cgraph->nodes[i];
-    ggml_sycl_pool_alloc<char> scratch(ctx.pool(), ggml_nbytes(d));
+    auto scratch = std::make_unique<ggml_sycl_pool_alloc<char>>(ctx.pool(), ggml_nbytes(d));
     ggml_tensor dc = *d;
-    dc.data = scratch.get();
+    dc.data = scratch->get();
     if (!ggml_sycl_compute_forward(ctx, &dc)) {
         GGML_ABORT("%s: MUL_MAT_ID %s did not run", __func__, d->name);
+    }
+    if (tail_scratch && dc.nb[1] % 16 == 0 && dc.nb[2] % 16 == 0 && ggml_sycl_moe_tail_reads(cgraph, i, rm.dst)) {
+        ggml_sycl_moe_scratch & e = g_ggml_sycl_moe_scratch[rm.dst];
+        e.mem     = std::move(scratch);
+        e.experts = dc;
+        e.weights = rm.weights;
+        return true;
     }
     rm.experts = &dc;
     ggml_sycl_op_moe_weighted_reduction(ctx, rm);
@@ -8986,6 +9019,7 @@ static bool ggml_sycl_hc_pre_up_weight_ready(ggml_backend_sycl_context & ctx, co
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_kq_mask_graph kq_mask;
     ggml_sycl_kq_mask_graph_begin(*sycl_ctx, cgraph, kq_mask);
+    g_ggml_sycl_moe_scratch.clear();  // scratch only ever spans one graph
 
     ggml_sycl_conv_window_match conv_window;
 
@@ -9318,8 +9352,20 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (ggml_sycl_hc_post_norm_at(cgraph, i)) {
                 ggml_sycl_hc_ffn_tail tail;
                 const bool has_tail = ggml_sycl_match_hc_ffn_tail(cgraph, i, tail);
-                if (ggml_sycl_op_dsv4_hc_post_fused_gate_norm(*sycl_ctx, cgraph->nodes[i + 3], gate, cgraph->nodes[i + 4],
-                                                              cgraph->nodes[i + 5], has_tail ? &tail.x : nullptr)) {
+                // the expert rows the down projection left in scratch: sum them here instead of the reduction
+                auto scratch = has_tail && tail.x.reduced ? g_ggml_sycl_moe_scratch.find(tail.x.reduced)
+                                                          : g_ggml_sycl_moe_scratch.end();
+                if (scratch != g_ggml_sycl_moe_scratch.end()) {
+                    tail.x.experts = &scratch->second.experts;
+                    tail.x.weights = scratch->second.weights;
+                    tail.x.reduced = nullptr;
+                }
+                const bool ran = ggml_sycl_op_dsv4_hc_post_fused_gate_norm(*sycl_ctx, cgraph->nodes[i + 3], gate, cgraph->nodes[i + 4],
+                                                                           cgraph->nodes[i + 5], has_tail ? &tail.x : nullptr);
+                if (scratch != g_ggml_sycl_moe_scratch.end()) {
+                    g_ggml_sycl_moe_scratch.erase(scratch);  // in-order queue: the pool may hand it out again
+                }
+                if (ran) {
                     i += 5;
                     continue;
                 }
