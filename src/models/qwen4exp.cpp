@@ -324,7 +324,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
 
     // grouped RMSNorm: reduce over one stream, then scale all streams with the [n_embd, hc] gamma
     // the converter folded each gamma to (1 + w)
-    ggml_tensor * xn = ggml_mul(ctx0, ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps), w_norm);
+    ggml_tensor * xr = ggml_rms_norm(ctx0, x, hparams.f_norm_rms_eps);
+    // "norm" places it on this layer's device (llama_context::graph_get_cb), so at a layer split only
+    // the residual crosses: left to the scheduler it runs on the previous device, which then sends
+    // its [n_embd, hc, n_tokens] output too
+    if (il >= 0) {
+        cb(xr, "norm", il);
+    }
+    ggml_tensor * xn = ggml_mul(ctx0, xr, w_norm);
     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
     cb(xn, "hc_norm", il);
 
