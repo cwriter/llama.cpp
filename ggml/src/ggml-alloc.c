@@ -310,8 +310,8 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
             peak_dbg = e ? atoi(e) : 0;
         }
         if (peak_dbg) {
-            fprintf(stderr, "[PEAK] chunk %d %8.2f MiB <- %-32s (%.2f MiB) op=%-10s ne=[%ld,%ld,%ld,%ld] src0=%s\n",
-                    addr.chunk, (addr.offset + size) / 1024.0 / 1024.0, tensor->name, size / 1024.0 / 1024.0,
+            fprintf(stderr, "[PEAK] alloc %p chunk %d %8.2f MiB <- %-32s (%.2f MiB) op=%-10s ne=[%ld,%ld,%ld,%ld] src0=%s\n",
+                    (void *) alloc, addr.chunk, (addr.offset + size) / 1024.0 / 1024.0, tensor->name, size / 1024.0 / 1024.0,
                     ggml_op_name(tensor->op), (long) tensor->ne[0], (long) tensor->ne[1], (long) tensor->ne[2],
                     (long) tensor->ne[3], tensor->src[0] ? tensor->src[0]->name : "-");
         }
