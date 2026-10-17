@@ -1164,6 +1164,46 @@ static char * fmt_size(size_t size) {
     return buffer;
 }
 
+// GGML_SCHED_DUMP=<prefix>: write the assigned graph to <prefix>.<n>.tsv, one line per node and leaf
+// (index, op, name, bytes, backend, view source, flags, then every src as name|bytes|view source),
+// for offline analysis of where splits cut and what crosses them. Inputs already point at the
+// split copies ("<backend>#<name>#<copy>").
+static void ggml_backend_sched_dump_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    static const char * prefix = getenv("GGML_SCHED_DUMP");
+    static int          n_dump = 0;
+    if (!prefix) {
+        return;
+    }
+    char path[1024];
+    snprintf(path, sizeof(path), "%s.%d.tsv", prefix, n_dump++);
+    FILE * f = fopen(path, "w");
+    if (!f) {
+        return;
+    }
+    auto bname = [&](const ggml_tensor * t) {
+        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, const_cast<ggml_tensor *>(t));
+        return b ? ggml_backend_name(b) : "-";
+    };
+    auto put = [&](const char * kind, int i, const ggml_tensor * t) {
+        fprintf(f, "%s\t%d\t%s\t%s\t%zu\t%s\t%s\t%d", kind, i, ggml_op_desc(t), t->name, ggml_nbytes(t), bname(t),
+                t->view_src ? t->view_src->name : "-", (int) t->flags);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (t->src[j]) {
+                fprintf(f, "\t%s|%zu|%s", t->src[j]->name, ggml_nbytes(t->src[j]),
+                        t->src[j]->view_src ? t->src[j]->view_src->name : "-");
+            }
+        }
+        fprintf(f, "\n");
+    };
+    for (int i = 0; i < graph->n_leafs; i++) {
+        put("leaf", i, graph->leafs[i]);
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        put("node", i, graph->nodes[i]);
+    }
+    fclose(f);
+}
+
 static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     int cur_split = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -1624,6 +1664,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
+    }
+    {
+        ggml_backend_sched_dump_graph(sched, graph);
     }
 
     // pass 6: collect all input tensors into graph_inputs
