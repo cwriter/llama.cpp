@@ -117,16 +117,26 @@ bool ggml_sycl_match_hc_ffn_tail(const ggml_cgraph * cgraph, int i, ggml_sycl_hc
     if (j < 0 || !ggml_sycl_match_moe_weighted_reduction(cgraph, j, rm) || rm.dst != moe_out) {
         return false;
     }
-    const ggml_tensor * ex = rm.experts;
-    if (ex->ne[0] != n_embd || ex->ne[2] * ex->ne[3] != n_tokens || ex->nb[1] % 16 != 0 || ex->nb[2] % 16 != 0) {
-        return false;
-    }
-    tail.x.experts = ex;
-    tail.x.weights = rm.weights;
+    // the down projection already computed the reduction (GGML_SYCL_MOE_DOWN_REDUCE): read its output,
+    // and absorb only the gated mul and the add; without a shared expert the plain fusion reads it
+    const bool by_down = ggml_sycl_moe_reduce_by_down(cgraph, rm, j);
+    if (by_down) {
+        if (!gated || rm.dst->nb[1] % 16 != 0 || ggml_sycl_written_between(cgraph, rm.dst, hc_ffn_find(cgraph, x, i), i)) {
+            return false;
+        }
+        tail.x.reduced = rm.dst;
+    } else {
+        const ggml_tensor * ex = rm.experts;
+        if (ex->ne[0] != n_embd || ex->ne[2] * ex->ne[3] != n_tokens || ex->nb[1] % 16 != 0 || ex->nb[2] % 16 != 0) {
+            return false;
+        }
+        tail.x.experts = ex;
+        tail.x.weights = rm.weights;
 
-    // the nodes that never launch, all in the window before the hc_post fusion
-    for (int k = 0; k < rm.node_count; ++k) {
-        tail.nodes[tail.n_nodes++] = cgraph->nodes[j + k];
+        // the nodes that never launch, all in the window before the hc_post fusion
+        for (int k = 0; k < rm.node_count; ++k) {
+            tail.nodes[tail.n_nodes++] = cgraph->nodes[j + k];
+        }
     }
     int at_gated = -1;
     if (gated) {
@@ -139,7 +149,8 @@ bool ggml_sycl_match_hc_ffn_tail(const ggml_cgraph * cgraph, int i, ggml_sycl_hc
     }
 
     // the inputs are now read at the hc_post fusion, later than the graph read them
-    if (ggml_sycl_written_between(cgraph, rm.experts, j, i) || ggml_sycl_written_between(cgraph, rm.weights, j, i)) {
+    if (!by_down &&
+        (ggml_sycl_written_between(cgraph, rm.experts, j, i) || ggml_sycl_written_between(cgraph, rm.weights, j, i))) {
         return false;
     }
     if (gated && (ggml_sycl_written_between(cgraph, tail.x.shexp, at_gated, i) ||

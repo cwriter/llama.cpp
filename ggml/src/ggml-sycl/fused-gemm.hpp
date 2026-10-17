@@ -11,6 +11,11 @@ struct ggml_sycl_gg_rows {
     int64_t                  ne1;
     size_t                   nb1;
     size_t                   nb2;
+    // with w, a mapped row (slot i1, token i2) is not stored but scaled by w[i1*w_nb1 + i2*w_nb2] and
+    // added atomically to base + i2*nb2: the MoE weighted sum, without the per-slot expert output
+    const char *             w    = nullptr;
+    size_t                   w_nb1 = 0;
+    size_t                   w_nb2 = 0;
 };
 
 // Shape and type gates, shared by the kernels below and by the graph compatibility check, so
@@ -185,8 +190,11 @@ bool ggml_sycl_grouped_dequant_gemm_dev(ggml_type src0_type, const void * src0_b
                                         bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream);
 
 // Merged gate/up -> SwiGLU -> down, using one routing schedule and bounded tile scratch.
+// With red_dst/red_w the down GEMM adds red_w * row into red_dst ([n_embd, n_tokens], zeroed first)
+// instead of writing down: the MoE weighted sum, and down's expert output is never written.
 bool ggml_sycl_mmid_tiled_moe(ggml_backend_sycl_context & ctx, const ggml_tensor * gate_up, const ggml_tensor * gate,
-                               const ggml_tensor * glu, ggml_tensor * down, int tile_batch);
+                               const ggml_tensor * glu, ggml_tensor * down, int tile_batch,
+                               ggml_tensor * red_dst = nullptr, const ggml_tensor * red_w = nullptr);
 
 // dst[n*ldd + m] = sum_k a[m*lda + k] * b[n*K + k], split-K for small M*N with long K
 // Returns false when the case is not handled (shape too large or device too small).

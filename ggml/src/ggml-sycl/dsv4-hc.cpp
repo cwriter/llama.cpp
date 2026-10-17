@@ -585,15 +585,17 @@ bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, 
 
     // the FFN tail computed in place of x: as moe_weighted_reduction_f32_sycl, then + shexp * sgate
     const bool    tail   = xs != nullptr;
-    const float * ex     = tail ? (const float *) xs->experts->data : nullptr;
-    const float * ew     = tail ? (const float *) xs->weights->data : nullptr;
+    const float * rd     = tail && xs->reduced ? (const float *) xs->reduced->data : nullptr;
+    const int64_t sr1    = rd ? xs->reduced->nb[1] / sizeof(float) : 0;
+    const float * ex     = tail && !rd ? (const float *) xs->experts->data : nullptr;
+    const float * ew     = tail && !rd ? (const float *) xs->weights->data : nullptr;
     const float * sh     = tail && xs->shexp ? (const float *) xs->shexp->data : nullptr;
     const float * sg     = tail && xs->shexp ? (const float *) xs->sgate->data : nullptr;
-    const int     n_used = tail ? (int) xs->experts->ne[1] : 0;
-    const int64_t se1    = tail ? xs->experts->nb[1] / sizeof(float) : 0;
-    const int64_t se2    = tail ? xs->experts->nb[2] / sizeof(float) : 0;
-    const int64_t sw1    = tail ? xs->weights->nb[1] / sizeof(float) : 0;
-    const int64_t sw2    = tail ? xs->weights->nb[2] / sizeof(float) : 0;
+    const int     n_used = ex ? (int) xs->experts->ne[1] : 0;
+    const int64_t se1    = ex ? xs->experts->nb[1] / sizeof(float) : 0;
+    const int64_t se2    = ex ? xs->experts->nb[2] / sizeof(float) : 0;
+    const int64_t sw1    = ex ? xs->weights->nb[1] / sizeof(float) : 0;
+    const int64_t sw2    = ex ? xs->weights->nb[2] / sizeof(float) : 0;
     const int64_t ss1    = sh ? xs->shexp->nb[1] / sizeof(float) : 0;
     const int64_t sg1    = sh ? xs->sgate->nb[1] / sizeof(float) : 0;
 
@@ -613,6 +615,9 @@ bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, 
             sycl::float4 xv;
             if (tail) {
                 sycl::float4 m(0.0f);
+                if (rd) {
+                    m = *(const sycl::float4 *) (rd + i0 + it*sr1);
+                }
                 for (int e = 0; e < n_used; ++e) {
                     const sycl::float4 ev = *(const sycl::float4 *) (ex + i0 + e*se1 + it*se2);
                     const float        we = ew[e*sw1 + it*sw2];

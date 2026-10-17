@@ -162,6 +162,54 @@ int ggml_sycl_moe_reduce_absorbs(const ggml_cgraph * cgraph, int node_idx) {
     return 0;
 }
 
+static constexpr int GGML_SYCL_MOE_DOWN_WINDOW = 16;
+
+static int32_t moe_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return 0;
+    }
+    return cgraph->use_counts[pos];
+}
+
+bool ggml_sycl_match_moe_down_reduce(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_moe_reduce_match & rm) {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_MOE_DOWN_REDUCE", 1) != 0;
+    const ggml_tensor * d = cgraph->nodes[node_idx];
+    if (!on || d->op != GGML_OP_MUL_MAT_ID || d->type != GGML_TYPE_F32 || !ggml_is_contiguous(d) || d->view_src ||
+        (d->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT)) || !(d->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+        moe_use_count(cgraph, d) != 1) {
+        return false;
+    }
+    const int end = std::min(cgraph->n_nodes, node_idx + GGML_SYCL_MOE_DOWN_WINDOW + 1);
+    for (int j = node_idx + 1; j < end; ++j) {
+        if (cgraph->nodes[j]->op != GGML_OP_MUL) {
+            continue;
+        }
+        if (ggml_sycl_match_moe_weighted_reduction(cgraph, j, rm)) {
+            return rm.experts == d;
+        }
+    }
+    return false;
+}
+
+int ggml_sycl_moe_down_reduce_absorbs(const ggml_cgraph * cgraph, int node_idx) {
+    ggml_sycl_moe_reduce_match rm;
+    return cgraph->nodes[node_idx]->op == GGML_OP_MUL_MAT_ID && ggml_sycl_match_moe_down_reduce(cgraph, node_idx, rm) ? 1 : 0;
+}
+
+bool ggml_sycl_moe_reduce_by_down(const ggml_cgraph * cgraph, const ggml_sycl_moe_reduce_match & rm, int mul_idx) {
+    if (!rm.experts || rm.experts->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    for (int j = mul_idx - 1; j >= 0 && j >= mul_idx - GGML_SYCL_MOE_DOWN_WINDOW; --j) {
+        if (cgraph->nodes[j] == rm.experts) {
+            ggml_sycl_moe_reduce_match m;
+            return ggml_sycl_match_moe_down_reduce(cgraph, j, m);
+        }
+    }
+    return false;
+}
+
 void ggml_sycl_op_moe_weighted_reduction(ggml_backend_sycl_context & ctx,
                                          const ggml_sycl_moe_reduce_match & match) {
     scope_op_debug_print scope_dbg_print(__func__, match.dst, /*num_src=*/0);

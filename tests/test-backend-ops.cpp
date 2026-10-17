@@ -8625,6 +8625,71 @@ struct test_moe_reduce : public test_case {
     }
 };
 
+// A routed MoE FFN as llama-graph builds it: gate and up MUL_MAT_ID, SwiGLU, down MUL_MAT_ID, the routing
+// weights, one view per used expert and the add chain. A backend may compute the weighted sum without
+// the [n_embd, n_used, n_tokens] down output (prefill GEMM epilogue, or scratch + reduce)
+struct test_moe_ffn_reduce : public test_case {
+    const ggml_type type;
+    const int64_t   n_embd;
+    const int64_t   n_ff;
+    const int       n_mats;
+    const int       n_used;
+    const int64_t   n_tokens;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type, n_embd, n_ff, n_mats, n_used, n_tokens);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_FFN_REDUCE";
+    }
+
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+
+    test_moe_ffn_reduce(ggml_type type = GGML_TYPE_Q8_0, int64_t n_embd = 512, int64_t n_ff = 128, int n_mats = 16,
+                        int n_used = 4, int64_t n_tokens = 64)
+        : type(type), n_embd(n_embd), n_ff(n_ff), n_mats(n_mats), n_used(n_used), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_tokens);
+        ggml_set_name(ids, "ids");
+        ids = ggml_view_2d(ctx, ids, n_used, n_tokens, ids->nb[1], 0);
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(weights, "weights");
+        ggml_tensor * w_gate = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * w_up   = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_mats);
+        ggml_tensor * w_down = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_mats);
+
+        ggml_tensor * cur  = ggml_reshape_3d(ctx, x, n_embd, 1, n_tokens);
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, w_gate, cur, ids);
+        ggml_tensor * up   = ggml_mul_mat_id(ctx, w_up, cur, ids);
+        ggml_tensor * glu  = ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * down = ggml_mul_mat_id(ctx, w_down, glu, ids);
+        ggml_set_name(down, "ffn_moe_down");
+        ggml_tensor * weighted = ggml_mul(ctx, down, weights);
+
+        std::vector<ggml_tensor *> views(n_used);
+        for (int e = 0; e < n_used; ++e) {
+            views[e] = ggml_view_2d(ctx, weighted, n_embd, n_tokens, weighted->nb[2], e*weighted->nb[1]);
+            ggml_build_forward_expand(gf, views[e]);
+        }
+        ggml_tensor * out = views[0];
+        for (int e = 1; e < n_used; ++e) {
+            out = ggml_add(ctx, out, views[e]);
+        }
+        ggml_set_name(out, "moe_out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // mul_mat with src1 in [0, 1]: a zero-mean src1 hides errors in the zero point or the min of a quantized src0
 struct test_mul_mat_pos : public test_mul_mat {
     using test_mul_mat::test_mul_mat;
@@ -13473,6 +13538,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    // the routed FFN whose down output a backend may never materialize: decode, short batches, prefill tiles
+    for (int64_t nt : { 1, 5, 64, 300 }) {
+        test_cases.emplace_back(new test_moe_ffn_reduce(GGML_TYPE_Q8_0, 512, 128, 16, 4, nt));
+    }
+    test_cases.emplace_back(new test_moe_ffn_reduce(GGML_TYPE_Q8_0, 2560, 640, 32, 10, 96));
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));

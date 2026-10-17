@@ -32,6 +32,7 @@ struct ggml_sycl_dsv4_hc_post_x {
     const ggml_tensor * weights = nullptr;  // [1, n_used, n_tokens]
     const ggml_tensor * shexp   = nullptr;  // [n_embd, n_tokens], or none
     const ggml_tensor * sgate   = nullptr;  // [1, n_tokens]
+    const ggml_tensor * reduced = nullptr;  // [n_embd, n_tokens]: the weighted sum, read instead of experts
 };
 bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                                const ggml_sycl_dsv4_hc_post_gate & gate, ggml_tensor * rms,

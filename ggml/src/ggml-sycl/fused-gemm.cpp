@@ -1928,7 +1928,15 @@ static void fused_dequant_gemm_tile(
                     for (int s = 0; s < FG_KSPLIT; ++s) {
                         sum += tile_c[s * C_ROWS * S::BN + r * S::BN + c];
                     }
-                    if (dst_rows.map) {
+                    if (dst_rows.map && dst_rows.w) {
+                        // grouped and reduced: the routing weight times the row, summed over the slots
+                        const mmid_row_mapping rm = dst_rows.map[n];
+                        const float wt = *(const float *) (dst_rows.w + rm.i1 * dst_rows.w_nb1 + rm.i2 * dst_rows.w_nb2);
+                        sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                         sycl::access::address_space::global_space>
+                            acc(((float *) (dst_rows.base + rm.i2 * dst_rows.nb2))[m]);
+                        acc.fetch_add(sum * wt);
+                    } else if (dst_rows.map) {
                         // grouped: routed row n goes straight to its place in the MUL_MAT_ID dst
                         const mmid_row_mapping rm = dst_rows.map[n];
                         ((float *) (dst_rows.base + (rm.i1 % dst_rows.ne1) * dst_rows.nb1 + rm.i2 * dst_rows.nb2))[m] = sum;
@@ -3069,7 +3077,8 @@ static bool fg_gate_up_pack(const ggml_tensor * wu, const ggml_tensor * wg, bool
 
 template <typename S>
 static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor * up, const ggml_tensor * gate, ggml_tensor * down,
-                              int tile_batch, bool up_reordered, bool down_reordered) {
+                              int tile_batch, bool up_reordered, bool down_reordered,
+                              ggml_tensor * red_dst, const ggml_tensor * red_w) {
     const ggml_tensor * wu = up->src[0];
     const ggml_tensor * wd = down->src[0];
     const ggml_tensor * wg = gate ? gate->src[0] : nullptr;
@@ -3102,7 +3111,10 @@ static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor 
     const auto * full_map = route_map.get();
     const auto * full_tiles = schedule.get();
     const ggml_sycl_gg_rows input = { (char *) x->data, map, x->ne[1], x->nb[1], x->nb[2] };
-    const ggml_sycl_gg_rows output = { (char *) down->data, map, down->ne[1], down->nb[1], down->nb[2] };
+    // with red_dst, the down GEMM adds weight * row into the [n_embd, n_tokens] MoE output instead
+    const ggml_sycl_gg_rows output = red_dst
+        ? ggml_sycl_gg_rows{ (char *) red_dst->data, map, 1, 0, red_dst->nb[1], (const char *) red_w->data, red_w->nb[1], red_w->nb[2] }
+        : ggml_sycl_gg_rows{ (char *) down->data, map, down->ne[1], down->nb[1], down->nb[2] };
     const ggml_sycl_gg_rows local = { (char *) act, nullptr, 1, (size_t) 2 * F * sizeof(float), 0 };
     const fg_arms ua = fg_pick_arms(up_reordered), da = fg_pick_arms(down_reordered);
     const fg_arms ga = fg_pick_arms(gr);
@@ -3119,6 +3131,10 @@ static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor 
                 ggml_type_name(wu->type), gate == nullptr, gate_up_mode == 2);
     }
     auto * down_packed = paired ? (typename S::tsb *) act : packed.get();
+    if (red_dst) {
+        // after the schedule kernels: they are the last readers of anything this may alias
+        stream->memset(red_dst->data, 0, ggml_nbytes(red_dst));
+    }
     for (int64_t first = 0; first < n_tiles; first += batch) {
         const int count = std::min<int64_t>(batch, n_tiles - first);
         stream->parallel_for(sycl::range<1>((size_t) count * S::BN), [=](sycl::id<1> id) {
@@ -3182,7 +3198,8 @@ static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor 
 }
 
 bool ggml_sycl_mmid_tiled_moe(ggml_backend_sycl_context & ctx, const ggml_tensor * up, const ggml_tensor * gate,
-                               const ggml_tensor * glu, ggml_tensor * down, int tile_batch) {
+                               const ggml_tensor * glu, ggml_tensor * down, int tile_batch,
+                               ggml_tensor * red_dst, const ggml_tensor * red_w) {
     const ggml_tensor * wu = up->src[0];
     const ggml_tensor * wd = down->src[0];
     const ggml_tensor * x = up->src[1];
@@ -3224,7 +3241,7 @@ bool ggml_sycl_mmid_tiled_moe(ggml_backend_sycl_context & ctx, const ggml_tensor
     fg_visit_combo(combo, [&](auto s) {
         using S = decltype(s);
         if constexpr (S::BN == GGML_SYCL_FG_BN) {
-            fg_tiled_moe_run<S>(ctx, up, gate, down, tile_batch, ur, dr);
+            fg_tiled_moe_run<S>(ctx, up, gate, down, tile_batch, ur, dr, red_dst, red_w);
         }
     });
     return true;

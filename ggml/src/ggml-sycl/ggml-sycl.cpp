@@ -8860,9 +8860,14 @@ static int ggml_sycl_mmid_tiled_moe_fused(ggml_backend_sycl_context & ctx, ggml_
     if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1)) {
         return 0;
     }
+    // the expert output is never materialized when the reduction it feeds is computed from the GEMM
+    ggml_sycl_moe_reduce_match red;
+    const bool reduce = ggml_sycl_match_moe_down_reduce(graph, i + skip, red);
+    const ggml_tensor * out = reduce ? red.dst : down;
     // The down output is written early and must not overwrite an input needed by a later tile.
-    for (const ggml_tensor * input : { up->src[0], up->src[1], up->src[2], down->src[0], gate ? gate->src[0] : nullptr }) {
-        if (input && (ggml_sycl_tensors_overlap(down, input) || ggml_backend_buffer_is_sycl_split(input->buffer))) {
+    for (const ggml_tensor * input : std::initializer_list<const ggml_tensor *>{ up->src[0], up->src[1], up->src[2], down->src[0],
+                                       gate ? gate->src[0] : nullptr, reduce ? red.weights : nullptr }) {
+        if (input && (ggml_sycl_tensors_overlap(out, input) || ggml_backend_buffer_is_sycl_split(input->buffer))) {
             return 0;
         }
     }
@@ -8871,7 +8876,8 @@ static int ggml_sycl_mmid_tiled_moe_fused(ggml_backend_sycl_context & ctx, ggml_
             opt_for_reorder_id(&ctx, op->src[0]);
         }
     }
-    if (!ggml_sycl_mmid_tiled_moe(ctx, up, gate, glu, down, tile_batch)) {
+    if (!ggml_sycl_mmid_tiled_moe(ctx, up, gate, glu, down, tile_batch, reduce ? red.dst : nullptr,
+                                  reduce ? red.weights : nullptr)) {
         return 0;
     }
     static std::atomic<int> trace_left{ getenv("GGML_SYCL_MMID_MOE_TRACE") ? 12 : 0 };
@@ -8882,6 +8888,27 @@ static int ggml_sycl_mmid_tiled_moe_fused(ggml_backend_sycl_context & ctx, ggml_
 }
 
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx);
+
+static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct ggml_tensor * dst);
+
+// GGML_SYCL_MOE_DOWN_REDUCE outside the tiled prefill path: the down projection writes the experts to
+// pool scratch (decode: n_expert_used rows), then the weighted reduction writes its output from there
+static bool ggml_sycl_moe_down_reduce_run(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    ggml_sycl_moe_reduce_match rm;
+    if (!ggml_sycl_match_moe_down_reduce(cgraph, i, rm)) {
+        return false;
+    }
+    ggml_tensor * d = cgraph->nodes[i];
+    ggml_sycl_pool_alloc<char> scratch(ctx.pool(), ggml_nbytes(d));
+    ggml_tensor dc = *d;
+    dc.data = scratch.get();
+    if (!ggml_sycl_compute_forward(ctx, &dc)) {
+        GGML_ABORT("%s: MUL_MAT_ID %s did not run", __func__, d->name);
+    }
+    rm.experts = &dc;
+    ggml_sycl_op_moe_weighted_reduction(ctx, rm);
+    return true;
+}
 
 // the fused hc_pre reads the up weight in the reordered Q8_0 layout: reorder it here when the
 // plain mat-vec would have, and decline when it would not
@@ -8988,6 +9015,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
 
         // the nodes of a QSA mask chain whose flash attention reads the selection list itself
         if (ggml_sycl_qsa_mask_absorbs(cgraph, i)) {
+            continue;
+        }
+
+        // the MoE down projection whose expert output is never materialized
+        if (node->op == GGML_OP_MUL_MAT_ID && ggml_sycl_moe_down_reduce_run(*sycl_ctx, cgraph, i)) {
             continue;
         }
 
@@ -9138,7 +9170,9 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (node->op == GGML_OP_MUL) {
             ggml_sycl_moe_reduce_match moe_match;
             if (ggml_sycl_match_moe_weighted_reduction(cgraph, i, moe_match)) {
-                ggml_sycl_op_moe_weighted_reduction(*sycl_ctx, moe_match);
+                if (!ggml_sycl_moe_reduce_by_down(cgraph, moe_match, i)) {
+                    ggml_sycl_op_moe_weighted_reduction(*sycl_ctx, moe_match);
+                }
                 i += moe_match.node_count - 1;
                 continue;
             }
@@ -9888,6 +9922,10 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
     if (const int n = ggml_sycl_moe_reduce_absorbs(cgraph, node_idx)) {
         return n;
     }
+    // the MoE down projection, whose expert output the reduction is computed without
+    if (const int n = ggml_sycl_moe_down_reduce_absorbs(cgraph, node_idx)) {
+        return n;
+    }
     // both of these run at the node they absorb and write the next one, reading the absorbed
     // node's own input; marking it absorbed keeps that input live and reserves no dst for it
     if (ggml_sycl_can_fuse_unary_mul_bcast(cgraph, node_idx)) {
@@ -10053,7 +10091,7 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
             // and what the FFN tail it computes in place of x reads
             ggml_sycl_hc_ffn_tail tail;
             if (ggml_sycl_match_hc_ffn_tail(cgraph, i, tail)) {
-                for (const ggml_tensor * t : { tail.x.experts, tail.x.weights, tail.x.shexp, tail.x.sgate }) {
+                for (const ggml_tensor * t : { tail.x.experts, tail.x.weights, tail.x.shexp, tail.x.sgate, tail.x.reduced }) {
                     if (t) {
                         ggml_tensor * b = const_cast<ggml_tensor *>(t->view_src ? t->view_src : t);
                         params->add_alloc_dep(params->user_data, b, n[5]);
