@@ -1899,8 +1899,14 @@ static size_t ggml_backend_sycl_buffer_type_get_max_size(ggml_backend_buffer_typ
     GGML_UNUSED(buft);
 }
 
+// On by default since 2026-10-17: at -c 131072 -ub 1024 the full [n_pool, n_tokens] f32 score (128 MiB)
+// set the compute buffer peak on every card; tiled and compact it is gone (-80..-120 MiB per card in
+// pipeline mode), prefill slightly faster, text unchanged. One stream and < 65536 pools only, else the
+// full score is kept.
+static constexpr int GGML_SYCL_INDEXER_QUERY_TILE_DEFAULT = 256;
+
 static bool ggml_sycl_indexer_compact_on() {
-    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_INDEXER_COMPACT", 0) != 0;
+    static const bool enabled = ggml_sycl_get_env("GGML_SYCL_INDEXER_COMPACT", 1) != 0;
     return enabled;
 }
 
@@ -1911,7 +1917,7 @@ struct ggml_sycl_indexer_workspace {
 };
 
 static ggml_sycl_indexer_workspace ggml_sycl_indexer_workspace_size(const ggml_tensor * top) {
-    static const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", 0);
+    static const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", GGML_SYCL_INDEXER_QUERY_TILE_DEFAULT);
     const ggml_tensor * score = top->src[0];
     if (!ggml_sycl_indexer_compact_on() || !g_ggml_sycl_enable_fusion || tile < 8 || tile > 4096 ||
         top->op != GGML_OP_TOP_K || top->type != GGML_TYPE_I32 || !ggml_is_contiguous(top) ||
@@ -8217,7 +8223,7 @@ static bool ggml_sycl_tensors_overlap(const ggml_tensor * a, const ggml_tensor *
 
 static bool ggml_sycl_match_indexer_topk(const ggml_cgraph * graph, int i,
                                          ggml_tensor * & view_out, ggml_tensor * & selected_scores_out) {
-    static const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", 0);
+    static const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", GGML_SYCL_INDEXER_QUERY_TILE_DEFAULT);
     // Keep compact allocation eligibility stable for the worst-case reservation.
     auto * score = graph->nodes[i];
     if (tile < 8 || tile > 4096 || !g_ggml_sycl_enable_fusion || i + 1 >= graph->n_nodes ||
@@ -8303,7 +8309,7 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
     const auto * k = score->src[1];
     const auto * w = score->src[2];
     const auto * m = score->src[3];
-    const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", 0);
+    const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", GGML_SYCL_INDEXER_QUERY_TILE_DEFAULT);
     const auto workspace = ggml_sycl_indexer_workspace_size(top);
     void * staging = score->data ? score->data : top->data;
     GGML_ASSERT(staging);
