@@ -1,6 +1,7 @@
 #include "qsa-kpool.hpp"
 #include "fusion.hpp"
 #include "kv-soa.hpp"
+#include "rope-pair.hpp"
 
 #include "ggml-impl.h"
 
@@ -133,13 +134,13 @@ static bool qsa_kpool_match_pool(const ggml_cgraph * cgraph, int i, qsa_kpool_ch
     if (!ro || ro->op != GGML_OP_ROPE || !qsa_kpool_f32(ro)) {
         return false;
     }
-    // multi-section rope over [D, 1, n_new]: positions are 4 per pooled key
-    const int mode = ggml_get_op_params_i32(ro, 2);
-    if (!(mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_VISION || ro->ne[1] != 1 || ro->ne[3] != 1) {
+    // a NEOX or multi-section rope over [D, 1, n_new]: positions are 1 or 4 per pooled key
+    if (!ggml_sycl_rope_pair_supported(ro) || ro->ne[1] != 1 || ro->ne[3] != 1) {
         return false;
     }
-    const ggml_tensor * pos = ro->src[1];
-    if (!pos || pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(pos) || ggml_nelements(pos) != 4 * ro->ne[2]) {
+    const int           n_pos_per = (ggml_get_op_params_i32(ro, 2) & GGML_ROPE_TYPE_MROPE) ? 4 : 1;
+    const ggml_tensor * pos       = ro->src[1];
+    if (!pos || pos->type != GGML_TYPE_I32 || !ggml_is_contiguous(pos) || ggml_nelements(pos) != n_pos_per * ro->ne[2]) {
         return false;
     }
     if (ro->src[2] && !qsa_kpool_f32(ro->src[2])) {
@@ -168,11 +169,6 @@ static bool qsa_kpool_match_pool(const ggml_cgraph * cgraph, int i, qsa_kpool_ch
     const int64_t n_new = ggml_nrows(sc);
     if (ro->ne[0] != D || ro->ne[2] != n_new || pn->ne[0] != D || ggml_nrows(pn) != n_new || D > 1024 ||
         !qsa_kpool_dst_ok(sr, D, n_new)) {
-        return false;
-    }
-    const int n_dims = ggml_get_op_params_i32(ro, 1);
-    const int n_offs = ggml_get_op_params_i32(ro, 15);
-    if (n_dims <= 0 || n_dims % 2 != 0 || n_offs < 0 || n_offs % 2 != 0 || n_offs + n_dims > D) {
         return false;
     }
 
@@ -398,57 +394,6 @@ static void qsa_kpool_write(const qsa_kpool_chain & c, const ggml_tensor * sr, d
     });
 }
 
-struct qsa_kpool_rope_params {
-    int   n_dims, n_offs, sections[4];
-    bool  is_imrope;
-    float freq_scale, ext_factor, attn_factor, theta_scale, corr_dims[2];
-};
-
-// rope_yarn() and the multi-section theta of rope.cpp's rope_multi, forward
-static inline void qsa_kpool_rope_cs(const qsa_kpool_rope_params & p, const int32_t * pos, int n_new, int ip, int j,
-                                     const float * ff, float & cos_theta, float & sin_theta) {
-    const int iw        = 2 * j;
-    const int sect_dims = p.sections[0] + p.sections[1] + p.sections[2] + p.sections[3];
-    const int sec_w     = p.sections[1] + p.sections[0];
-    const int sector    = j % sect_dims;
-    const float pw      = sycl::pow(p.theta_scale, iw / 2.0f);
-
-    float theta_base = 0.0f;
-    if (p.is_imrope) {
-        if (sector % 3 == 1 && sector < 3 * p.sections[1]) {
-            theta_base = pos[ip + n_new * 1] * pw;
-        } else if (sector % 3 == 2 && sector < 3 * p.sections[2]) {
-            theta_base = pos[ip + n_new * 2] * pw;
-        } else if (sector % 3 == 0 && sector < 3 * p.sections[0]) {
-            theta_base = pos[ip] * pw;
-        } else {
-            theta_base = pos[ip + n_new * 3] * pw;
-        }
-    } else {
-        if (sector < p.sections[0]) {
-            theta_base = pos[ip] * pw;
-        } else if (sector >= p.sections[0] && sector < sec_w) {
-            theta_base = pos[ip + n_new * 1] * pw;
-        } else if (sector >= sec_w && sector < sec_w + p.sections[2]) {
-            theta_base = pos[ip + n_new * 2] * pw;
-        } else if (sector >= sec_w + p.sections[2]) {
-            theta_base = pos[ip + n_new * 3] * pw;
-        }
-    }
-    const float theta_extrap = theta_base / (ff ? ff[j] : 1.0f);
-
-    float theta  = p.freq_scale * theta_extrap;
-    float mscale = p.attn_factor;
-    if (p.ext_factor != 0.0f) {
-        const float y        = (iw / 2 - p.corr_dims[0]) / sycl::max(0.001f, p.corr_dims[1] - p.corr_dims[0]);
-        const float ramp_mix = (1.0f - sycl::min(1.0f, sycl::max(0.0f, y))) * p.ext_factor;
-        theta                = theta * (1 - ramp_mix) + theta_extrap * ramp_mix;
-        mscale *= 1.0f + 0.1f * sycl::log(1.0f / p.freq_scale);
-    }
-    cos_theta = sycl::cos(theta) * mscale;
-    sin_theta = sycl::sin(theta) * mscale;
-}
-
 template <typename TIdx>
 static void qsa_kpool_pool(const qsa_kpool_chain & c, const ggml_tensor * sr, dpct::queue_ptr stream) {
     const ggml_tensor * gr  = c.gather;
@@ -474,21 +419,7 @@ static void qsa_kpool_pool(const qsa_kpool_chain & c, const ggml_tensor * sr, dp
     memcpy(&b_scale, (const float *) sc->op_params + 1, sizeof(float));
     memcpy(&eps, rn->op_params, sizeof(float));
 
-    qsa_kpool_rope_params p;
-    float freq_base, beta_fast, beta_slow;
-    p.n_dims = ggml_get_op_params_i32(ro, 1);
-    p.n_offs = ggml_get_op_params_i32(ro, 15);
-    const int n_ctx_orig = ggml_get_op_params_i32(ro, 4);
-    memcpy(&freq_base, (const int32_t *) ro->op_params + 5, sizeof(float));
-    memcpy(&p.freq_scale, (const int32_t *) ro->op_params + 6, sizeof(float));
-    memcpy(&p.ext_factor, (const int32_t *) ro->op_params + 7, sizeof(float));
-    memcpy(&p.attn_factor, (const int32_t *) ro->op_params + 8, sizeof(float));
-    memcpy(&beta_fast, (const int32_t *) ro->op_params + 9, sizeof(float));
-    memcpy(&beta_slow, (const int32_t *) ro->op_params + 10, sizeof(float));
-    memcpy(p.sections, (const int32_t *) ro->op_params + 11, sizeof(int) * 4);
-    p.is_imrope   = ggml_get_op_params_i32(ro, 2) == GGML_ROPE_TYPE_IMROPE;
-    p.theta_scale = powf(freq_base, -2.0f / p.n_dims);
-    ggml_rope_yarn_corr_dims(p.n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, p.corr_dims);
+    const ggml_sycl_rope_pair_params p = ggml_sycl_rope_pair_init(ro);
 
     // one work-group per pooled key, one work-item per element
     stream->submit([&](sycl::handler & cgh) {
@@ -522,7 +453,7 @@ static void qsa_kpool_pool(const qsa_kpool_chain & c, const ggml_tensor * sr, dp
                 ys[t] = xs[t];
             } else if (t < n_offs + n_dims / 2) {
                 float cos_theta, sin_theta;
-                qsa_kpool_rope_cs(p, pos, n_new, ip, t - n_offs, ff, cos_theta, sin_theta);
+                ggml_sycl_rope_pair_cs(p, pos, n_new, ip, t - n_offs, ff, cos_theta, sin_theta);
                 const float x0       = xs[t];
                 const float x1       = xs[t + n_dims / 2];
                 ys[t]                = x0 * cos_theta - x1 * sin_theta;

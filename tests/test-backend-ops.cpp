@@ -8335,6 +8335,86 @@ struct test_qsa_kpool : public test_case {
     }
 };
 
+// rope(rms_norm(x) * w): the per-head q/k norm and rope of an attention layer
+struct test_norm_rope : public test_case {
+    const int64_t D;
+    const int64_t n_head;
+    const int64_t n_tok;
+    const int     n_rot;
+    const int     mode;
+    const bool    strided;  // x is every other half row of a wider projection
+    const bool    ff;       // with frequency factors
+    ggml_tensor * out {};
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "NORM_ROPE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(D, n_head, n_tok, n_rot, mode, strided, ff);
+    }
+
+    test_norm_rope(int64_t D = 256, int64_t n_head = 24, int64_t n_tok = 1, int n_rot = 64,
+                   int mode = GGML_ROPE_TYPE_IMROPE, bool strided = false, bool ff = false)
+        : D(D), n_head(n_head), n_tok(n_tok), n_rot(n_rot), mode(mode), strided(strided), ff(ff) {}
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x;
+        if (strided) {
+            ggml_tensor * qg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*D, n_head, n_tok);
+            ggml_set_name(qg, "qg");
+            x = ggml_view_3d(ctx, qg, D, n_head, n_tok, qg->nb[1], qg->nb[2], 0);
+        } else {
+            x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, n_head, n_tok);
+            ggml_set_name(x, "x");
+        }
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+        ggml_set_name(w, "w");
+        const bool multi = (mode & GGML_ROPE_TYPE_MROPE) != 0;
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, multi ? 4*n_tok : n_tok);
+        ggml_set_name(pos, "pos");
+        ggml_tensor * freq = nullptr;
+        if (ff) {
+            freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_rot/2);
+            ggml_set_name(freq, "freq");
+        }
+
+        ggml_tensor * y = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        if (multi) {
+            int sections[4] = { 11, 11, 10, 0 };
+            out = ggml_rope_multi(ctx, y, pos, freq, n_rot, sections, mode, 4096, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        } else {
+            out = ggml_rope_ext(ctx, y, pos, freq, n_rot, mode, 4096, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(99);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & p : v) {
+                    p = (int32_t) (rng() % 20000);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "freq") == 0) {
+                init_tensor_uniform(t, 0.9f, 1.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -12798,6 +12878,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_live(8192,   64, 4, 3, 4));
     test_cases.emplace_back(new test_qsa_live(4096,   64, 4, 3, 512));
     test_cases.emplace_back(new test_qsa_live(1000,   7,  3, 5, 9, false));
+
+    // q/k norm then rope: qwen4exp Q, K and indexer q at decode and prefill, then other layouts
+    test_cases.emplace_back(new test_norm_rope(256, 24, 1,   64));
+    test_cases.emplace_back(new test_norm_rope(256, 2,  1,   64));
+    test_cases.emplace_back(new test_norm_rope(128, 4,  1,   64));
+    test_cases.emplace_back(new test_norm_rope(256, 24, 512, 64));
+    test_cases.emplace_back(new test_norm_rope(256, 24, 3,   64, GGML_ROPE_TYPE_IMROPE, true));
+    test_cases.emplace_back(new test_norm_rope(128, 8,  7,   128, GGML_ROPE_TYPE_MROPE));
+    test_cases.emplace_back(new test_norm_rope(128, 8,  5,   128, GGML_ROPE_TYPE_NEOX));
+    test_cases.emplace_back(new test_norm_rope(128, 8,  5,   64,  GGML_ROPE_TYPE_NEOX, false, true));
 
     // qwen4exp QSA indexer key cache: decode, a short batch and a prefill ubatch
     test_cases.emplace_back(new test_qsa_kpool(64,   1,   1,  4, 64));

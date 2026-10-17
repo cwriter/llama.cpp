@@ -84,6 +84,7 @@
 #include "ggml-sycl/qsa-mask.hpp"
 #include "ggml-sycl/qsa-live.hpp"
 #include "ggml-sycl/qsa-kpool.hpp"
+#include "ggml-sycl/norm-rope.hpp"
 #include "ggml-sycl/census.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
@@ -151,6 +152,7 @@ int g_ggml_sycl_upload_queue = -1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_fuse_qsa_live = 1;
 int g_ggml_sycl_fuse_qsa_kpool = 1;
+int g_ggml_sycl_fuse_norm_rope = 1;
 int g_ggml_sycl_fuse_conv_window = 1;
 int g_ggml_sycl_gdn_state_store = 1;
 int g_ggml_sycl_gdn_state_gather = 1;
@@ -518,6 +520,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 1);
         g_ggml_sycl_fuse_qsa_live = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_LIVE", 1);
         g_ggml_sycl_fuse_qsa_kpool = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_KPOOL", 1);
+        g_ggml_sycl_fuse_norm_rope = ggml_sycl_get_env("GGML_SYCL_FUSE_NORM_ROPE", 1);
         g_ggml_sycl_fuse_conv_window = ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_WINDOW", 1);
         g_ggml_sycl_gdn_state_store = ggml_sycl_get_env("GGML_SYCL_GDN_STATE_STORE", 1);
         g_ggml_sycl_gdn_state_gather = ggml_sycl_get_env("GGML_SYCL_GDN_STATE_GATHER", 1);
@@ -709,6 +712,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_LIVE: %d\n", g_ggml_sycl_fuse_qsa_live);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_KPOOL: %d\n", g_ggml_sycl_fuse_qsa_kpool);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_NORM_ROPE: %d\n", g_ggml_sycl_fuse_norm_rope);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_CONV_WINDOW: %d\n", g_ggml_sycl_fuse_conv_window);
         GGML_LOG_INFO("  GGML_SYCL_GDN_STATE_STORE: %d\n", g_ggml_sycl_gdn_state_store);
         GGML_LOG_INFO("  GGML_SYCL_GDN_STATE_GATHER: %d\n", g_ggml_sycl_gdn_state_gather);
@@ -9092,6 +9096,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (ggml_sycl_match_rms_norm_gate(cgraph, i, ng)) {
                 ggml_sycl_op_rms_norm_gate_fused(*sycl_ctx, ng.rms, ng.mul_w, ng.gate, const_cast<ggml_tensor *>(ng.out));
                 i = ng.last_idx;
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_RMS_NORM) {
+            if (const int n = ggml_sycl_rms_norm_rope(*sycl_ctx, cgraph, i)) {
+                i += n - 1;
                 continue;
             }
         }

@@ -89,6 +89,7 @@ extern int g_ggml_sycl_esimd_q8_0;
 extern int g_ggml_sycl_fuse_qsa_fa_mask;
 extern int g_ggml_sycl_fuse_qsa_live;
 extern int g_ggml_sycl_fuse_qsa_kpool;
+extern int g_ggml_sycl_fuse_norm_rope;
 extern int g_ggml_sycl_fuse_conv_window;
 extern int g_ggml_sycl_gdn_state_store;
 extern int g_ggml_sycl_gdn_state_gather;
