@@ -8220,6 +8220,121 @@ struct test_qsa_live : public test_case {
     }
 };
 
+// qwen4exp QSA indexer key cache: write each token's key | zeros row, then pool the new blocks
+// (gather, mean, rms norm, multi-section rope) into the pooled half of their rep rows (build_indexer)
+struct test_qsa_kpool : public test_case {
+    const int64_t n_cells;
+    const int64_t n_tok;
+    const int64_t n_new;
+    const int64_t kpool;
+    const int     n_rot;
+    const int     mode;
+    ggml_tensor * out {};
+
+    static constexpr int64_t D = 128;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "QSA_KPOOL";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_cells, n_tok, n_new, kpool, n_rot, mode);
+    }
+
+    test_qsa_kpool(int64_t n_cells = 64, int64_t n_tok = 1, int64_t n_new = 1, int64_t kpool = 4, int n_rot = 64,
+                   int mode = GGML_ROPE_TYPE_IMROPE)
+        : n_cells(n_cells), n_tok(n_tok), n_new(n_new), kpool(kpool), n_rot(n_rot), mode(mode) {}
+
+    // the pooled keys go through q8_0 after a norm and a rope, so a last-bit difference can move a quant
+    double max_nmse_err() override { return 1e-5; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 2*D, n_cells);
+        ggml_set_name(cache, "idx_cache");
+        ggml_tensor * k_raw = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok);
+        ggml_set_name(k_raw, "k_raw");
+        ggml_tensor * k_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tok);
+        ggml_set_name(k_idxs, "k_idxs");
+        ggml_tensor * pool_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kpool*n_new);
+        ggml_set_name(pool_idxs, "pool_idxs");
+        ggml_tensor * pool_rep = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_new);
+        ggml_set_name(pool_rep, "pool_rep");
+        ggml_tensor * pool_pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4*n_new);
+        ggml_set_name(pool_pos, "pool_pos");
+        ggml_tensor * norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, D);
+        ggml_set_name(norm_w, "norm_w");
+
+        // the write, expanded first as cpy_k is in the model: the gather reads the cache, not its result
+        ggml_tensor * pzero  = ggml_fill(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_tok), 0.0f);
+        ggml_tensor * packed = ggml_reshape_3d(ctx, ggml_concat(ctx, k_raw, pzero, 0), 2*D, 1, n_tok);
+        packed = ggml_view_2d(ctx, packed, 2*D, n_tok, packed->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, cache, packed, k_idxs));
+
+        ggml_tensor * key    = ggml_view_2d(ctx, cache, D, n_cells, cache->nb[1], 0);
+        ggml_tensor * pooled = ggml_view_2d(ctx, cache, D, n_cells, cache->nb[1], ggml_row_size(GGML_TYPE_Q8_0, D));
+
+        ggml_tensor * rows = ggml_reshape_3d(ctx, ggml_get_rows(ctx, key, pool_idxs), D, kpool, n_new);
+        ggml_tensor * p = nullptr;
+        for (int64_t i = 0; i < kpool; ++i) {
+            ggml_tensor * slice = ggml_view_2d(ctx, rows, D, n_new, rows->nb[2], i*rows->nb[1]);
+            p = p ? ggml_add(ctx, p, slice) : ggml_cont(ctx, slice);
+        }
+        p = ggml_scale(ctx, p, 1.0f/(float) kpool);
+        p = ggml_mul(ctx, ggml_rms_norm(ctx, p, 1e-6f), norm_w);
+        int sections[4] = { 11, 11, 10, 0 };
+        p = ggml_rope_multi(ctx, ggml_reshape_3d(ctx, p, D, 1, n_new), pool_pos, nullptr, n_rot, sections, mode,
+                            4096, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
+        p = ggml_reshape_2d(ctx, p, D, n_new);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx, pooled, p, pool_rep));
+
+        // read the whole cache back, after both writes
+        out = ggml_get_rows(ctx, cache, ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) n_cells, 1.0f), GGML_TYPE_I32));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(777);
+        std::vector<int32_t> cells(n_cells);
+        std::iota(cells.begin(), cells.end(), 0);
+        std::shuffle(cells.begin(), cells.end(), rng);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "k_idxs") == 0) {
+                // distinct cells
+                std::vector<int64_t> v(cells.begin(), cells.begin() + n_tok);
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int64_t));
+            } else if (strcmp(t->name, "pool_rep") == 0) {
+                // distinct rep rows, some of them rows this step writes
+                std::vector<int64_t> v(cells.end() - n_new, cells.end());
+                v[0] = cells[0];
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int64_t));
+            } else if (strcmp(t->name, "pool_idxs") == 0) {
+                // members: the fresh rows first, then any rows
+                std::vector<int32_t> v(kpool*n_new);
+                for (size_t i = 0; i < v.size(); ++i) {
+                    v[i] = i < (size_t) n_tok ? cells[i] : (int32_t) (rng() % n_cells);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pool_pos") == 0) {
+                std::vector<int32_t> v(4*n_new);
+                for (auto & x : v) {
+                    x = (int32_t) (rng() % 5000);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_Q8_0) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -12683,6 +12798,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_qsa_live(8192,   64, 4, 3, 4));
     test_cases.emplace_back(new test_qsa_live(4096,   64, 4, 3, 512));
     test_cases.emplace_back(new test_qsa_live(1000,   7,  3, 5, 9, false));
+
+    // qwen4exp QSA indexer key cache: decode, a short batch and a prefill ubatch
+    test_cases.emplace_back(new test_qsa_kpool(64,   1,   1,  4, 64));
+    test_cases.emplace_back(new test_qsa_kpool(64,   4,   2,  4, 128));
+    test_cases.emplace_back(new test_qsa_kpool(1024, 512, 129, 4, 64));
+    test_cases.emplace_back(new test_qsa_kpool(64,   3,   2,  2, 64, GGML_ROPE_TYPE_MROPE));
 
     // qwen4exp QSA attention chain: 24/2 heads, head size 256, width 2051
     for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {

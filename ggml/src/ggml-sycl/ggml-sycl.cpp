@@ -83,6 +83,7 @@
 #include "ggml-sycl/presets.hpp"
 #include "ggml-sycl/qsa-mask.hpp"
 #include "ggml-sycl/qsa-live.hpp"
+#include "ggml-sycl/qsa-kpool.hpp"
 #include "ggml-sycl/census.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
@@ -149,6 +150,7 @@ int g_ggml_sycl_moe_esimd = 5;
 int g_ggml_sycl_upload_queue = -1;
 int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_fuse_qsa_live = 1;
+int g_ggml_sycl_fuse_qsa_kpool = 1;
 int g_ggml_sycl_fuse_conv_window = 1;
 int g_ggml_sycl_gdn_state_store = 1;
 int g_ggml_sycl_gdn_state_gather = 1;
@@ -515,6 +517,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_mmid_sched = ggml_sycl_get_env("GGML_SYCL_MMID_SCHED", 0);
         g_ggml_sycl_fuse_qsa_fa_mask = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_FA_MASK", 1);
         g_ggml_sycl_fuse_qsa_live = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_LIVE", 1);
+        g_ggml_sycl_fuse_qsa_kpool = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_KPOOL", 1);
         g_ggml_sycl_fuse_conv_window = ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_WINDOW", 1);
         g_ggml_sycl_gdn_state_store = ggml_sycl_get_env("GGML_SYCL_GDN_STATE_STORE", 1);
         g_ggml_sycl_gdn_state_gather = ggml_sycl_get_env("GGML_SYCL_GDN_STATE_GATHER", 1);
@@ -705,6 +708,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_MMVQ_WIDE: %d\n", g_ggml_sycl_mmvq_wide);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_FA_MASK: %d\n", g_ggml_sycl_fuse_qsa_fa_mask);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_LIVE: %d\n", g_ggml_sycl_fuse_qsa_live);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_KPOOL: %d\n", g_ggml_sycl_fuse_qsa_kpool);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_CONV_WINDOW: %d\n", g_ggml_sycl_fuse_conv_window);
         GGML_LOG_INFO("  GGML_SYCL_GDN_STATE_STORE: %d\n", g_ggml_sycl_gdn_state_store);
         GGML_LOG_INFO("  GGML_SYCL_GDN_STATE_GATHER: %d\n", g_ggml_sycl_gdn_state_gather);
@@ -8982,6 +8986,14 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // the QSA indexer key cache writes, each chain computed at its SET_ROWS
+        if (ggml_sycl_qsa_kpool_absorbs(cgraph, i)) {
+            continue;
+        }
+        if (node->op == GGML_OP_SET_ROWS && ggml_sycl_qsa_kpool(*sycl_ctx, cgraph, i)) {
+            continue;
+        }
+
         if (kq_mask.tail) {
             ggml_sycl_kq_mask_graph_at(kq_mask, node);
         }
@@ -9838,6 +9850,10 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
     }
     // the elementwise steps of the QSA selection list, computed at its final cast
     if (const int n = ggml_sycl_qsa_live_absorbs(cgraph, node_idx)) {
+        return n;
+    }
+    // the QSA indexer key cache writes, each chain computed at its SET_ROWS
+    if (const int n = ggml_sycl_qsa_kpool_absorbs(cgraph, node_idx)) {
         return n;
     }
     // both of these run at the node they absorb and write the next one, reading the absorbed
