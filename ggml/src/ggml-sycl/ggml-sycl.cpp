@@ -9884,6 +9884,10 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
     if (const int n = ggml_sycl_hc_ffn_tail_absorbs(cgraph, node_idx)) {
         return n;
     }
+    // the MoE weighted reduction's mul, views and inner adds, which its fused kernel never writes
+    if (const int n = ggml_sycl_moe_reduce_absorbs(cgraph, node_idx)) {
+        return n;
+    }
     // both of these run at the node they absorb and write the next one, reading the absorbed
     // node's own input; marking it absorbed keeps that input live and reserves no dst for it
     if (ggml_sycl_can_fuse_unary_mul_bcast(cgraph, node_idx)) {

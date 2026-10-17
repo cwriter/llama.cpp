@@ -27,4 +27,10 @@ bool ggml_sycl_match_moe_weighted_reduction(const ggml_cgraph * cgraph, int node
 void ggml_sycl_op_moe_weighted_reduction(ggml_backend_sycl_context & ctx,
                                          const ggml_sycl_moe_reduce_match & match);
 
+// 1 when node_idx is a node of a matched reduction span other than its output: the mul, the
+// views and the inner adds are never written, so fusion_absorbs reports them and ggml-alloc gives
+// them no buffer (the mul alone is the full [n_embd, n_expert_used, n_tokens] expert output).
+// graph_optimize already keeps the experts and weights live until the span's output.
+int ggml_sycl_moe_reduce_absorbs(const ggml_cgraph * cgraph, int node_idx);
+
 #endif  // GGML_SYCL_MOE_REDUCE_HPP

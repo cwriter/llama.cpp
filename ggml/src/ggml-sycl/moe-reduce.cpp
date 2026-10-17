@@ -143,6 +143,25 @@ bool ggml_sycl_match_moe_weighted_reduction(const ggml_cgraph * cgraph, int node
     return true;
 }
 
+int ggml_sycl_moe_reduce_absorbs(const ggml_cgraph * cgraph, int node_idx) {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_MOE_REDUCE_ABSORB", 1) != 0;
+    const ggml_tensor * n = cgraph->nodes[node_idx];
+    if (!on || (n->op != GGML_OP_MUL && n->op != GGML_OP_VIEW && n->op != GGML_OP_ADD)) {
+        return 0;
+    }
+    // the span starts at its mul and is 2 * n_expert_used nodes long
+    for (int j = node_idx; j >= 0 && j > node_idx - 2 * GGML_SYCL_MOE_REDUCE_MAX_EXPERTS; --j) {
+        if (cgraph->nodes[j]->op != GGML_OP_MUL) {
+            continue;
+        }
+        ggml_sycl_moe_reduce_match m;
+        if (ggml_sycl_match_moe_weighted_reduction(cgraph, j, m)) {
+            return node_idx < j + m.node_count - 1 ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
 void ggml_sycl_op_moe_weighted_reduction(ggml_backend_sycl_context & ctx,
                                          const ggml_sycl_moe_reduce_match & match) {
     scope_op_debug_print scope_dbg_print(__func__, match.dst, /*num_src=*/0);
