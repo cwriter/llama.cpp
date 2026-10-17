@@ -4542,6 +4542,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const bool    identity;
     const bool    gated;
     const bool    normed;
+    const int     tail;  // x is the MoE weighted sum of 10 expert outputs (1), plus a gated shared expert (2)
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4549,6 +4550,9 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
+        if (tail) {
+            return VARS_TO_STR6(n_embd, n_tokens, identity, gated, normed, tail);
+        }
         return normed ? VARS_TO_STR5(n_embd, n_tokens, identity, gated, normed) : VARS_TO_STR4(n_embd, n_tokens, identity, gated);
     }
 
@@ -4558,12 +4562,39 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     bool run_whole_graph() override { return gated; }
 
     test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false,
-                      bool normed = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), normed(normed) {}
+                      bool normed = false, int tail = 0)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), normed(normed), tail(tail) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-        ggml_set_name(x, "x");
+        ggml_tensor * x;
+        if (tail) {
+            // the MoE layer tail as llama-graph builds it, then the shared expert as qwen4exp adds it
+            const int64_t n_used  = 10;
+            ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_used, n_tokens);
+            ggml_set_name(experts, "x");
+            ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+            ggml_set_name(weights, "weights");
+            experts = ggml_mul(ctx, experts, weights);
+            std::vector<ggml_tensor *> views(n_used);
+            for (int64_t e = 0; e < n_used; ++e) {
+                views[e] = ggml_view_2d(ctx, experts, n_embd, n_tokens, experts->nb[2], e*experts->nb[1]);
+                ggml_build_forward_expand(gf, views[e]);
+            }
+            x = views[0];
+            for (int64_t e = 1; e < n_used; ++e) {
+                x = ggml_add(ctx, x, views[e]);
+            }
+            if (tail == 2) {
+                ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+                ggml_set_name(shexp, "residual");
+                ggml_tensor * sgate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+                ggml_set_name(sgate, "weights");
+                x = ggml_add(ctx, x, ggml_mul(ctx, shexp, sgate));
+            }
+        } else {
+            x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(x, "x");
+        }
 
         ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
         ggml_set_name(residual, "residual");
@@ -11020,7 +11051,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t nt : {1, 3}) {
         test_cases.emplace_back(new test_dsv4_hc_post(2560, nt, true, true, true));
         test_cases.emplace_back(new test_dsv4_hc_post(512, nt, true, true, true));
+        // the FFN output computed inside the fused kernel
+        test_cases.emplace_back(new test_dsv4_hc_post(2560, nt, true, true, true, 2));
+        test_cases.emplace_back(new test_dsv4_hc_post(512, nt, true, true, true, 1));
     }
+    // a prefill ubatch
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1024, true, true, true, 2));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -13883,6 +13919,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n, true));
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true));
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true, true, true));
+        test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true, true, true, 2));
     }
     for (int n : {1, 2, 4}) {
         test_cases.emplace_back(new test_dsv4_hc_pre_up(2560, 320, n));

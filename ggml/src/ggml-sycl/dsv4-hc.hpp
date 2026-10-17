@@ -25,9 +25,17 @@ void ggml_sycl_op_dsv4_hc_post_fused_gate(ggml_backend_sycl_context & ctx, ggml_
 // mix runs on its output, as one kernel: a work-group owns one (stream, token) row, writes the hc_post output and
 // the normed row. False (nothing launched) if the shapes do not suit it.
 bool ggml_sycl_dsv4_hc_post_norm_ok(const ggml_tensor * hc_post, const ggml_tensor * rms, const ggml_tensor * mul);
+// With xs, x is not read but computed per element (hc-ffn-tail.cpp): the weighted sum of the expert
+// outputs over the expert axis, plus shexp * sgate when there is a shared expert.
+struct ggml_sycl_dsv4_hc_post_x {
+    const ggml_tensor * experts = nullptr;  // [n_embd, n_used, n_tokens]
+    const ggml_tensor * weights = nullptr;  // [1, n_used, n_tokens]
+    const ggml_tensor * shexp   = nullptr;  // [n_embd, n_tokens], or none
+    const ggml_tensor * sgate   = nullptr;  // [1, n_tokens]
+};
 bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                                const ggml_sycl_dsv4_hc_post_gate & gate, ggml_tensor * rms,
-                                               ggml_tensor * mul);
+                                               ggml_tensor * mul, const ggml_sycl_dsv4_hc_post_x * xs = nullptr);
 
 // The hc_pre gate is up(silu(scale(lo))) with a reordered Q8_0 up weight, built by three launches
 // per hyper-connection block. With GGML_SYCL_FUSE_HC_PRE one kernel does the scale, the unary, the

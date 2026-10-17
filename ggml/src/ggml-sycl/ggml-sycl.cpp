@@ -85,6 +85,7 @@
 #include "ggml-sycl/qsa-live.hpp"
 #include "ggml-sycl/qsa-kpool.hpp"
 #include "ggml-sycl/norm-rope.hpp"
+#include "ggml-sycl/hc-ffn-tail.hpp"
 #include "ggml-sycl/census.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
@@ -153,6 +154,7 @@ int g_ggml_sycl_fuse_qsa_fa_mask = 1;
 int g_ggml_sycl_fuse_qsa_live = 1;
 int g_ggml_sycl_fuse_qsa_kpool = 1;
 int g_ggml_sycl_fuse_norm_rope = 1;
+int g_ggml_sycl_fuse_hc_ffn_tail = 1;
 int g_ggml_sycl_fuse_conv_window = 1;
 int g_ggml_sycl_gdn_state_store = 1;
 int g_ggml_sycl_gdn_state_gather = 1;
@@ -521,6 +523,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_fuse_qsa_live = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_LIVE", 1);
         g_ggml_sycl_fuse_qsa_kpool = ggml_sycl_get_env("GGML_SYCL_FUSE_QSA_KPOOL", 1);
         g_ggml_sycl_fuse_norm_rope = ggml_sycl_get_env("GGML_SYCL_FUSE_NORM_ROPE", 1);
+        g_ggml_sycl_fuse_hc_ffn_tail = ggml_sycl_get_env("GGML_SYCL_FUSE_HC_FFN_TAIL", 1);
         g_ggml_sycl_fuse_conv_window = ggml_sycl_get_env("GGML_SYCL_FUSE_CONV_WINDOW", 1);
         g_ggml_sycl_gdn_state_store = ggml_sycl_get_env("GGML_SYCL_GDN_STATE_STORE", 1);
         g_ggml_sycl_gdn_state_gather = ggml_sycl_get_env("GGML_SYCL_GDN_STATE_GATHER", 1);
@@ -713,6 +716,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_LIVE: %d\n", g_ggml_sycl_fuse_qsa_live);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_QSA_KPOOL: %d\n", g_ggml_sycl_fuse_qsa_kpool);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_NORM_ROPE: %d\n", g_ggml_sycl_fuse_norm_rope);
+        GGML_LOG_INFO("  GGML_SYCL_FUSE_HC_FFN_TAIL: %d\n", g_ggml_sycl_fuse_hc_ffn_tail);
         GGML_LOG_INFO("  GGML_SYCL_FUSE_CONV_WINDOW: %d\n", g_ggml_sycl_fuse_conv_window);
         GGML_LOG_INFO("  GGML_SYCL_GDN_STATE_STORE: %d\n", g_ggml_sycl_gdn_state_store);
         GGML_LOG_INFO("  GGML_SYCL_GDN_STATE_GATHER: %d\n", g_ggml_sycl_gdn_state_gather);
@@ -8994,6 +8998,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (ggml_sycl_qsa_kpool_absorbs(cgraph, i)) {
             continue;
         }
+        // the MoE reduction and shared-expert add that the hc_post + norm fusion computes itself
+        if (ggml_sycl_hc_ffn_tail_absorbs(cgraph, i)) {
+            continue;
+        }
         if (node->op == GGML_OP_SET_ROWS && ggml_sycl_qsa_kpool(*sycl_ctx, cgraph, i)) {
             continue;
         }
@@ -9201,17 +9209,18 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             memcpy(&gate.b0, (const float *) node->op_params + 1, sizeof(float));
             memcpy(&gate.s1, (const float *) scale1->op_params + 0, sizeof(float));
             memcpy(&gate.b1, (const float *) scale1->op_params + 1, sizeof(float));
-            // and the grouped RMS norm * gamma of the next hyper-connection mix, when that comes next
-            if (i + 5 < cgraph->n_nodes && cgraph->nodes[i + 4]->op == GGML_OP_RMS_NORM &&
-                cgraph->nodes[i + 5]->op == GGML_OP_MUL &&
-                ggml_sycl_dsv4_hc_post_norm_ok(cgraph->nodes[i + 3], cgraph->nodes[i + 4], cgraph->nodes[i + 5]) &&
-                ggml_can_fuse_subgraph(cgraph, i,
-                    { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST, GGML_OP_RMS_NORM, GGML_OP_MUL },
-                    { i + 3, i + 5 }) &&
-                ggml_sycl_op_dsv4_hc_post_fused_gate_norm(*sycl_ctx, cgraph->nodes[i + 3], gate, cgraph->nodes[i + 4],
-                                                          cgraph->nodes[i + 5])) {
-                i += 5;
-                continue;
+            // and the grouped RMS norm * gamma of the next hyper-connection mix, when that comes next,
+            // computing the FFN output it combines when that tail was absorbed
+            if (ggml_sycl_hc_post_norm_at(cgraph, i)) {
+                ggml_sycl_hc_ffn_tail tail;
+                const bool has_tail = ggml_sycl_match_hc_ffn_tail(cgraph, i, tail);
+                if (ggml_sycl_op_dsv4_hc_post_fused_gate_norm(*sycl_ctx, cgraph->nodes[i + 3], gate, cgraph->nodes[i + 4],
+                                                              cgraph->nodes[i + 5], has_tail ? &tail.x : nullptr)) {
+                    i += 5;
+                    continue;
+                }
+                // the tail's nodes never ran, so nothing else can produce its output
+                GGML_ASSERT(!has_tail);
             }
             ggml_sycl_op_dsv4_hc_post_fused_gate(*sycl_ctx, cgraph->nodes[i + 3], gate);
             i += 3;
@@ -9866,6 +9875,10 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
     if (const int n = ggml_sycl_qsa_kpool_absorbs(cgraph, node_idx)) {
         return n;
     }
+    // the MoE reduction and shared-expert add that the hc_post + norm fusion computes itself
+    if (const int n = ggml_sycl_hc_ffn_tail_absorbs(cgraph, node_idx)) {
+        return n;
+    }
     // both of these run at the node they absorb and write the next one, reading the absorbed
     // node's own input; marking it absorbed keeps that input live and reserves no dst for it
     if (ggml_sycl_can_fuse_unary_mul_bcast(cgraph, node_idx)) {
@@ -10027,6 +10040,16 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
             ggml_sycl_dsv4_hc_post_norm_ok(n[3], n[4], n[5])) {
             for (ggml_tensor * t : { n[3]->src[0], n[3]->src[1], n[0]->src[0] }) {
                 params->add_alloc_dep(params->user_data, t->view_src ? t->view_src : t, n[5]);
+            }
+            // and what the FFN tail it computes in place of x reads
+            ggml_sycl_hc_ffn_tail tail;
+            if (ggml_sycl_match_hc_ffn_tail(cgraph, i, tail)) {
+                for (const ggml_tensor * t : { tail.x.experts, tail.x.weights, tail.x.shexp, tail.x.sgate }) {
+                    if (t) {
+                        ggml_tensor * b = const_cast<ggml_tensor *>(t->view_src ? t->view_src : t);
+                        params->add_alloc_dep(params->user_data, b, n[5]);
+                    }
+                }
             }
             i += 5;
         }

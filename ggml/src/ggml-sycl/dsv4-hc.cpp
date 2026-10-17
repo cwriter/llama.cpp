@@ -558,7 +558,7 @@ bool ggml_sycl_dsv4_hc_post_norm_ok(const ggml_tensor * hc_post, const ggml_tens
 
 bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                                const ggml_sycl_dsv4_hc_post_gate & gate, ggml_tensor * rms,
-                                               ggml_tensor * mul) {
+                                               ggml_tensor * mul, const ggml_sycl_dsv4_hc_post_x * xs) {
     if (!ggml_sycl_dsv4_hc_post_norm_ok(dst, rms, mul) || gate.src == nullptr || gate.src->type != GGML_TYPE_F32) {
         return false;
     }
@@ -583,6 +583,20 @@ bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, 
     const sycl::float2 g1(gate.s1, gate.b1);
     const int nv = (int) (n_embd / 4);
 
+    // the FFN tail computed in place of x: as moe_weighted_reduction_f32_sycl, then + shexp * sgate
+    const bool    tail   = xs != nullptr;
+    const float * ex     = tail ? (const float *) xs->experts->data : nullptr;
+    const float * ew     = tail ? (const float *) xs->weights->data : nullptr;
+    const float * sh     = tail && xs->shexp ? (const float *) xs->shexp->data : nullptr;
+    const float * sg     = tail && xs->shexp ? (const float *) xs->sgate->data : nullptr;
+    const int     n_used = tail ? (int) xs->experts->ne[1] : 0;
+    const int64_t se1    = tail ? xs->experts->nb[1] / sizeof(float) : 0;
+    const int64_t se2    = tail ? xs->experts->nb[2] / sizeof(float) : 0;
+    const int64_t sw1    = tail ? xs->weights->nb[1] / sizeof(float) : 0;
+    const int64_t sw2    = tail ? xs->weights->nb[2] / sizeof(float) : 0;
+    const int64_t ss1    = sh ? xs->shexp->nb[1] / sizeof(float) : 0;
+    const int64_t sg1    = sh ? xs->sgate->nb[1] / sizeof(float) : 0;
+
     ctx.stream()->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(n_tokens, hc, nv), sycl::range<3>(1, 1, nv)),
         [=](sycl::nd_item<3> item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -596,7 +610,29 @@ bool ggml_sycl_op_dsv4_hc_post_fused_gate_norm(ggml_backend_sycl_context & ctx, 
             g = 1.0f / (1.0f + op_exp(-g));
             g = g1[0] * g + g1[1];
 
-            const sycl::float4 xv = *(const sycl::float4 *) (x + i0 + it*sx1);
+            sycl::float4 xv;
+            if (tail) {
+                sycl::float4 m(0.0f);
+                for (int e = 0; e < n_used; ++e) {
+                    const sycl::float4 ev = *(const sycl::float4 *) (ex + i0 + e*se1 + it*se2);
+                    const float        we = ew[e*sw1 + it*sw2];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        m[j] += ev[j] * we;
+                    }
+                }
+                if (sh) {
+                    const sycl::float4 sv = *(const sycl::float4 *) (sh + i0 + it*ss1);
+                    const float        gv = sg[it*sg1];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        m[j] += sv[j] * gv;
+                    }
+                }
+                xv = m;
+            } else {
+                xv = *(const sycl::float4 *) (x + i0 + it*sx1);
+            }
             const sycl::float4 rv = *(const sycl::float4 *) (residual + i0 + (idst + it*hc)*n_embd);
             sycl::float4 sum;
 #pragma unroll
