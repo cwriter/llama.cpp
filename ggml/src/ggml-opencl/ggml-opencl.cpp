@@ -12944,6 +12944,7 @@ static ggml_backend_buffer_type_i ggml_backend_opencl_buffer_type_interface = {
     /* .get_alloc_size      = */ ggml_backend_opencl_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
     /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+    /* .set_tensor_is_copy  = */ NULL, // defaults to true
     /* .is_host             = */ NULL,
 };
 

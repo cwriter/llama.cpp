@@ -318,6 +318,7 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_shared(int devi
                     /* .get_alloc_size      = */ ggml_backend_metal_buffer_type_shared_get_alloc_size,
                     /* .get_alloc_size_n    = */ NULL,
                     /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+                    /* .set_tensor_is_copy  = */ NULL, // defaults to true
                     /* .is_host             = */ ggml_backend_metal_buffer_type_shared_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
@@ -396,6 +397,7 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_private(int dev
                     /* .get_alloc_size      = */ ggml_backend_metal_buffer_type_private_get_alloc_size,
                     /* .get_alloc_size_n    = */ NULL,
                     /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+                    /* .set_tensor_is_copy  = */ NULL, // defaults to true
                     /* .is_host             = */ ggml_backend_metal_buffer_type_private_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
@@ -477,6 +479,7 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_mapped(int devi
                     /* .get_alloc_size      = */ ggml_backend_metal_buffer_type_mapped_get_alloc_size,
                     /* .get_alloc_size_n    = */ NULL,
                     /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+                    /* .set_tensor_is_copy  = */ NULL, // defaults to true
                     /* .is_host             = */ ggml_backend_metal_buffer_type_mapped_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),

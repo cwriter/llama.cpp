@@ -1962,6 +1962,13 @@ static size_t ggml_backend_sycl_buffer_type_get_max_alloc_size(ggml_backend_buff
     return std::max(size, ggml_sycl_flash_attn_ext_get_max_alloc_size(tensor));
 }
 
+// a KQ mask is packed into bits on upload (see kq-mask-bits.hpp), and a quantized tensor may be kept reordered or
+// in SoA spans (init_tensor), so their bytes in memory are not the ones they were given
+static bool ggml_backend_sycl_buffer_type_set_tensor_is_copy(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    GGML_UNUSED(buft);
+    return !ggml_is_quantized(tensor->type) && !ggml_sycl_kq_mask_eligible(tensor);
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface = {
     /* .get_name            = */ ggml_backend_sycl_buffer_type_get_name,
     /* .alloc_buffer        = */ ggml_backend_sycl_buffer_type_alloc_buffer,
@@ -1971,6 +1978,7 @@ static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface 
     /* .get_alloc_size      = */ ggml_backend_sycl_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
     /* .get_max_alloc_size  = */ ggml_backend_sycl_buffer_type_get_max_alloc_size,
+    /* .set_tensor_is_copy  = */ ggml_backend_sycl_buffer_type_set_tensor_is_copy,
     /* .is_host             = */ NULL,
 };
 
@@ -2410,6 +2418,7 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
     /* .get_alloc_size      = */ ggml_backend_sycl_split_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
     /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+    /* .set_tensor_is_copy  = */ NULL, // defaults to true
     /* .is_host             = */ ggml_backend_sycl_split_buffer_type_is_host,
 };
 
@@ -2557,6 +2566,7 @@ static ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type_for_device(
                     /* .get_alloc_size      = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
                     /* .get_alloc_size_n    = */ NULL,
                     /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+                    /* .set_tensor_is_copy  = */ NULL, // defaults to true
                     /* .is_host             = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                 },
                 /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_sycl_reg(), i),

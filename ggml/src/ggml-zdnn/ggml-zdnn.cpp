@@ -422,6 +422,7 @@ ggml_backend_buffer_type_t ggml_backend_zdnn_buffer_type(void) {
             /* .get_alloc_size      = */ NULL,  // defaults to ggml_nbytes
             /* .get_alloc_size_n    = */ NULL,
             /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+            /* .set_tensor_is_copy  = */ NULL, // defaults to true
             /* .is_host             = */ ggml_backend_zdnn_buffer_type_is_host,
         },
         /* .device  = */ &g_ggml_backend_zdnn_device,

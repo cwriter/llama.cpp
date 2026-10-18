@@ -31,6 +31,9 @@ extern "C" {
         // (optional) upper bound of get_alloc_size for this tensor in any later graph with the same topology (defaults to get_alloc_size)
         // the graph allocator plans each tensor at this size, so a backend whose scratch depends on runtime shapes (e.g. the KV length) does not force a new plan
         size_t                (*get_max_alloc_size)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
+        // (optional) whether set_tensor stores the bytes it is given unchanged for this tensor (defaults to true)
+        // false lets a backend keep a tensor in a layout of its own, e.g. a mask packed into bits, which callers must not write around set_tensor
+        bool                  (*set_tensor_is_copy)(ggml_backend_buffer_type_t buft, const struct ggml_tensor * tensor);
         // (optional) check if tensor data is in host memory and uses standard ggml tensor layout (defaults to false)
         bool                  (*is_host)         (ggml_backend_buffer_type_t buft);
     };

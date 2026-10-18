@@ -1671,6 +1671,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
          /* .get_alloc_size     = */ ggml_backend_cpu_riscv64_spacemit_nbytes,
          /* .get_alloc_size_n   = */ NULL,
          /* .get_max_alloc_size  = */ nullptr, // defaults to get_alloc_size
+         /* .set_tensor_is_copy  = */ NULL, // defaults to true
          /* .is_host            = */ nullptr,
          },
  /* .device  = */

@@ -1603,6 +1603,7 @@ static const ggml_backend_buffer_type_i ggml_backend_cann_buffer_type_interface 
     /* .get_alloc_size      = */ ggml_backend_cann_buffer_type_get_alloc_size,
     /* .get_alloc_size_n    = */ NULL,
     /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+    /* .set_tensor_is_copy  = */ NULL, // defaults to true
     /* .is_host             = */ ggml_backend_cann_buffer_type_is_host,
 };
 
@@ -1753,6 +1754,7 @@ ggml_backend_buffer_type_t ggml_backend_cann_host_buffer_type() {
                            /* .get_alloc_size       = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
                            /* .get_alloc_size_n     = */ NULL,
                            /* .get_max_alloc_size  = */ NULL, // defaults to get_alloc_size
+                           /* .set_tensor_is_copy  = */ NULL, // defaults to true
                            /* .is_host              = */ ggml_backend_cpu_buffer_type()->iface.is_host,
                            },
         /* .device   = */

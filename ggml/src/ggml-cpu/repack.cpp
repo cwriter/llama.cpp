@@ -5246,6 +5246,7 @@ ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type(void) {
                            /* .get_alloc_size       = */ nullptr,  // defaults to ggml_nbytes
                            /* .get_alloc_size_n     = */ NULL,
                            /* .get_max_alloc_size  = */ nullptr, // defaults to get_alloc_size
+                           /* .set_tensor_is_copy  = */ NULL, // defaults to true
                            /* .is_host              = */ nullptr,
                            },
         /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
