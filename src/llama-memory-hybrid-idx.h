@@ -84,6 +84,12 @@ public:
     // Whether pools are kpool consecutive cells in sequence order (qwen4exp) instead of kpool consecutive positions.
     bool get_kpool_by_order() const { return hparams_idx.indexer_kpool_by_order; }
 
+    // With a stream per sequence a token only ever selects pools of its own sequence. A ubatch of many tokens then
+    // holds one sequence and the indexer scores that sequence's pools only, instead of every sequence's; a few tokens
+    // of several sequences (decode) stay together and score every pool, which costs the same reads.
+    bool kpool_per_seq() const;
+    static constexpr uint32_t KPOOL_FEW_TOKENS = 16; // per sequence
+
     // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
     // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
     // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
@@ -190,6 +196,8 @@ public:
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
+    // Padded count of the pools the ubatch's tokens are scored against, a prefix of the get_n_kpool() list.
+    uint32_t get_n_kpool_list(const llama_ubatch & ubatch) const;
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
@@ -200,6 +208,9 @@ public:
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
+
+    // whether the ubatch is scored against its own sequence's pools only, see get_n_kpool_list
+    bool kpool_list_own(const llama_ubatch & ubatch) const;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact

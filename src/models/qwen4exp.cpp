@@ -726,6 +726,7 @@ public:
 
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
         res &= pool_cells->ne[0] == mctx->get_n_kpool();
+        res &= pool_mask->ne[0]  == mctx->get_n_kpool_list(params.ubatch);
         res &= pool_mask->ne[1]  == params.ubatch.n_tokens;
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // the scatter mask shape follows n_kv
@@ -738,7 +739,7 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
-    ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
+    ggml_tensor * pool_mask     = nullptr; // F16 [n_list, n_tokens] the first n_list pools are the ones scored
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
     ggml_tensor * new_pool_flat = nullptr; // I32 [kpool*n_new]    the same, one view shared by all layers
@@ -758,13 +759,16 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     const uint32_t kpool  = hparams.indexer_kpool;
     const uint32_t n_pool = mctx_hyb->get_n_kpool();
+    // a ubatch of one sequence (with a stream per sequence) is scored against that sequence's pools only, while the
+    // pool inputs and the gather keep every pool, so a decode of several sequences never outgrows the reserved plan
+    const uint32_t n_list = mctx_hyb->get_n_kpool_list(ubatch);
 
     auto inp = std::make_unique<llm_graph_input_kpool>(mctx_hyb, kpool);
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_list, n_tokens);
     ggml_set_name(inp->pool_mask, "inp_pool_mask");
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
@@ -781,7 +785,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->n_kv  = mctx_idx->get_n_kv();
     inp->n_new = mctx_hyb->get_n_kpool_new();
     // the top blocks plus the tail
-    inp->n_sel = kpool*std::min<uint32_t>(n_pool, hparams.indexer_top_k / kpool) + kpool - 1;
+    inp->n_sel = kpool*std::min<uint32_t>(n_list, hparams.indexer_top_k / kpool) + kpool - 1;
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
@@ -852,6 +856,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
+    // the scored pools lead the list
+    const int64_t n_list = inp_kpool->pool_mask->ne[0];
+    pooled = ggml_view_3d(ctx0, pooled, idx_dim, 1, n_list, pooled->nb[1], pooled->nb[2], 0);
     cb(pooled, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
@@ -865,11 +872,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_list, n_tokens]
     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     cb(score, "indexer_score", il);
 
-    const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+    const int64_t n_top_pool = std::min<int64_t>(n_list, hparams.indexer_top_k / kpool);
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 
@@ -903,7 +910,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // top_k fills a short selection with invisible pools that can overlap the tail, so the scatter would write
     // some cells from several threads: map every dead slot to its own dump row, idx = dump + live*(idx - dump)
     // a picked pool is live when visible: a visible score is a rectified sum >= 0, an invisible one is -inf
-    ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pool, n_tokens), top_k); // [1, n_top_pool, n_tokens]
+    ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_list, n_tokens), top_k); // [1, n_top_pool, n_tokens]
     ggml_tensor * live_pool = ggml_clamp(ctx0, ggml_scale_bias(ctx0, top_score, 1.0f, 1.0f), 0.0f, 1.0f);
     live_pool = ggml_reshape_2d(ctx0, ggml_repeat_4d(ctx0, live_pool, kpool, n_top_pool, n_tokens, 1), kpool*n_top_pool, n_tokens);
     // a tail cell is live unless it is the n_kv sentinel
