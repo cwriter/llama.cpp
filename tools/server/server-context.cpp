@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <deque>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -992,6 +993,10 @@ private:
     common_speculative_init_result_ptr spec_init;
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+
+    // see stagger_step()
+    bool            decode_stagger = false;
+    std::deque<int> stagger_queue; // the slots with a decode in flight, oldest first
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
@@ -1419,6 +1424,17 @@ private:
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
+        }
+
+        if (params_base.decode_stagger) {
+            if (spec) {
+                SRV_WRN("%s", "staggered decode is not used with speculative decoding\n");
+            } else if (llama_set_decode_stagger(ctx_tgt, true)) {
+                decode_stagger = true;
+                SRV_INF("%s", "staggered decode enabled\n");
+            } else {
+                SRV_WRN("%s", "staggered decode is not supported by this context\n");
+            }
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -2761,6 +2777,7 @@ private:
         // the task may change the slots or read the draft state
         if (task.type != SERVER_TASK_TYPE_NEXT_RESPONSE && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             spec_catch_up(false);
+            stagger_drain();
         }
 
         switch (task.type) {
@@ -3237,6 +3254,23 @@ private:
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
+            }
+        }
+
+        if (decode_stagger) {
+            try {
+                if (stagger_can_run()) {
+                    stagger_step();
+                    return;
+                }
+
+                // anything else goes through the batch
+                stagger_drain();
+            } catch (const std::exception & e) {
+                SRV_ERR("staggered decode failed: %s\n", e.what());
+                stagger_queue.clear();
+                abort_all_slots("staggered decode failed: " + std::string(e.what()));
+                return;
             }
         }
 
@@ -4343,6 +4377,172 @@ private:
         return true;
     }
 
+    bool accept_special_token(const server_slot & slot, llama_token token) const {
+        return params_base.special ||
+            slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+    }
+
+    // sample the next token of a generating slot from the output tok_idx of the last decode, and process it
+    void sample_token(server_slot & slot, int32_t tok_idx) {
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+        }
+
+        slot.i_batch = -1;
+
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+        const int64_t t_now = ggml_time_us();
+
+        slot.stats.n_gen += 1;
+
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = t_now;
+            slot.n_gen_last = 0;
+        }
+
+        slot.stats.update_gen_last();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+        result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+        }
+
+        if (!process_token(result, slot)) {
+            // release slot because of stop condition
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+
+            return;
+        }
+
+        slot.print_timings_tg();
+    }
+
+    //
+    // staggered decode (--decode-stagger): while only slots that generate are busy, each one is decoded on its own and
+    // decoded again as soon as its token is sampled, without waiting for the others. With a layer split, the devices
+    // then work on different slots at the same time instead of on one batch of all of them.
+    //
+
+    // whether the busy slots can be staggered: at least two, all generating
+    bool stagger_can_run() {
+        server_slot * first = nullptr;
+        int n_gen = 0;
+
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+
+            // prompts, context shifts and embedding inputs go through the batch
+            if (slot.state != SLOT_STATE_GENERATING || slot.prompt.n_tokens() + 1 >= slot.n_ctx || !slot.inp_embd.empty()) {
+                return false;
+            }
+
+            if (first && !first->can_batch_with(slot)) {
+                return false;
+            }
+
+            first = first ? first : &slot;
+            n_gen++;
+        }
+
+        return n_gen >= 2;
+    }
+
+    bool stagger_in_flight(const server_slot & slot) const {
+        return std::find(stagger_queue.begin(), stagger_queue.end(), slot.id) != stagger_queue.end();
+    }
+
+    // decode the last sampled token of a slot, without waiting for it
+    void stagger_submit(server_slot & slot) {
+        batch.clear();
+        slot.handle_last_sampled_token(batch);
+        batch.render(0, 1);
+
+        metrics_pre_decode();
+
+        const int ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
+        if (ret != 0) {
+            const std::string err = ret == 1 ? "Context size has been exceeded." : "Compute error.";
+            SLT_ERR(slot, "staggered decode failed: %s ret = %d\n", err.c_str(), ret);
+
+            send_error(slot, err);
+            slot.release();
+            slot.prompt_clear();
+            return;
+        }
+
+        metrics_post_decode(0, 1, false);
+
+        stagger_queue.push_back(slot.id);
+    }
+
+    // wait for the oldest decode in flight, then sample and process its token
+    server_slot & stagger_collect() {
+        auto & slot = slots[stagger_queue.front()];
+        stagger_queue.pop_front();
+
+        // yield, so the metrics tasks are handled while waiting
+        queue_tasks.yield_to_queue([&]() {
+            llama_synchronize_seq(ctx_tgt, slot.id);
+        });
+
+        if (slot.state == SLOT_STATE_GENERATING && slot.i_batch == 0) {
+            sample_token(slot, 0);
+        }
+
+        return slot;
+    }
+
+    // collect every decode in flight, before anything else uses the context or the slots
+    void stagger_drain() {
+        while (!stagger_queue.empty()) {
+            stagger_collect();
+        }
+    }
+
+    void stagger_step() {
+        if (stagger_queue.empty()) {
+            // the context state that the batch sets for each decode
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    common_set_adapter_lora(ctx_tgt, slot.lora);
+                    llama_set_embeddings(ctx_tgt, false);
+                    break;
+                }
+            }
+        }
+
+        // the slots that just started generating
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && !stagger_in_flight(slot)) {
+                stagger_submit(slot);
+            }
+        }
+
+        if (stagger_queue.empty()) {
+            return;
+        }
+
+        auto & slot = stagger_collect();
+
+        // decode its next token at once, while the devices still work on the other slots
+        if (slot.state == SLOT_STATE_GENERATING && stagger_can_run()) {
+            stagger_submit(slot);
+        }
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4358,11 +4558,6 @@ private:
                 }
             }
         });
-
-        auto accept_special_token = [&](server_slot & slot, llama_token token) {
-            return params_base.special ||
-                slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
-        };
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
@@ -4417,50 +4612,7 @@ private:
             }
 
             // shifted according to the current sub-batch
-            const int tok_idx = slot.i_batch - off;
-
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-            }
-
-            slot.i_batch = -1;
-
-            common_sampler_accept(slot.smpl.get(), id, true);
-
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
-            slot.stats.n_gen += 1;
-
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
-
-            slot.stats.update_gen_last();
-
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
-
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-
-                return;
-            }
-
-            slot.print_timings_tg();
+            sample_token(slot, slot.i_batch - off);
         });
 
         // speculative decoding - main model sample and accept

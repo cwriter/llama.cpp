@@ -1135,6 +1135,19 @@ extern "C" {
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
 
+    // Staggered decode, for pipeline parallelism over several devices with one KV stream per sequence.
+    // When enabled, a decode of a single output token of a single sequence runs on graphs of its own and does not wait
+    // for the decodes of other sequences, so the devices can work on different sequences at the same time. Its outputs
+    // go to the output row of the sequence; read them after llama_synchronize_seq().
+    // Returns false if the context does not support it (no pipeline parallelism, n_seq_max == 1 or a unified KV cache).
+    LLAMA_API bool llama_set_decode_stagger(struct llama_context * ctx, bool value);
+
+    // Wait for the last staggered decode of seq_id only, and make its output the current one: until the next decode,
+    // llama_synchronize() and the getters below then read it with index 0, without waiting for the other sequences.
+    // Without such a decode it is llama_synchronize(). A decode that is not staggered overwrites the outputs of the
+    // staggered decodes not read yet.
+    LLAMA_API void llama_synchronize_seq(struct llama_context * ctx, llama_seq_id seq_id);
+
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously
     // in the order they have appeared in the batch.

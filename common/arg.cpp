@@ -2578,6 +2578,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
+        {"--decode-stagger"},
+        {"--no-decode-stagger"},
+        string_format("with a layer split over several devices, decode each generating slot on its own and start its next "
+                      "token as soon as it is sampled, so the devices work on different slots at the same time instead of "
+                      "batching them (needs --parallel > 1 and no unified KV cache; not used with speculative decoding) "
+                      "(default: %s)", params.decode_stagger ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.decode_stagger = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_DECODE_STAGGER"));
+    add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
         "note: if -hf is used, this argument can be omitted",

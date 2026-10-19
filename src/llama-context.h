@@ -60,6 +60,13 @@ struct llama_context {
 
     void synchronize();
 
+    // staggered decode, see llama_set_decode_stagger() and llama_synchronize_seq()
+    bool set_decode_stagger(bool value);
+    void synchronize_seq(llama_seq_id seq_id);
+
+    // the synchronization before reading outputs: none after synchronize_seq() selected them
+    void synchronize_outputs();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -233,7 +240,8 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    // row_only >= 0: a staggered decode, which keeps the backend sampling outputs of the other rows
+    uint32_t output_reserve(int32_t n_outputs, int32_t row_only = -1);
 
     void output_reorder();
 
@@ -416,6 +424,46 @@ private:
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
+
+    // staggered decode: a scheduler and graphs per sequence, swapped in for the decodes of that sequence, so that
+    // the graphs of each sequence are reused and its decodes do not wait for the other sequences
+    struct stagger_slot {
+        ggml_backend_sched_ptr sched;
+        std::array<llm_graph_result_ptr, 2> gf_res_prev;
+        llm_graph_result * gf_res_prev_active = nullptr;
+        bool logged = false;
+    };
+
+    // the output of the last staggered decode of a sequence, in the output row of the sequence
+    struct stagger_output {
+        ggml_backend_event_ptr ev;            // recorded after the output copies
+        ggml_backend_t         ev_backend = nullptr;
+        bool                   pending    = false; // not waited for yet
+        bool                   valid      = false; // no decode that is not staggered since
+        int64_t                t_start_us = 0;
+    };
+
+    bool stagger_enabled = false;
+    int  stagger_active  = -1; // the sequence whose scheduler is swapped in
+
+    std::vector<stagger_slot>   stagger;         // created on first use, dropped by sched_reserve()
+    std::vector<stagger_output> stagger_outputs; // kept across sched_reserve()
+
+    // outputs selected by synchronize_seq(), until the next decode
+    bool output_seq_ready = false;
+
+    // the graph that last built the chain of each backend sampler: a sampler keeps the inputs of that graph, so
+    // another graph that uses the sampler must be built again, see samplers_owned()
+    std::map<llama_seq_id, const llm_graph_result *> sampler_owner;
+
+    std::map<llama_seq_id, llama_sampler *> graph_samplers() const;
+
+    bool samplers_owned(const llm_graph_result * res, const std::map<llama_seq_id, llama_sampler *> & samplers) const;
+    void samplers_own  (const llm_graph_result * res, const std::map<llama_seq_id, llama_sampler *> & samplers);
+
+    // the sequence of a decode that can be staggered, -1 if none
+    llama_seq_id stagger_seq(const llama_batch_ext & batch_inp, uint32_t n_tokens_all, uint32_t n_outputs_all) const;
+    void stagger_swap(llama_seq_id seq_id);
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

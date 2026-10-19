@@ -742,6 +742,7 @@ void llama_context::sched_reserve() {
     for (auto & res : gf_res_prev) {
         res.reset();
     }
+    stagger.clear();
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
@@ -911,6 +912,109 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+}
+
+bool llama_context::set_decode_stagger(bool value) {
+    if (value && (!memory || !cparams.pipeline_parallel || cparams.n_seq_max < 2 || cparams.kv_unified)) {
+        LLAMA_LOG_WARN("%s: staggered decode needs pipeline parallelism, n_seq_max > 1 and a KV stream per sequence\n", __func__);
+        return false;
+    }
+
+    synchronize();
+
+    stagger_enabled = value;
+    stagger.clear();
+    stagger_outputs.clear();
+    stagger_outputs.resize(value ? cparams.n_seq_max : 0);
+
+    return true;
+}
+
+llama_seq_id llama_context::stagger_seq(const llama_batch_ext & batch_inp, uint32_t n_tokens_all, uint32_t n_outputs_all) const {
+    if (!stagger_enabled || n_tokens_all != 1 || n_outputs_all != 1 || batch_inp.tokens[0].seq_ids.size() != 1) {
+        return -1;
+    }
+
+    // outputs other than logits and backend sampling stay with the decodes that are not staggered
+    if (cparams.embeddings || cparams.embeddings_nextn) {
+        return -1;
+    }
+    for (bool enabled : cparams.embeddings_layer_inp) {
+        if (enabled) {
+            return -1;
+        }
+    }
+
+    const llama_seq_id seq_id = *batch_inp.tokens[0].seq_ids.begin();
+
+    return seq_id >= 0 && (uint32_t) seq_id < cparams.n_seq_max ? seq_id : -1;
+}
+
+void llama_context::stagger_swap(llama_seq_id seq_id) {
+    if (stagger.size() < cparams.n_seq_max) {
+        stagger.resize(cparams.n_seq_max);
+    }
+
+    auto & slot = stagger[seq_id];
+
+    if (stagger_active < 0 && !slot.sched) {
+        slot.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+        ggml_backend_sched_set_copy_callback(slot.sched.get(), sched_copy_experts, this);
+        if (cparams.seam_mode != 0) {
+            ggml_backend_sched_set_seam_mode(slot.sched.get(), (enum ggml_backend_sched_seam_mode) cparams.seam_mode);
+        }
+    }
+
+    // the compute buffers of a new scheduler are known after its first graph
+    if (stagger_active >= 0 && !slot.logged) {
+        slot.logged = true;
+        for (auto * backend : backend_ptrs) {
+            LLAMA_LOG_INFO("%s: staggered decode, seq %d %10s compute buffer size = %8.2f MiB\n", __func__, seq_id, ggml_backend_name(backend),
+                    ggml_backend_sched_get_buffer_size(sched.get(), backend) / 1024.0 / 1024.0);
+        }
+    }
+
+    std::swap(sched,              slot.sched);
+    std::swap(gf_res_prev,        slot.gf_res_prev);
+    std::swap(gf_res_prev_active, slot.gf_res_prev_active);
+
+    stagger_active = stagger_active < 0 ? seq_id : -1;
+}
+
+void llama_context::synchronize_seq(llama_seq_id seq_id) {
+    if (seq_id < 0 || (size_t) seq_id >= stagger_outputs.size() || !stagger_outputs[seq_id].valid) {
+        synchronize();
+        return;
+    }
+
+    auto & out = stagger_outputs[seq_id];
+
+    if (out.pending) {
+        if (out.ev) {
+            ggml_backend_event_synchronize(out.ev.get());
+        } else {
+            synchronize();
+        }
+        out.pending = false;
+
+        if (!cparams.no_perf) {
+            t_eval_us += ggml_time_us() - out.t_start_us;
+        }
+        n_eval++;
+    }
+
+    // the output of the sequence is the current one, at index 0
+    output_swaps.clear();
+    output_ids[0]    = seq_id;
+    n_outputs        = seq_id + 1;
+    output_seq_ready = true;
+}
+
+void llama_context::synchronize_outputs() {
+    if (!output_seq_ready) {
+        synchronize();
+    }
 }
 
 const llama_model & llama_context::get_model() const {
@@ -1592,14 +1696,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // the KV-only catch-up of a pipelined MTP draft rebuilds its small graph rather than wait for the device it shares with the target
     const bool can_reuse = !graph_reuse_disable && !(cparams.pipeline_parallel && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_outputs == 0);
 
-    if (can_reuse && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (can_reuse && gf_res_prev_active == res && samplers_owned(res, gparams.samplers) && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            // the scheduler of a sequence waits only for the last decode of that sequence, which its output event
+            // follows: the decodes of the other sequences may be in flight
+            const auto * out = stagger_active >= 0 ? &stagger_outputs[stagger_active] : nullptr;
+            if (out && out->ev) {
+                ggml_backend_event_synchronize(out->ev.get());
+            } else {
+                ggml_backend_sched_synchronize(sched.get());
+            }
         }
 
         n_reused++;
@@ -1613,6 +1724,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
+        samplers_own(res, gparams.samplers);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1976,11 +2088,26 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
 
-    if (t_compute_start_us == 0) {
-        t_compute_start_us = ggml_time_us();
-    }
-    n_queued_tokens += n_tokens_all;
+    // a staggered decode runs on the graphs of its sequence, writes its output row and is waited for alone
+    const llama_seq_id stagger_id = stagger_seq(batch_inp, n_tokens_all, n_outputs_all);
 
+    if (stagger_id >= 0) {
+        // until the decode records its output, a failed decode leaves no output to read
+        stagger_outputs[stagger_id].valid      = false;
+        stagger_outputs[stagger_id].t_start_us = ggml_time_us();
+    } else {
+        if (t_compute_start_us == 0) {
+            t_compute_start_us = ggml_time_us();
+        }
+        n_queued_tokens += n_tokens_all;
+
+        // the rows of the staggered decodes are overwritten
+        for (auto & out : stagger_outputs) {
+            out.valid = false;
+        }
+    }
+
+    output_seq_ready = false;
     output_swaps.clear();
     embd_batch_idxs.clear();
 
@@ -2052,7 +2179,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     };
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    if (output_reserve(n_outputs_all, stagger_id) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         if (nextn_flip) {
             nextn_half ^= 1;
@@ -2063,8 +2190,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     ggml_backend_t nextn_backend = nullptr;
 
     // start a new sampling transaction for this logical batch
+    // a staggered decode only for its sequence, the decodes of the other sequences may still be in flight
     for (const auto & entry : sampling.samplers) {
-        llama_sampler_backend_begin(entry.second);
+        if (stagger_id < 0 || entry.first == stagger_id) {
+            llama_sampler_backend_begin(entry.second);
+        }
     }
 
     int64_t n_outputs_prev = 0;
@@ -2090,6 +2220,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         ggml_status status;
+
+        // run a staggered decode on the scheduler and graphs of its sequence
+        struct stagger_guard {
+            llama_context * lctx;
+            llama_seq_id    seq_id;
+            ~stagger_guard() {
+                if (seq_id >= 0) {
+                    lctx->stagger_swap(seq_id);
+                }
+            }
+        } stagger_scope { this, stagger_id };
+        if (stagger_id >= 0) {
+            stagger_swap(stagger_id);
+        }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
@@ -2139,18 +2283,30 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             t_embd = res->get_embd_pooled();
         }
 
+        // the first output row of this ubatch: a staggered decode writes the row of its sequence
+        const int64_t row_out = stagger_id >= 0 ? stagger_id : n_outputs_prev;
+
+        // the backends that copy outputs, a staggered decode waits for them with an event
+        ggml_backend_t stagger_backend = nullptr;
+        bool           stagger_mixed   = false;
+        auto backend_out = [&](ggml_backend_t backend) {
+            stagger_mixed   = stagger_mixed || (stagger_backend != nullptr && stagger_backend != backend);
+            stagger_backend = backend;
+        };
+
         // extract logits
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            float * logits_out = logits.data + row_out*n_vocab;
 
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+                GGML_ASSERT((row_out + n_outputs)*n_vocab <= (int64_t) logits.size);
                 ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                backend_out(backend_res);
             }
         }
 
@@ -2250,10 +2406,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const auto stride = n_vocab;
 
             // async copy the sampling data from the backend to the host
-            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
-            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
-            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
-            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      row_out, sched.get());
+            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, row_out, sched.get(), &sampling.logits_count);
+            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, row_out, sched.get(), &sampling.probs_count);
+            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, row_out, sched.get(), &sampling.candidates_count);
+
+            for (const auto * ts : { &res->t_sampled, &res->t_sampled_logits, &res->t_sampled_probs, &res->t_candidates }) {
+                for (auto * t : *ts) {
+                    if (t) {
+                        backend_out(ggml_backend_sched_get_tensor_backend(sched.get(), t));
+                    }
+                }
+            }
+        }
+
+        if (stagger_id >= 0) {
+            auto & out = stagger_outputs[stagger_id];
+            if (stagger_backend && !stagger_mixed) {
+                if (!out.ev || out.ev_backend != stagger_backend) {
+                    out.ev.reset(ggml_backend_event_new(ggml_backend_get_device(stagger_backend)));
+                    out.ev_backend = stagger_backend;
+                }
+            } else {
+                out.ev.reset();
+                out.ev_backend = nullptr;
+            }
+            if (out.ev) {
+                ggml_backend_event_record(out.ev.get(), stagger_backend);
+            }
+            out.pending = true;
+            out.valid   = true;
         }
 
         n_outputs_prev += n_outputs;
@@ -2321,6 +2503,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
     }
 
+    // the output of a staggered decode is in the row of its sequence
+    if (stagger_id >= 0) {
+        output_ids[0] = stagger_id;
+        n_outputs     = stagger_id + 1;
+    }
+
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
@@ -2331,7 +2519,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t row_only) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
@@ -2486,11 +2674,20 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         sampling.probs_count.resize(n_outputs_max);
         sampling.candidates_count.resize(n_outputs_max);
 
-        std::fill(sampling.logits_count.begin(),     sampling.logits_count.end(),     0);
-        std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
-        std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
+        if (row_only < 0) {
+            std::fill(sampling.logits_count.begin(),     sampling.logits_count.end(),     0);
+            std::fill(sampling.probs_count.begin(),      sampling.probs_count.end(),      0);
+            std::fill(sampling.candidates_count.begin(), sampling.candidates_count.end(), 0);
 
-        std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+            std::fill_n(sampling.sampled.data, sampling.sampled.size, LLAMA_TOKEN_NULL);
+        } else {
+            // a staggered decode keeps the rows of the other sequences, their decodes may not be read yet
+            sampling.logits_count[row_only]     = 0;
+            sampling.probs_count[row_only]      = 0;
+            sampling.candidates_count[row_only] = 0;
+
+            sampling.sampled.data[row_only] = LLAMA_TOKEN_NULL;
+        }
     } else {
         sampling.logits     = {nullptr, 0};
         sampling.probs      = {nullptr, 0};
@@ -2792,6 +2989,7 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+    samplers_own(res, gparams.samplers);
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
@@ -2818,6 +3016,45 @@ ggml_cgraph * llama_context::graph_reserve(
     return gf;
 }
 
+// the samplers whose chains a graph builds: all of them, so the graph serves any batch, but a staggered decode only
+// builds its own, so that its graph does not take the samplers of other sequences from their graphs
+std::map<llama_seq_id, llama_sampler *> llama_context::graph_samplers() const {
+    if (stagger_active < 0) {
+        return sampling.samplers;
+    }
+
+    std::map<llama_seq_id, llama_sampler *> res;
+
+    const auto it = sampling.samplers.find(stagger_active);
+    if (it != sampling.samplers.end()) {
+        res.insert(*it);
+    }
+
+    return res;
+}
+
+bool llama_context::samplers_owned(const llm_graph_result * res, const std::map<llama_seq_id, llama_sampler *> & samplers) const {
+    for (const auto & entry : samplers) {
+        const auto it = sampler_owner.find(entry.first);
+        if (it == sampler_owner.end() || it->second != res) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void llama_context::samplers_own(const llm_graph_result * res, const std::map<llama_seq_id, llama_sampler *> & samplers) {
+    // a graph without logits builds no sampler chains, see build_sampling()
+    if (!res->get_logits()) {
+        return;
+    }
+
+    for (const auto & entry : samplers) {
+        sampler_owner[entry.first] = res;
+    }
+}
+
 llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -2838,7 +3075,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
-        /*.samplers    =*/ sampling.samplers,
+        /*.samplers    =*/ graph_samplers(),
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
@@ -3994,6 +4231,7 @@ void llama_context::opt_epoch_iter(
             res->reset();
 
             auto * gf = model.build_graph(gparams);
+            samplers_own(res, gparams.samplers);
 
             struct ggml_context * ctx_compute_opt;
             {
@@ -4325,7 +4563,15 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
+}
+
+bool llama_set_decode_stagger(llama_context * ctx, bool value) {
+    return ctx->set_decode_stagger(value);
+}
+
+void llama_synchronize_seq(llama_context * ctx, llama_seq_id seq_id) {
+    ctx->synchronize_seq(seq_id);
 }
 
 float * llama_get_logits(llama_context * ctx) {
@@ -4335,7 +4581,7 @@ float * llama_get_logits(llama_context * ctx) {
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     float * res = nullptr;
 
@@ -4355,7 +4601,7 @@ float * llama_get_embeddings(llama_context * ctx) {
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_embeddings_ith(i);
 }
@@ -4413,43 +4659,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize_outputs();
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
