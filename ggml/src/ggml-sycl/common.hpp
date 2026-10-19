@@ -801,7 +801,9 @@ struct ggml_backend_sycl_context {
     }
 
     // uid of the last graph whose MoE weight consumers were checked: the same graph has the same consumers
-    uint64_t moe_consumers_checked_uid = 0;
+    // the last graphs checked: several reused graphs can alternate, e.g. one per sequence in a staggered decode
+    uint64_t moe_consumers_checked_uid[8] = {};
+    int      moe_consumers_checked_pos    = 0;
 
 #ifdef GGML_SYCL_GRAPH
     // Map from first node pointer to graph - allows multiple graphs per context when the

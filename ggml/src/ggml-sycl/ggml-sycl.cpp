@@ -9847,9 +9847,15 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     // walking every node's sources costs ~150 us per call on a 2400-node decode graph; a reused graph (same
     // uid) has the same consumers, and a weight it restored stays canonical, so check each graph once
     static const bool moe_check_cache = ggml_sycl_get_env("GGML_SYCL_MOE_CHECK_CACHE", 1) != 0;
-    if (!moe_check_cache || cgraph->uid == 0 || cgraph->uid != sycl_ctx->moe_consumers_checked_uid) {
+    bool moe_checked = false;
+    for (uint64_t uid : sycl_ctx->moe_consumers_checked_uid) {
+        moe_checked = moe_checked || (cgraph->uid != 0 && uid == cgraph->uid);
+    }
+    if (!moe_check_cache || !moe_checked) {
         ggml_sycl_moe_check_consumers(*sycl_ctx, cgraph);
-        sycl_ctx->moe_consumers_checked_uid = cgraph->uid;
+        const int n = (int) (sizeof(sycl_ctx->moe_consumers_checked_uid)/sizeof(sycl_ctx->moe_consumers_checked_uid[0]));
+        sycl_ctx->moe_consumers_checked_uid[sycl_ctx->moe_consumers_checked_pos] = cgraph->uid;
+        sycl_ctx->moe_consumers_checked_pos = (sycl_ctx->moe_consumers_checked_pos + 1) % n;
     }
     static int trace_seq[GGML_SYCL_MAX_DEVICES] = {};
     const bool trace = ggml_sycl_pipe_trace_on();
