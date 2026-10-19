@@ -1332,8 +1332,10 @@ static void ggml_backend_sched_build_fusion_plan(ggml_backend_sched_t sched) {
         return;
     }
 
+    // a linear search per node is quadratic, ~3 ms on a decode graph, paid by every graph that is not reused
+    std::sort(absorbed.begin(), absorbed.end());
     for (int i = 0; i < graph_copy->n_nodes; i++) {
-        sched->fusion_absorbed[i] = std::find(absorbed.begin(), absorbed.end(), graph_copy->nodes[i]) != absorbed.end();
+        sched->fusion_absorbed[i] = std::binary_search(absorbed.begin(), absorbed.end(), graph_copy->nodes[i]);
     }
     ggml_gallocr_set_fusion_plan(sched->galloc, sched->fusion_absorbed, graph_copy->n_nodes);
 
