@@ -39,6 +39,10 @@ namespace syclexp = sycl::ext::oneapi::experimental;
     #endif
 #endif
 
+#if defined(__INTEL_LLVM_COMPILER)
+    #define GGML_SYCL_DMMV_HAS_ESIMD
+#endif
+
 #if GGML_SYCL_DNNL
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
@@ -132,6 +136,8 @@ enum ggml_sycl_xmx_gather_type {
     GGML_SYCL_XMX_GATHER_Q4_K     = 1 << 10,
     GGML_SYCL_XMX_GATHER_Q5_K     = 1 << 11,
     GGML_SYCL_XMX_GATHER_Q6_K     = 1 << 12,
+    GGML_SYCL_XMX_GATHER_Q2_K     = 1 << 13,
+    GGML_SYCL_XMX_GATHER_Q3_K     = 1 << 14,
 };
 static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
 extern int g_ggml_sycl_xmx_gather_types;

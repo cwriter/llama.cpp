@@ -442,7 +442,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q4_0> {
         }
 
         return vec_dot_q4_0_q8_1_impl(v, u, d, *q8_1_ds);
-    };
+    }
 };
 
 // Load four contiguous dwords per operand instead of loading each value separately.
@@ -514,7 +514,8 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
 
     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
                                      const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
-                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+                                     const sycl::half2 * q8_1_ds, const int & iqs,
+                                     const int vdr = q8_0_traits::vdr_mmvq) {
         const uint8_t * base = static_cast<const uint8_t *>(vbq);
         const int8_t *  qs   = reinterpret_cast<const int8_t *>(base + ibx_offset.first);
         const ggml_half  d   = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
@@ -523,14 +524,14 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {
         int u[q8_0_traits::vdr_mmvq];
 
 #pragma unroll
-        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+        for (int i = 0; i < vdr; ++i) {
             v[i] = get_int_from_int8(qs, iqs + i);
             u[i] = get_int_from_int8_aligned(q8_1_quant_ptr, iqs + i);
         }
 
         int sumi = 0;
 #pragma unroll
-        for (size_t i = 0; i < q8_0_traits::vdr_mmvq; ++i) {
+        for (int i = 0; i < vdr; ++i) {
             sumi = dpct::dp4a(v[i], u[i], sumi);
         }
 
@@ -1596,7 +1597,7 @@ vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
 static __dpct_inline__ float
 vec_dot_iq2_xs_q8_1(const void *__restrict__ vbq,
                     const block_q8_1 *__restrict__ bq8_1, const int &iqs,
-                    const uint64_t *iq2xs_grid, const uint64_t *ksigns64) {
+                    const uint64_t *iq2xs_grid) {
 #if DPCT_COMPATIBILITY_TEMP >=                                                 \
     MIN_CC_DP4A // lowest compute capability for integer intrinsics
 #if QK_K == 256
@@ -1608,25 +1609,27 @@ vec_dot_iq2_xs_q8_1(const void *__restrict__ vbq,
     const uint8_t ls1 = bq2->scales[ib32] & 0xf;
     const uint8_t ls2 = bq2->scales[ib32] >>  4;
     int sumi1 = 0;
+#pragma unroll
     for (int l = 0; l < 2; ++l) {
-        const uint32_t * grid = (const uint32_t *)(iq2xs_grid + (q2[l] & 511));
-        const uint32_t * signs = (const uint32_t *)(ksigns64 + (q2[l] >> 9));
-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
-            grid[0] ^ signs[0], signs[0], std::minus<>());
-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
-            grid[1] ^ signs[1], signs[1], std::minus<>());
+        const uint64_t grid = iq2xs_grid[q2[l] & 511];
+        const uint32_t sign_bits = iq_sign_bits(q2[l] >> 9);
+        const uint32_t signs0 = iq_sign_mask(sign_bits);
+        const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
+        const int grid_l = ((uint32_t)grid ^ signs0) + (signs0 & 0x01010101);
+        const int grid_h = ((uint32_t)(grid >> 32) ^ signs1) + (signs1 & 0x01010101);
         sumi1 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi1);
         sumi1 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi1);
         q8 += 8;
     }
     int sumi2 = 0;
+#pragma unroll
     for (int l = 2; l < 4; ++l) {
-        const uint32_t * grid = (const uint32_t *)(iq2xs_grid + (q2[l] & 511));
-        const uint32_t * signs = (const uint32_t *)(ksigns64 + (q2[l] >> 9));
-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
-            grid[0] ^ signs[0], signs[0], std::minus<>());
-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
-            grid[1] ^ signs[1], signs[1], std::minus<>());
+        const uint64_t grid = iq2xs_grid[q2[l] & 511];
+        const uint32_t sign_bits = iq_sign_bits(q2[l] >> 9);
+        const uint32_t signs0 = iq_sign_mask(sign_bits);
+        const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
+        const int grid_l = ((uint32_t)grid ^ signs0) + (signs0 & 0x01010101);
+        const int grid_h = ((uint32_t)(grid >> 32) ^ signs1) + (signs1 & 0x01010101);
         sumi2 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi2);
         sumi2 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi2);
         q8 += 8;
@@ -1702,7 +1705,7 @@ vec_dot_iq2_s_q8_1(const void *__restrict__ vbq,
 static __dpct_inline__ float
 vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
                      const block_q8_1 *__restrict__ bq8_1, const int &iqs,
-                     const uint32_t *iq3xxs_grid, const uint64_t *ksigns64) {
+                     const uint32_t *iq3xxs_grid) {
 #if DPCT_COMPATIBILITY_TEMP >=                                                 \
     MIN_CC_DP4A // lowest compute capability for integer intrinsics
 #if QK_K == 256
@@ -1714,14 +1717,15 @@ vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
     const int8_t   * q8 = bq8_1[ib32].qs;
     uint32_t aux32 = gas[0] | (gas[1] << 16);
     int sumi = 0;
+#pragma unroll
     for (int l = 0; l < 4; ++l) {
-        const uint32_t * grid1 = iq3xxs_grid + q3[2*l+0];
-        const uint32_t * grid2 = iq3xxs_grid + q3[2*l+1];
-        const uint32_t * signs = (const uint32_t *)(ksigns64 + (aux32 & 127));
-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
-            grid1[0] ^ signs[0], signs[0], std::minus<>());
-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
-            grid2[0] ^ signs[1], signs[1], std::minus<>());
+        const uint32_t grid1 = iq3xxs_grid[q3[2*l+0]];
+        const uint32_t grid2 = iq3xxs_grid[q3[2*l+1]];
+        const uint32_t sign_bits = iq_sign_bits(aux32);
+        const uint32_t signs0 = iq_sign_mask(sign_bits);
+        const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
+        const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
+        const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
         sumi = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi);
         sumi = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi);
         q8 += 8;
@@ -1743,33 +1747,33 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_XXS> {
     static constexpr ggml_type gtype = GGML_TYPE_IQ3_XXS;
 
     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
-                     const int iqs) {
-#if QK_K == 256
-        const uint8_t *  base = static_cast<const uint8_t *>(vbq);
-        const uint8_t *  qs   = base + ibx_offset.first;
-        const uint8_t *  q3   = qs + 8 * iqs;
-        const uint16_t * gas  = (const uint16_t *) (qs + QK_K / 4) + 2 * iqs;
-        const int8_t *   q8   = q8_1_quant_ptr + iqs * QK8_1;
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
+#if DPCT_COMPATIBILITY_TEMP >= MIN_CC_DP4A && QK_K == 256
+        const uint8_t * base = static_cast<const uint8_t *>(vbq);
+        const uint8_t * qs   = base + ibx_offset.first;
+        const uint8_t * q3   = qs + 8 * iqs;
+        const uint16_t * gas = reinterpret_cast<const uint16_t *>(qs + QK_K / 4) + 2 * iqs;
+        const int8_t * q8    = q8_1_quant_ptr + iqs * QK8_1;
+        uint32_t aux32       = gas[0] | (gas[1] << 16);
 
-        uint32_t aux32 = gas[0] | (gas[1] << 16);
-        int      sumi  = 0;
+        int sumi = 0;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint32_t grid1     = iq3xxs_grid[q3[2*l+0]];
-            const uint32_t grid2     = iq3xxs_grid[q3[2*l+1]];
+            const uint32_t grid1 = iq3xxs_grid[q3[2*l+0]];
+            const uint32_t grid2 = iq3xxs_grid[q3[2*l+1]];
             const uint32_t sign_bits = iq_sign_bits(aux32);
-            const uint32_t signs0    = iq_sign_mask(sign_bits);
-            const uint32_t signs1    = iq_sign_mask(sign_bits >> 4);
-            const int      grid_l    = (grid1 ^ signs0) + (signs0 & 0x01010101);
-            const int      grid_h    = (grid2 ^ signs1) + (signs1 & 0x01010101);
+            const uint32_t signs0 = iq_sign_mask(sign_bits);
+            const uint32_t signs1 = iq_sign_mask(sign_bits >> 4);
+            const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
+            const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
             sumi = dpct::dp4a(grid_l, *((const int *) q8 + 0), sumi);
             sumi = dpct::dp4a(grid_h, *((const int *) q8 + 1), sumi);
             q8 += 8;
             aux32 >>= 7;
         }
 
-        const ggml_half d = *(const ggml_half *) (base + d_offset.first);
+        const ggml_half d = *reinterpret_cast<const ggml_half *>(base + d_offset.first);
         return (float) d * (0.5f + aux32) * q8_1_ds[iqs][0] * 0.5f * sumi;
 #else
         GGML_UNUSED(vbq);
@@ -1778,8 +1782,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_XXS> {
         GGML_UNUSED(q8_1_quant_ptr);
         GGML_UNUSED(q8_1_ds);
         GGML_UNUSED(iqs);
-        assert(false);
-        return 0.f;
+        GGML_ABORT("IQ3_XXS reorder vec dot requires dp4a and QK_K == 256");
 #endif
     }
 };
@@ -1798,18 +1801,13 @@ vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
     const int8_t   * q8 = bq8_1[ib32].qs;
     int sumi = 0;
     for (int l = 0; l < 4; ++l) {
-        const uint32_t * grid1 = iq3s_grid + (qs[2*l+0] | ((bq2->qh[ib32] << (8 - 2*l)) & 256));
-        const uint32_t * grid2 = iq3s_grid + (qs[2*l+1] | ((bq2->qh[ib32] << (7 - 2*l)) & 256));
-        uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
-            ((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201,
-            0x08040201, std::equal_to<>());
-        uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
-            ((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201,
-            0x08040201, std::equal_to<>());
-        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
-            grid1[0] ^ signs0, signs0, std::minus<>());
-        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
-            grid2[0] ^ signs1, signs1, std::minus<>());
+        const uint32_t grid1 = iq3s_grid[qs[2*l+0] | ((bq2->qh[ib32] << (8 - 2*l)) & 256)];
+        const uint32_t grid2 = iq3s_grid[qs[2*l+1] | ((bq2->qh[ib32] << (7 - 2*l)) & 256)];
+        const uint32_t signs = bq2->signs[4 * ib32 + l];
+        const uint32_t signs0 = iq_sign_mask(signs);
+        const uint32_t signs1 = iq_sign_mask(signs >> 4);
+        const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
+        const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
         sumi = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi);
         sumi = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi);
         q8 += 8;
@@ -1828,27 +1826,27 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_S> {
     static constexpr ggml_type gtype = GGML_TYPE_IQ3_S;
 
     __dpct_inline__ float operator()(const void * __restrict__ vbq, const std::pair<int, int> ibx_offset,
-                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr, const sycl::half2 * q8_1_ds,
-                     const int iqs) {
+                                     const std::pair<int, int> d_offset, const int8_t * q8_1_quant_ptr,
+                                     const sycl::half2 * q8_1_ds, const int & iqs) {
 #if QK_K == 256
         const uint8_t * base     = static_cast<const uint8_t *>(vbq);
         const uint8_t * qs       = base + ibx_offset.first + 8 * iqs;
         const uint8_t * qh       = base + ibx_offset.second;
         const uint8_t * signs    = base + d_offset.first + 4 * iqs;
         const uint8_t * metadata = base + d_offset.second;
-        const ggml_half d        = *(const ggml_half *) metadata;
+        const ggml_half d        = *reinterpret_cast<const ggml_half *>(metadata);
         const uint8_t * scales   = metadata + sizeof(ggml_half);
-        const int8_t *  q8       = q8_1_quant_ptr + iqs * QK8_1;
+        const int8_t * q8        = q8_1_quant_ptr + iqs * QK8_1;
 
         int sumi = 0;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
-            const uint32_t grid1  = iq3s_grid[qs[2*l+0] | ((qh[iqs] << (8 - 2*l)) & 256)];
-            const uint32_t grid2  = iq3s_grid[qs[2*l+1] | ((qh[iqs] << (7 - 2*l)) & 256)];
+            const uint32_t grid1 = iq3s_grid[qs[2*l+0] | ((qh[iqs] << (8 - 2*l)) & 256)];
+            const uint32_t grid2 = iq3s_grid[qs[2*l+1] | ((qh[iqs] << (7 - 2*l)) & 256)];
             const uint32_t signs0 = iq_sign_mask(signs[l]);
             const uint32_t signs1 = iq_sign_mask(signs[l] >> 4);
-            const int      grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
-            const int      grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
+            const int grid_l = (grid1 ^ signs0) + (signs0 & 0x01010101);
+            const int grid_h = (grid2 ^ signs1) + (signs1 & 0x01010101);
             sumi = dpct::dp4a(grid_l, *((const int *) q8 + 0), sumi);
             sumi = dpct::dp4a(grid_h, *((const int *) q8 + 1), sumi);
             q8 += 8;
@@ -1863,8 +1861,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_S> {
         GGML_UNUSED(q8_1_quant_ptr);
         GGML_UNUSED(q8_1_ds);
         GGML_UNUSED(iqs);
-        assert(false);
-        return 0.f;
+        GGML_ABORT("IQ3_S reorder vec dot not supported for QK_K != 256");
 #endif
     }
 };

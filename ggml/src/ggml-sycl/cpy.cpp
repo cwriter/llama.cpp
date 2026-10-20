@@ -1369,6 +1369,8 @@ void ggml_sycl_cpy(ggml_backend_sycl_context & ctx, const ggml_tensor * src0, co
     scope_op_debug_print scope_dbg_print(__func__, src1, /*num_src=*/0, debug_get_tensor_str("\tsrc0", src0));
     const int64_t ne = ggml_nelements(src0);
     GGML_ASSERT(ne == ggml_nelements(src1));
+    // the cpy kernels index in 32-bit
+    GGML_ASSERT(ne <= INT32_MAX);
 
     // ggml_cpy is the path llama-kv-cache uses for the RoPE shift (cast -> rope -> cpy), so a
     // permuted cache reaches it in both directions and each has to go through the layout.

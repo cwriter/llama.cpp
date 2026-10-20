@@ -616,6 +616,39 @@ static __dpct_inline__ void fg_scale_min_k4(const int j, const uint8_t * __restr
     }
 }
 
+template <typename E>
+static __dpct_inline__ void fg_decode_q2_K(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ scales,
+                                           const float d, const float dmin, const int ib, typename E::pair * a) {
+    const uint8_t * q = qs + 32 * (ib / 4);
+    const int shift = 2 * (ib % 4);
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const uint8_t sc = scales[2 * ib + j / 8];
+        const float dl = d * (sc & 0xF);
+        const float ml = dmin * (sc >> 4);
+        a[j] = E::make(dl * ((q[2 * j] >> shift) & 3) - ml,
+                       dl * ((q[2 * j + 1] >> shift) & 3) - ml);
+    }
+}
+
+template <typename E>
+static __dpct_inline__ void fg_decode_q3_K(const uint8_t * __restrict__ qs, const uint8_t * __restrict__ hmask,
+                                           const uint8_t * __restrict__ scales, const float d, const int ib,
+                                           typename E::pair * a) {
+    const uint8_t * q = qs + 32 * (ib / 4);
+    const int shift = 2 * (ib % 4);
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+        const int s = 2 * ib + j / 8;
+        const int sc = ((scales[s % 8] >> (4 * (s / 8))) & 0xF) |
+                       (((scales[8 + s % 4] >> (2 * (s / 4))) & 3) << 4);
+        const float dl = d * (sc - 32);
+        const int q0 = ((q[2 * j] >> shift) & 3) - ((hmask[2 * j] & (1 << ib)) ? 0 : 4);
+        const int q1 = ((q[2 * j + 1] >> shift) & 3) - ((hmask[2 * j + 1] & (1 << ib)) ? 0 : 4);
+        a[j] = E::make(dl * q0, dl * q1);
+    }
+}
+
 // q4_K sub-block ib32 (0..7) of one superblock. Following dequantize_row_q4_K: the outer loop
 // there walks 64 values at a time from q = qs + 32*t with scale indices 2t and 2t+1, so
 // sub-block ib32 uses scale/min pair ib32 and the low (ib32 even) or high (ib32 odd) nibbles of
@@ -682,6 +715,18 @@ static __dpct_inline__ void fg_decode_q6_k(const uint8_t * __restrict__ ql_sb, c
         const int   q1 = (int) (((ql[l1] >> shift_l) & 0xF) | (((qh_sb[l1] >> shift_h) & 3) << 4)) - 32;
         a[j] = E::make(dl * q0, dl * q1);
     }
+}
+
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_q2_K * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_q2_K * blk = xrow + kb / (QK_K / 32);
+    fg_decode_q2_K<E>(blk->qs, blk->scales, (float) blk->dm[0], (float) blk->dm[1], kb % (QK_K / 32), a);
+}
+
+template <typename E>
+static __dpct_inline__ void fg_stage_a(const block_q3_K * __restrict__ xrow, const int kb, typename E::pair * a) {
+    const block_q3_K * blk = xrow + kb / (QK_K / 32);
+    fg_decode_q3_K<E>(blk->qs, blk->hmask, blk->scales, (float) blk->d, kb % (QK_K / 32), a);
 }
 
 template <typename E>
@@ -1035,6 +1080,77 @@ template <> struct fg_reorder_a<block_q8_0> {
     }
 };
 
+template <> struct fg_reorder_a<block_q2_K> {
+    static constexpr bool supported = true;
+    static constexpr bool lite      = false;
+    using regs = block_q2_K;
+
+    static_assert(QK_K / 4 + QK_K / 16 + sizeof(ggml_half2) == sizeof(block_q2_K),
+                  "the q2_K reorder layout must cover the canonical block");
+
+    // [qs][scales][dm]
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * __restrict__ xb, const int ib_row, const int nblocks,
+                                      const int kb, typename E::pair * a) {
+        const int ib = ib_row + kb / (QK_K / 32);
+        const uint8_t * scales = xb + (size_t) nblocks * (QK_K / 4);
+        const sycl::half2 dm = ((const sycl::half2 *) (scales + (size_t) nblocks * (QK_K / 16)))[ib];
+        fg_decode_q2_K<E>(xb + (size_t) ib * (QK_K / 4), scales + (size_t) ib * (QK_K / 16),
+                          (float) dm[0], (float) dm[1], kb % (QK_K / 32), a);
+    }
+
+    static __dpct_inline__ regs load(const uint8_t * __restrict__ xb, const int ib, const int nblocks) {
+        regs r;
+        fg_load_bytes<QK_K / 4>(r.qs, xb + (size_t) ib * (QK_K / 4));
+        const uint8_t * scales = xb + (size_t) nblocks * (QK_K / 4);
+        fg_load_bytes<QK_K / 16>(r.scales, scales + (size_t) ib * (QK_K / 16));
+        r.dm = ((const sycl::half2 *) (scales + (size_t) nblocks * (QK_K / 16)))[ib];
+        return r;
+    }
+
+    template <typename E>
+    static __dpct_inline__ void decode(const regs & r, const int ib32, typename E::pair * a) {
+        fg_stage_a<E>(&r, ib32, a);
+    }
+};
+
+template <> struct fg_reorder_a<block_q3_K> {
+    static constexpr bool supported = true;
+    static constexpr bool lite      = false;
+    using regs = block_q3_K;
+
+    static_assert(QK_K / 4 + QK_K / 8 + 12 + sizeof(ggml_half) == sizeof(block_q3_K),
+                  "the q3_K reorder layout must cover the canonical block");
+
+    // [qs][hmask][scales][d]
+    template <typename E>
+    static __dpct_inline__ void stage(const uint8_t * __restrict__ xb, const int ib_row, const int nblocks,
+                                      const int kb, typename E::pair * a) {
+        const int ib = ib_row + kb / (QK_K / 32);
+        const uint8_t * hmask = xb + (size_t) nblocks * (QK_K / 4);
+        const uint8_t * scales = hmask + (size_t) nblocks * (QK_K / 8);
+        const float d = (float) ((const sycl::half *) (scales + (size_t) nblocks * 12))[ib];
+        fg_decode_q3_K<E>(xb + (size_t) ib * (QK_K / 4), hmask + (size_t) ib * (QK_K / 8),
+                          scales + (size_t) ib * 12, d, kb % (QK_K / 32), a);
+    }
+
+    static __dpct_inline__ regs load(const uint8_t * __restrict__ xb, const int ib, const int nblocks) {
+        regs r;
+        fg_load_bytes<QK_K / 4>(r.qs, xb + (size_t) ib * (QK_K / 4));
+        const uint8_t * hmask = xb + (size_t) nblocks * (QK_K / 4);
+        fg_load_bytes<QK_K / 8>(r.hmask, hmask + (size_t) ib * (QK_K / 8));
+        const uint8_t * scales = hmask + (size_t) nblocks * (QK_K / 8);
+        fg_load_bytes<12>(r.scales, scales + (size_t) ib * 12);
+        r.d = ((const sycl::half *) (scales + (size_t) nblocks * 12))[ib];
+        return r;
+    }
+
+    template <typename E>
+    static __dpct_inline__ void decode(const regs & r, const int ib32, typename E::pair * a) {
+        fg_stage_a<E>(&r, ib32, a);
+    }
+};
+
 template <> struct fg_reorder_a<block_q4_K> {
     static constexpr bool supported = true;
     static constexpr bool lite      = true;
@@ -1275,6 +1391,8 @@ template <> struct fg_block_traits<block_iq2_s>    { static constexpr int qk = Q
 template <> struct fg_block_traits<block_iq1_s>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_iq1_m>    { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q8_0>     { static constexpr int qk = QK8_0; };
+template <> struct fg_block_traits<block_q2_K>     { static constexpr int qk = QK_K; };
+template <> struct fg_block_traits<block_q3_K>     { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q4_K>     { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q5_K>     { static constexpr int qk = QK_K; };
 template <> struct fg_block_traits<block_q6_K>     { static constexpr int qk = QK_K; };
@@ -1363,6 +1481,16 @@ template <> struct fg_soa_layout<block_iq4_xs> {
 template <> struct fg_soa_layout<block_q8_0> {
     static constexpr int nstreams  = 2;
     static constexpr int stream[2] = { QK8_0, (int) sizeof(ggml_half) };
+};
+
+template <> struct fg_soa_layout<block_q2_K> {
+    static constexpr int nstreams  = 3;
+    static constexpr int stream[3] = { QK_K / 4, QK_K / 16, (int) sizeof(ggml_half2) };
+};
+
+template <> struct fg_soa_layout<block_q3_K> {
+    static constexpr int nstreams  = 4;
+    static constexpr int stream[4] = { QK_K / 4, QK_K / 8, 12, (int) sizeof(ggml_half) };
 };
 
 template <> struct fg_soa_layout<block_q4_K> {
@@ -2231,6 +2359,8 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
         case GGML_TYPE_IQ1_S:   return fg_visit_layout<block_iq1_s>(reordered, f);
         case GGML_TYPE_IQ1_M:   return fg_visit_layout<block_iq1_m>(reordered, f);
         case GGML_TYPE_Q8_0:    return fg_visit_layout<block_q8_0>(reordered, f);
+        case GGML_TYPE_Q2_K:    return fg_visit_layout<block_q2_K>(reordered, f);
+        case GGML_TYPE_Q3_K:    return fg_visit_layout<block_q3_K>(reordered, f);
         case GGML_TYPE_Q4_K:    return fg_visit_layout<block_q4_K>(reordered, f);
         case GGML_TYPE_Q5_K:    return fg_visit_layout<block_q5_K>(reordered, f);
         case GGML_TYPE_Q6_K:    return fg_visit_layout<block_q6_K>(reordered, f);
@@ -2526,6 +2656,9 @@ static bool fg_fused_run(ggml_type src0_type, const void * src0, const void * sr
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,
                                   int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd,
                                   bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+    if (src0_type == GGML_TYPE_Q2_K || src0_type == GGML_TYPE_Q3_K) {
+        return false;
+    }
     // every BN columns dequantize A again, so wide N is left to the library GEMM. q8_0 and the
     // k-quants take this path too: Qwen3-30B-A3B Q4_K_M on B60 measured pp16 +5%, pp32 +5.5%, pp64 flat
     if (!ggml_sycl_xmx_gather_type_enabled(src0_type) || !fg_visit_type(src0_type, reordered, [](auto) {})) {

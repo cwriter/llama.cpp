@@ -20,13 +20,13 @@ static __dpct_inline__ float vec_dot_iq2_xxs_q8_1_moe(const void * __restrict__ 
 static __dpct_inline__ float vec_dot_iq2_xs_q8_1_moe(const void * __restrict__ vbq,
                                                      const block_q8_1 * __restrict__ bq8_1,
                                                      const int & iqs) {
-    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid, ksigns64);
+    return vec_dot_iq2_xs_q8_1(vbq, bq8_1, iqs, iq2xs_grid);
 }
 
 static __dpct_inline__ float vec_dot_iq3_xxs_q8_1_moe(const void * __restrict__ vbq,
                                                       const block_q8_1 * __restrict__ bq8_1,
                                                       const int & iqs) {
-    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid, ksigns64);
+    return vec_dot_iq3_xxs_q8_1(vbq, bq8_1, iqs, iq3xxs_grid);
 }
 
 static __dpct_inline__ float vec_dot_iq3_s_q8_1_moe(const void * __restrict__ vbq,
@@ -450,7 +450,7 @@ static void mul_mat_vec_q_iq2_xs_q8_1(const void *__restrict__ vx,
             (item_ct1.get_local_id(2) %
              (qi / vdr)); // x block quant index when casting the quants to int
 
-        tmp += vec_dot_iq2_xs_q8_1(&x[ibx], &y[iby], iqs, iq2xs_grid, ksigns64);
+        tmp += vec_dot_iq2_xs_q8_1(&x[ibx], &y[iby], iqs, iq2xs_grid);
     }
 
     // sum up partial sums and write back result
@@ -546,7 +546,7 @@ static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
             (item_ct1.get_local_id(2) %
              (qi / vdr)); // x block quant index when casting the quants to int
 
-        tmp += vec_dot_iq3_xxs_q8_1(&x[ibx], &y[iby], iqs, iq3xxs_grid, ksigns64);
+        tmp += vec_dot_iq3_xxs_q8_1(&x[ibx], &y[iby], iqs, iq3xxs_grid);
     }
 
     // sum up partial sums and write back result
@@ -2888,12 +2888,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
                     } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_iq3_q8_1_sycl IQ3_XXS\n");
+                        GGML_SYCL_DEBUG("Calling reordered IQ3_XXS MMVQ\n");
                         reorder_mul_mat_vec_iq3_q8_1_sycl<GGML_TYPE_IQ3_XXS>(
                             src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                     }
                 } else {
-                    mul_mat_vec_iq3_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                    mul_mat_vec_iq3_xxs_q8_1_sycl(
+                        src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 }
                 break;
             case GGML_TYPE_IQ3_S:
@@ -2908,21 +2909,20 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                             src1_ncols, stride_col_y_bytes, stride_col_dst, stream);
                         return;
                     } else {
-                        GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_iq3_q8_1_sycl IQ3_S\n");
+                        GGML_SYCL_DEBUG("Calling reordered IQ3_S MMVQ\n");
                         reorder_mul_mat_vec_iq3_q8_1_sycl<GGML_TYPE_IQ3_S>(
                             src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                     }
-                } else {
-                    if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
-                        const int stride_col_y = src1_padded_col_size / QK8_1;
-                        const int stride_col_dst = dst->ne[0];
-                        mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
-                                                               src1_ncols, stride_col_y, stride_col_dst, stream);
-                        return;
-                    }
-                    if (i == 0 || src1_ncols == 1) {
-                        mul_mat_vec_iq3_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
-                    }
+                } else if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
+                    const int stride_col_y   = src1_padded_col_size / QK8_1;
+                    const int stride_col_dst = dst->ne[0];
+                    GGML_SYCL_DEBUG("Calling mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols ncols=%d\n", (int) src1_ncols);
+                    mul_mat_vec_iq3_s_q8_1_sycl_switch_ncols(
+                        src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff,
+                        src1_ncols, stride_col_y, stride_col_dst, stream);
+                    return;
+                } else if (i == 0 || src1_ncols == 1) {
+                    mul_mat_vec_iq3_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 }
                 break;
             case GGML_TYPE_IQ4_NL:
@@ -4014,9 +4014,11 @@ static void mul_mat_vec_q_moe_reorder(
 
     const auto sg = item_ct1.get_sub_group();
 
+    constexpr int vdr_mmvq = reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0 ?
+                            VDR_Q8_0_Q8_1_MMVQ : block_traits::vdr_mmvq;
     const int     blocks_per_row              = ncols / block_traits::qk;
-    constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
-    constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
+    constexpr int blocks_per_subgroup         = ceil_div(vdr_mmvq * WARP_SIZE, block_traits::qi);
+    constexpr int block_elements_per_subgroup = block_traits::qi / vdr_mmvq;
     const int     nblocks                     = nrows * (ncols / block_traits::qk);
 
     static_assert(blocks_per_subgroup > 0);
@@ -4038,15 +4040,26 @@ static void mul_mat_vec_q_moe_reorder(
 
 #pragma unroll
             for (int elem = 0; elem < block_elements_per_subgroup; elem += WARP_SIZE) {
-                const int iqs = elem + block_traits::vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
-                partial_sum[r] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                const int iqs = elem + vdr_mmvq * (sg.get_local_linear_id() % block_elements_per_subgroup);
+                if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
+                    partial_sum[r] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs, vdr_mmvq);
+                } else {
+                    partial_sum[r] += reorder_vec_dot_q_sycl()(vx, bx_offset, d_offset, q8_1_quant_ptr, q8_1_ds_ptr, iqs);
+                }
             }
         }
     }
 
 #pragma unroll
     for (int r = 0; r < ROWS; ++r) {
-        const float sum = sycl::reduce_over_group(sg, partial_sum[r], std::plus<>());
+        float sum = partial_sum[r];
+        if constexpr (reorder_vec_dot_q_sycl::gtype == GGML_TYPE_Q8_0) {
+            for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+                sum += dpct::permute_sub_group_by_xor(sg, sum, mask);
+            }
+        } else {
+            sum = sycl::reduce_over_group(sg, partial_sum[r], std::plus<>());
+        }
         if (sg.leader() && row0 + r < nrows) {
             dst[row0 + r] = sum;
         }
