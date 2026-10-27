@@ -3165,7 +3165,7 @@ k_argsort_f32_i32(const float *x, int *dst, const int ncols, int ncols_pad,
         dst_row[col] = col;
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     for (int k = 2; k <= ncols_pad; k *= 2) {
         for (int j = k / 2; j > 0; j /= 2) {
@@ -3193,7 +3193,7 @@ k_argsort_f32_i32(const float *x, int *dst, const int ncols, int ncols_pad,
                         }
                     }
                 }
-                item_ct1.barrier(sycl::access::fence_space::local_space);
+                sycl::group_barrier(item_ct1.get_group());
             }
         }
     }
@@ -3567,7 +3567,7 @@ static void top_k_scan_merge_f32(
         }
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     if (tid != 0) {
         return;
@@ -3779,7 +3779,7 @@ static void argmax_f32_i32_sycl(const float *x, int *dst, const int ncols,
 
                 shared_data[tid] = max_val;
                 shared_indices[tid] = max_idx;
-                item_ct1.barrier(sycl::access::fence_space::local_space);
+                sycl::group_barrier(item_ct1.get_group());
 
                 for (int stride = 256/2; stride > 0; stride >>= 1) {
                     if (tid < stride) {
@@ -3790,7 +3790,7 @@ static void argmax_f32_i32_sycl(const float *x, int *dst, const int ncols,
                             shared_indices[tid] = shared_indices[tid + stride];
                         }
                     }
-                    item_ct1.barrier(sycl::access::fence_space::local_space);
+                    sycl::group_barrier(item_ct1.get_group());
                 }
 
 

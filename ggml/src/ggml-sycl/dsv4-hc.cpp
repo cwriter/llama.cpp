@@ -722,7 +722,7 @@ static void dsv4_hc_pre_up_q8_0_sycl(
                     }
                     act[iw] = a;
                 }
-                item.barrier(sycl::access::fence_space::local_space);
+                sycl::group_barrier(item.get_group());
 
                 const auto    sg   = item.get_sub_group();
                 const int64_t i0   = item.get_group(0) * dsv4_hc_pre_up_sg_per_wg + sg.get_group_linear_id();

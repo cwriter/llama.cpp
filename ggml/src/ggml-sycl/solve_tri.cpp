@@ -41,7 +41,7 @@ static void solve_tri_f32_fast(const float * __restrict__ A,
         }
     }
 
-    item.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item.get_group());
 
     float x_low  = (lane < n) ? B_batch[lane * k + col_idx] : 0.0f;
     float x_high = (WARP_SIZE + lane < n) ? B_batch[(WARP_SIZE + lane) * k + col_idx] : 0.0f;

@@ -36,25 +36,25 @@ static void rwkv_wkv6_f32_kernel(
     }
 
     // Sync threads before shared memory operations
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     // Load time-mixing parameters
     _tf[tid] = tf[head_i * head_size + tid];
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     // Main sequence processing loop
     for (int t = batch_i * n_seq_tokens * C + head_i * head_size + tid;
          t < (batch_i + 1) * n_seq_tokens * C + head_i * head_size + tid;
          t += C) {
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         // Load current timestep data to shared memory
         _k[tid] = k[t];
         _r[tid] = r[t];
         _td[tid] = td[t];
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         const float _v = v[t];
         float y = 0;
@@ -129,7 +129,7 @@ static void rwkv_wkv7_f32_kernel(
          t < (batch_i + 1) * n_seq_tokens * C + head_i * head_size + tid;
          t += C) {
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         _r[tid] = r[t];
         _w[tid] = w[t];
@@ -137,7 +137,7 @@ static void rwkv_wkv7_f32_kernel(
         _a[tid] = a[t];
         _b[tid] = b[t];
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         const float _v = v[t];
         float y = 0, sa = 0;

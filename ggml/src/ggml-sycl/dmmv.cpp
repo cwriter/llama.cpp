@@ -1969,7 +1969,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_reorder_esimd(
 
     lmem[tid * 2 + 0] = reduce<float>(acc_a, std::plus<>{});
     lmem[tid * 2 + 1] = reduce<float>(acc_b, std::plus<>{});
-    it.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
 
     if (tid == 0) {
         float sum_a = 0.0f;
@@ -2167,7 +2167,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd(
 
     lmem[tid * 2 + 0] = reduce<float>(acc_a, std::plus<>{});
     lmem[tid * 2 + 1] = reduce<float>(acc_b, std::plus<>{});
-    it.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
 
     if (tid == 0) {
         float sum_a = 0.0f;
@@ -2304,7 +2304,7 @@ static void q8_0_siblings_launch(const void * va, const void * vb, const float *
                 lmem[(tid * NR + r) * 2] = reduce<float>(aa[r], std::plus<>{});
                 lmem[(tid * NR + r) * 2 + 1] = reduce<float>(ab[r], std::plus<>{});
             }
-            it.barrier(sycl::access::fence_space::local_space);
+            sycl::group_barrier(it.get_group());
             if (tid < NR) {
                 float a = 0.0f, b = 0.0f;
                 for (int t = 0; t < WG; ++t) {
@@ -2374,7 +2374,7 @@ ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd_rows(
     for (int r = 0; r < NR; ++r) {
         lmem[tid * NR + r] = reduce<float>(acc[r], std::plus<>{});
     }
-    it.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
 
     if (tid < NR && row0 + tid < nrows) {
         float sum = 0.0f;
@@ -2422,7 +2422,7 @@ ESIMD_INLINE void f32_row_dot_esimd(const float * w, const float * y, float * ds
         acc[0] += block_load<float, 32>(w + c) * block_load<float, 32>(y + c);
     }
     lmem[tid] = reduce<float>(acc[0] + acc[1] + acc[2] + acc[3], std::plus<>{});
-    it.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
     if (tid == 0) {
         float sum = 0.0f;
         for (int p = 0; p < WG; ++p) {
@@ -2511,7 +2511,7 @@ ESIMD_INLINE void q8_0_glu_reorder_esimd_rows(
         lmem[(tid * NR + r) * 2 + 0] = reduce<float>(acc_g[r], std::plus<>{});
         lmem[(tid * NR + r) * 2 + 1] = reduce<float>(acc_u[r], std::plus<>{});
     }
-    it.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
 
     if (tid < NR && row0 + tid < nrows) {
         float g = 0.0f;
@@ -2599,7 +2599,7 @@ static void q8_0_moe_esimd_launch(const void * vx_base, const float * y_base, co
                 for (int r = 0; r < NR; ++r) {
                     lmem[tid * NR + r] = reduce<float>(acc[r], std::plus<>{});
                 }
-                it.barrier(sycl::access::fence_space::local_space);
+                sycl::group_barrier(it.get_group());
                 // a work-group may hold more rows than threads
                 for (int r = tid; r < NR && row0 + r < nrows; r += WG) {
                     float sum = 0.0f;
@@ -2791,7 +2791,7 @@ ESIMD_INLINE void esimd_ncols_epilogue(
         lmem[(tid * NCOLS + c) * 2 + 0] = reduce<float>(simd<float, 32>(acc0.template select<32, 1>(c * 32)), std::plus<>{});
         lmem[(tid * NCOLS + c) * 2 + 1] = reduce<float>(simd<float, 32>(acc1.template select<32, 1>(c * 32)), std::plus<>{});
     }
-    it.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
 
     if (tid == 0) {
 #pragma unroll

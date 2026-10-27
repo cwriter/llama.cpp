@@ -101,7 +101,7 @@ static inline void top_k_radix_select_f32(
         for (int i = tid; i < SYCL_TOP_K_RADIX_HIST_SIZE; i += block_size) {
             hist[i] = 0;
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         for (int col = tid; col < ncols; col += block_size) {
             const uint32_t key = top_k_radix_key(src[col]);
@@ -110,7 +110,7 @@ static inline void top_k_radix_select_f32(
                 local_atomic(hist[bucket * SYCL_TOP_K_RADIX_HIST_COPIES + copy]).fetch_add(1u);
             }
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         // Lane t takes bucket 255 - t, so an inclusive scan over lanes counts from the top
         // bucket downward. The pivot is the unique bucket whose cumulative count first
@@ -129,7 +129,7 @@ static inline void top_k_radix_select_f32(
             *s_bucket = cnt;
             *s_need   = need - (incl - cnt);
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
 
         const uint32_t digit      = *s_digit;
         const uint32_t bucket_cnt = *s_bucket;
@@ -143,10 +143,10 @@ static inline void top_k_radix_select_f32(
             break;
         }
         // The next pass rewrites hist and s_*; the reads above must land first.
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     // Exactly k - need columns have (key & mask) > prefix; the first need of the pivot-equal
     // columns fill the tail. Both counters live in SLM since the whole row is this group.

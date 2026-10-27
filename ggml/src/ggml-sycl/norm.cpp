@@ -38,7 +38,7 @@ static void norm_f32(const float* x, float* dst, const int ncols,
         if (wi_in_sg == 0) {
             s_sum[sg_id] = mean_var;
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
         mean_var = 0.f;
         const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
         for (size_t i = 0; i < nreduce; i += 1)
@@ -88,12 +88,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
         DPCT1118:1: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
-        /*
-        DPCT1065:54: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
-        item_ct1.barrier();
+        sycl::group_barrier(item_ct1.get_group());
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
         {
@@ -123,12 +118,7 @@ static void group_norm_f32(const float* x, float* dst, const int group_size, con
         DPCT1118:2: SYCL group functions and algorithms must be encountered in
         converged control flow. You may need to adjust the code.
         */
-        /*
-        DPCT1065:55: Consider replacing sycl::nd_item::barrier() with
-        sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-        better performance if there is no access to global memory.
-        */
-        item_ct1.barrier();
+        sycl::group_barrier(item_ct1.get_group());
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
         {
@@ -204,7 +194,7 @@ static void rms_norm_f32(const float* x, float* dst, const int ncols,
             s_sum[sg_id] = tmp;
         }
 
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
         const size_t nreduce = ceil_div(nwarps, WARP_SIZE);
         tmp = 0.f;
         for (size_t i = 0; i < nreduce; i += 1)
@@ -1033,7 +1023,7 @@ void ggml_sycl_op_rms_norm_back(ggml_backend_sycl_context & ctx, ggml_tensor * d
                         l_xx[sg_id] = xx;
                         l_xg[sg_id] = xg;
                     }
-                    item_ct1.barrier(sycl::access::fence_space::local_space);
+                    sycl::group_barrier(item_ct1.get_group());
 
                     if (sg_id == 0) {
                         const unsigned wi_u = wi_in_sg;

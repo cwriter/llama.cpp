@@ -1279,12 +1279,7 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
             DPCT1118:9: SYCL group functions and algorithms must be encountered
             in converged control flow. You may need to adjust the code.
             */
-            /*
-            DPCT1065:56: Consider replacing sycl::nd_item::barrier() with
-            sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-            better performance if there is no access to global memory.
-            */
-            item_ct1.barrier();
+            sycl::group_barrier(item_ct1.get_group());
 
 // #pragma unroll // unrolling this loop causes too much register pressure
             for (int k = ir*WARP_SIZE/qr; k < (ir+1)*WARP_SIZE/qr; k += vdr) {
@@ -1304,12 +1299,7 @@ mul_mat_q(const void *__restrict__ vx, const void *__restrict__ vy,
             DPCT1118:10: SYCL group functions and algorithms must be encountered
             in converged control flow. You may need to adjust the code.
             */
-            /*
-            DPCT1065:57: Consider replacing sycl::nd_item::barrier() with
-            sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-            better performance if there is no access to global memory.
-            */
-            item_ct1.barrier();
+            sycl::group_barrier(item_ct1.get_group());
         }
     }
 

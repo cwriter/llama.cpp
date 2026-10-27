@@ -3464,7 +3464,7 @@ static void mul_mat_vec_q_moe_ordered_slm(
         };
 
         load_tiles(0, 0);
-        item.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item.get_group());
 
         int buf = 0;
         for (int block_base = 0; block_base < blocks_per_row; block_base += blocks_tile) {
@@ -3496,7 +3496,7 @@ static void mul_mat_vec_q_moe_ordered_slm(
                 }
             }
             // publishes the tile just loaded and retires the reads above in one go
-            item.barrier(sycl::access::fence_space::local_space);
+            sycl::group_barrier(item.get_group());
             buf ^= 1;
         }
 

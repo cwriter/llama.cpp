@@ -503,7 +503,7 @@ template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_IQ4_NL> {
         const sycl::float2 ds8f = q8_1_ds->convert<float, sycl::rounding_mode::automatic>();
         // the lookup table already carries the sign, so there is no -8 correction here
         return static_cast<float>(d) * ds8f.x() * (sumi1 + sumi2);
-    };
+    }
 };
 
 template <> struct reorder_vec_dot_q_sycl<GGML_TYPE_Q8_0> {

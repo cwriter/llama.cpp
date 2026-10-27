@@ -1235,7 +1235,7 @@ static void dequantize_block_q4_K_reorder(const void * __restrict__ vx, dst_t * 
         scales_local[tid] = scales_ptr[tid];
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
     dequantize_q4_K_common(y, qs_ptr, dall, dmin, scales_local, il, ir);
 }
 
@@ -1322,7 +1322,7 @@ static void dequantize_block_q5_K_reorder(const void * __restrict__ vx, dst_t * 
         scales_local[tid] = scales_ptr[tid];
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     uint8_t sc, m;
     get_scale_min_k4(is + 0, scales_local, sc, m);

@@ -260,7 +260,7 @@ static void topk_moe_radix_kernel(const float * __restrict__ logits,
 
     top_k_radix_select_f32(logits, ids, n_experts, n_expert_used, slm, item_ct1);
     // ids is global memory filled by the whole group; the gather below crosses lanes.
-    item_ct1.barrier(sycl::access::fence_space::global_and_local);
+    sycl::group_barrier(item_ct1.get_group());
 
     // Without norm the weight is the softmax over every expert, so the full denominator is still
     // needed. With norm it would cancel, but the clamp on the selected sum does not, so the

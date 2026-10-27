@@ -163,7 +163,7 @@ static __dpct_inline__ void ssm_conv_tile(
         }
         tile[c * (TT + 1) + ti] = sumf;
     }
-    it.barrier(access::fence_space::local_space);
+    sycl::group_barrier(it.get_group());
 
     const int cc = lid % TC;
     const int tj = lid / TC;

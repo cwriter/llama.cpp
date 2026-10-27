@@ -635,7 +635,7 @@ static void flash_attn_mask_to_KV_max(const sycl::half2 * __restrict__ mask,
     if (tid < warp_size) {
         buf_iw[tid] = 1;
     }
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     int KV_max_sj = (ne30 - 1) * FATTN_KQ_STRIDE;
     for (; KV_max_sj >= 0; KV_max_sj -= FATTN_KQ_STRIDE) {
@@ -652,9 +652,9 @@ static void flash_attn_mask_to_KV_max(const sycl::half2 * __restrict__ mask,
         if (tid % warp_size == 0) {
             buf_iw[tid / warp_size] = all_inf;
         }
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
         all_inf = buf_iw[tid % warp_size];
-        item_ct1.barrier(sycl::access::fence_space::local_space);
+        sycl::group_barrier(item_ct1.get_group());
         all_inf = warp_reduce_all<warp_size>(all_inf);
 
         if (!all_inf) {
@@ -815,7 +815,7 @@ static void flash_attn_combine_results(const float * __restrict__ VKQ_parts,
         ((float *) meta)[i] = ((const float *)VKQ_meta) [i];
     }
 
-    item_ct1.barrier(sycl::access::fence_space::local_space);
+    sycl::group_barrier(item_ct1.get_group());
 
     float kqmax = meta[0].x();
     for (int l = 1; l < parallel_blocks; ++l) {

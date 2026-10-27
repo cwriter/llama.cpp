@@ -1,5 +1,6 @@
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/cache_control_properties.hpp>
+#include <sycl/ext/oneapi/experimental/group_load_store.hpp>
 #include "dpct/helper.hpp"
 #include "common.hpp"
 #include "ggml.h"
@@ -22,17 +23,8 @@ template <int rows_per_lane, bool KDA> struct gdn_step {
 
 // one sub-group block load of N floats per lane: element r of lane l is p[r * sub-group size + l]
 template <int N> static __dpct_inline__ void gdn_block_load(const sycl::sub_group & sg, const float * p, float * out) {
-    const auto mp = sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::yes>(
-        const_cast<float *>(p));
-    if constexpr (N == 1) {
-        out[0] = sg.load(mp);
-    } else {
-        const sycl::vec<float, N> v = sg.load<N>(mp);
-#pragma unroll
-        for (int r = 0; r < N; r++) {
-            out[r] = v[r];
-        }
-    }
+    namespace syclex = sycl::ext::oneapi::experimental;
+    syclex::group_load(sg, p, sycl::span<float, N>(out, N), syclex::properties(syclex::data_placement_striped));
 }
 
 // store this lane's shard of a state column: element r of lane l goes to p[r * warp_size + l].
