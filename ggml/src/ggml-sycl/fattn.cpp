@@ -393,6 +393,22 @@ bool ggml_sycl_fattn_reads_mask_bits(const ggml_tensor * dst) {
 void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     ggml_sycl_set_device(ctx.device);
 
+    ggml_tensor * Q = dst->src[0];
+    ggml_tensor * K = dst->src[1];
+    ggml_tensor * V = dst->src[2];
+    if (K && Q && K->ne[0] != Q->ne[0] && Q->ne[0] > 0 && K->ne[0] % Q->ne[0] == 0) {
+        const int64_t d = Q->ne[0];
+        const int64_t n_heads = (K->ne[0] * K->ne[2]) / d;
+        K->ne[0] = d;
+        K->ne[2] = n_heads;
+    }
+    if (V && Q && V->ne[0] != Q->ne[0] && Q->ne[0] > 0 && V->ne[0] % Q->ne[0] == 0) {
+        const int64_t d = Q->ne[0];
+        const int64_t n_heads = (V->ne[0] * V->ne[2]) / d;
+        V->ne[0] = d;
+        V->ne[2] = n_heads;
+    }
+
     // The packed mask is backend-local and only some kernels read it. Rather than let an
     // untaught one reinterpret bits as f16 - the way the QSA mask fusion once did, silently -
     // expand it here for every reader that has not been taught, and substitute the dense copy.

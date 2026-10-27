@@ -1,3 +1,47 @@
+# Merge of upstream master on 2026-10-27
+
+Upstream `19ff817f` merged into `performance_uplift_mega_branch` (`7faa54ca`) as a merge commit, like the 2026-10-20 update: no history rewrite, no force push. The branch's own history (including the re-attached pre-rebase history of `bf1f0092`) is untouched.
+
+Nothing below was compiled or run with oneAPI: the merge was done in a container without the SYCL toolchain. The CPU build and the CPU `test-backend-ops` compile were checked (see the end). The first step on a GPU machine is a SYCL build and `test-backend-ops -o MUL_MAT_ID`, `-o MUL_MAT`, `-o FLASH_ATTN_EXT`, `-o GET_ROWS`.
+
+## How the conflicts were resolved
+
+17 files conflicted (75 hunks). Rule of thumb: where the branch already had its own, evolved version of what upstream did, the branch's code was kept and upstream's fixes were ported into it; where upstream reworked code the branch had not touched, upstream's version was taken.
+
+- **SYCL graph record/replay (#28725, `7377bada`).** The branch carried an earlier copy of this PR and extended it (per-node blocker log, sparse attention exemption, MoE consumer check, reorder gate, device-local check). The branch's graph code is kept. Taken from upstream: `can_use_mul_mat_vec_q()` now takes the device (#31014, the XMX batch check needs it), the configurable `GGML_SYCL_GRAPH_EVICTION_TIMEOUT`, and the one-time "enabling / disabling SYCL graphs" log.
+- **Pinned upload staging and `set_tensor_2d` (#30358).** The branch replaced the slot staging with a growing ring (`stg.used`, `stg.cap`), which upstream's `set_tensor_2d` (written against `staging.next/events/submitted`) cannot use. A branch version was written: contiguous destination rows are packed into host batches of at most 64 MiB, each sent with one `set_tensor` call (which copies into the pinned ring before returning). Non-contiguous rows, reordered MoE owners, packed KQ masks and SoA KV fall back to one `set_tensor` per row, as the generic path does.
+- **Reorder temp memory bound (#31062).** Upstream bounds every reorder's temporary to 32 MiB (`reorder_qw_planar`, chunked MoE reorders). Q8_0, IQ3_S and IQ3_XXS dense reorders now use upstream's `reorder_qw_planar` (same byte layout as before; the branch versions were cosmetic variants of the old code). The branch keeps its own Q6_K dense reorder and its own MoE reorder structure (one shared temporary for all chunks); both are chunked through `GGML_SYCL_MEM_SAVE_REORDER_CHUNK`, which is on by default, so every reorder stays within a small temporary either way.
+- **XMX multi-column mat-vec (#29864, `d81d0d8f`).** Added next to the branch's ESIMD multi-column kernels. Dispatch order in `ggml_sycl_mul_mat`: the branch's ESIMD n-cols (Q8_0, Q6_K, 2..N columns) first, then DMMV, then MMVQ, where upstream's XMX kernel takes reordered Q2_K..Q6_K and Q8_0 batches. Upstream's code reads `optimized_feature.reorder`; on the branch that is `is_reordered()`, translated everywhere.
+- **Fused GEMM on reordered weights (#30604 part).** The branch already did this with its own signature (reordered flag after `ldc`, base pointer check); the branch's `fused-gemm.cpp/.hpp` are kept as they were.
+- **IQ3 crash fix (#30604, `493253fe`).** Upstream changed `dequantize_block_iq3_{s,xxs}_reorder()` to take the block index and a pre-offset `y`, so that GET_ROWS can read reordered IQ3 (tied embeddings). The branch's vectorized IQ3_S version was moved to that signature.
+- **convert.cpp (#30740 merged fp16/fp32 switches, #30775 fast Q8_0 dequant).** Upstream's merged `ggml_get_dequant_sycl<dst_t>` is taken, with the branch's additions re-applied: reordered IQ4_NL and IQ4_XS dequant, the IQ4_NL work-group size, the wide f32->f16 conversion, `is_reordered()`. The branch keeps its own wide Q8_0 reordered dequant; upstream's `dequantize_block_q8_0_reorder_wide(..., sycl::id<1>)` overload is present but unused (see benchmark 3).
+- **fattn-mkl (#30684, explicit dependencies instead of host waits).** The branch had already removed those waits its own way (online Q8, one-pass softmax, `GGML_SYCL_MKL_FA_DRAIN`), so the branch's file is kept as is.
+- **fattn-sparse (#30812, memset not always ordered).** The branch's mask compaction kernel already replaced that memset.
+- **fattn (#30286, K/V head-size mismatch).** Upstream's reshape is applied before the branch's packed-mask handling.
+- **llama side.** `memory_breakdown()` uses upstream's `llama_memory_bufs` plus the branch's KV rotation buffers; the rotation code now reads `no_alloc` from `ctxs_bufs` (upstream moved it out of `hparams`, #31141). The branch's SoA `kv_size % 256` assert stays; upstream dropped `n_pad` (#31200) but still rounds `n_ctx` to 256. qwen4exp's MTP layer takes upstream's `hc_mix` struct (#31142) and keeps the branch's KV catch-up early return.
+- **tests.** `test_mul_mat_id` keeps the branch's `amax` and `b_off` and gains upstream's `skip` as the last parameter. Upstream dropped `amax` (#30924), so its new and changed call sites were rewritten to the branch's argument order; taken unchanged they would have silently passed `m_v` as `amax`, and `init_mul_mat_id_tensors(ctx, n_mats, amax)` would have turned `amax = 1.0f` into `skip = true`.
+
+## MUL_MAT_ID with id == -1 (#26631)
+
+Upstream lets a MUL_MAT_ID id be -1 ("skip this slot, the dst row is 0"). No model emits it yet; only test-backend-ops (`skip=1` cases). State on the branch:
+
+- Handled: the host-scheduled path (counting sort skips them, a kernel zeroes their dst rows; this is upstream's code, ported into `ggml_sycl_mul_mat_id_host_sched`), the plain and reordered MMVQ MoE kernels (zero their rows), the route-ordered MMVQ path and the device-scheduled grouped GEMM (both drop -1 routes; `ggml_sycl_mmid_zero_skipped()` zeroes the rows after the launch).
+- **Not handled:** the ESIMD MoE kernels in `dmmv.cpp` (`ggml_sycl_mul_mat_vec_q_id_reorder_esimd` and the fused gate/up ones) index the weights with the id unchecked, so a -1 reads one expert slice before the tensor. The `skip=1` test cases for IQ4_NL / Q8_0 / IQ3_S at a few tokens can hit them. Fix before any model starts emitting -1: an `if (i02 < 0)` guard that writes zeros, per kernel.
+
+## Benchmarks to run (merged vs `7faa54ca`)
+
+1. **XMX takes Q2_K/Q3_K/Q4_K single-column decode.** Upstream turns DMMV off for one column when `ggml_sycl_xmx_min_cols(type) == 1` and the reordered weight can use the XMX kernel (BMG and LNL only), so reordered Q4_K decode now runs the XMX DPAS kernel instead of the branch's tuned path. Upstream measured it against its own kernels, not the branch's. Compare tg with `GGML_SYCL_ENABLE_XMX_ESIMD=0` and `=1` on a Q4_K model (and Q4_K_M MoE). Also short batches (spec decode / MTP verify, 2..16 columns), where XMX competes with the branch's MMVQ.
+2. **XMX fused gate/up.** `ggml_sycl_mul_mat_glu_fused` now first tries upstream's XMX GLU kernel for same-type Q2_K..Q6_K/Q8_0 pairs up to `GGML_SYCL_XMX_GLU_MAX_COLS` (16) columns, ahead of the branch's reorder / ESIMD GLU paths. Same A/B with `GGML_SYCL_ENABLE_XMX_ESIMD=0`.
+3. **Q8_0 reordered dequant.** The branch's wide kernel vs upstream's #30775 version (switch `dequantize_row_q8_0_sycl_reorder` to it to test). Prefill of a Q8_0 model.
+4. **qwen4exp QSA graph (#30965, #31243, #30640).** Upstream builds the QSA selection without the kq_mask and added `GGML_OP_TOP_K_MASK`. SYCL does not implement that op, so llama keeps the non-fused path, but that path was itself rebuilt upstream. The branch's QSA fusions (`GGML_SYCL_FUSE_QSA_*`) match graph patterns and silently stop firing if the pattern changed. Check that the fusions still fire (`GGML_SYCL_CENSUS` or the fusion debug log) and compare pp/tg and compute buffer size on qwen4exp. A SYCL `TOP_K_MASK` kernel is the likely follow-up if the old fusions no longer apply.
+5. **Graph replay.** `GGML_SYCL_ENABLE_GRAPH=1` still records (the graph code is the branch's); check the log for the new one-time "enabling SYCL graphs" line and that the replay count is unchanged.
+
+## Checked here
+
+- CPU build of everything, including `test-backend-ops` with the merged MUL_MAT_ID test changes.
+- Every top-level function of `ggml-sycl.cpp`, `mmvq.cpp`, `getrows.cpp`, `fusion.cpp`, `common.hpp`, `fattn.cpp` that matches neither the branch nor upstream (that is, one git combined from both) was read; three such mixes were wrong and fixed (upstream's `needs_sync` check inside the branch's MoE shape gate, which would have sent 2..8-token MoE batches to the host path; its assert in the host path; a duplicated `can_use_mul_mat_q`).
+
+
 # Rebase of performance_uplift_mega_branch onto upstream master
 
 Upstream base: ggml-org/llama.cpp `8345f33` (2026-10-05). Old base: `ec7630a` (2026-10-01).
