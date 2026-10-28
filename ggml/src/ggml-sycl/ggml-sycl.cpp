@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <float.h>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <stdint.h>
 #include <stdio.h>
@@ -148,6 +149,7 @@ int g_ggml_sycl_usm_system = 0;
 int g_ggml_sycl_enable_host_pinned_mem = 1;
 int g_ggml_sycl_host_pinned_mem_2g = 0;
 int g_ggml_sycl_upload_staging_slots = 4;
+static int g_ggml_sycl_upload_queue = 0;
 int g_ggml_sycl_get_mem_api = MEMORY_API_TYPE_LEVEL_ZERO;
 int g_ggml_sycl_enable_sparse_fa = 0;
 int g_ggml_sycl_debug_sparse_fa = 0;
@@ -479,6 +481,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_host_pinned_mem_2g =
             ggml_sycl_get_env("GGML_SYCL_HOST_PINNED_MEM_2G", 0) & g_ggml_sycl_enable_host_pinned_mem;
         g_ggml_sycl_upload_staging_slots = std::max(0, ggml_sycl_get_env("GGML_SYCL_UPLOAD_STAGING_SLOTS", 4));
+        g_ggml_sycl_upload_queue = ggml_sycl_get_env("GGML_SYCL_UPLOAD_QUEUE", 0);
 
         g_ggml_sycl_enable_sparse_fa = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA", 0);
         g_ggml_sycl_debug_sparse_fa = ggml_sycl_get_env("GGML_SYCL_SPARSE_FA_DEBUG", 0);
@@ -578,6 +581,7 @@ static void ggml_check_sycl() try {
 
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FUSION: %d\n", g_ggml_sycl_enable_fusion);
         GGML_LOG_INFO("  GGML_SYCL_UPLOAD_STAGING_SLOTS: %d\n", g_ggml_sycl_upload_staging_slots);
+        GGML_LOG_INFO("  GGML_SYCL_UPLOAD_QUEUE: %d\n", g_ggml_sycl_upload_queue);
 
 #if defined(__INTEL_LLVM_COMPILER)
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_ESIMD: %d\n", g_ggml_sycl_enable_esimd);
@@ -703,6 +707,55 @@ inline void free_aligned_mem_host(void * memblock) {
 #endif
 }
 
+// Keep staged uploads off compute queues that may wait on another device.
+struct ggml_sycl_upload_queue_state {
+    std::unique_ptr<sycl::queue> queue;
+    sycl::queue * compute = nullptr;
+    sycl::event last;
+    std::mutex mutex;
+    std::atomic<int> enabled{-1};
+    std::atomic<bool> pending{false};
+};
+static ggml_sycl_upload_queue_state g_ggml_sycl_upload_q[GGML_SYCL_MAX_DEVICES];
+
+static bool ggml_sycl_use_upload_queue(int device, const sycl::queue & compute) {
+    auto & cached = g_ggml_sycl_upload_q[device].enabled;
+    int enabled = cached.load(std::memory_order_relaxed);
+    if (enabled < 0) {
+        enabled = g_ggml_sycl_upload_queue < 0 ?
+            compute.get_device().get_platform().get_info<sycl::info::platform::name>().find("Level-Zero V2") != std::string::npos :
+            g_ggml_sycl_upload_queue != 0;
+        cached.store(enabled, std::memory_order_relaxed);
+    }
+    return enabled != 0;
+}
+
+static sycl::event ggml_sycl_upload_memcpy(int device, sycl::queue & compute, void * dst, const void * src, size_t size) {
+    auto & u = g_ggml_sycl_upload_q[device];
+    std::lock_guard<std::mutex> lock(u.mutex);
+    if (!u.queue) {
+        u.queue = std::make_unique<sycl::queue>(compute.get_context(), compute.get_device(), sycl::property::queue::in_order{});
+    }
+    u.compute = &compute;
+    const auto tail = compute.ext_oneapi_get_last_event();
+    u.last = tail ? u.queue->memcpy(dst, src, size, *tail) : u.queue->memcpy(dst, src, size);
+    u.pending.store(true, std::memory_order_release);
+    return u.last;
+}
+
+// Join before any compute-queue access so uploads retain single-queue ordering.
+static void ggml_sycl_upload_join(int device) {
+    auto & u = g_ggml_sycl_upload_q[device];
+    if (!u.pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(u.mutex);
+    if (u.pending.load(std::memory_order_relaxed)) {
+        u.compute->ext_oneapi_submit_barrier({ u.last });
+        u.pending.store(false, std::memory_order_relaxed);
+    }
+}
+
 // sycl buffer
 
 struct ggml_backend_sycl_buffer_context {
@@ -774,6 +827,7 @@ static void
 ggml_backend_sycl_buffer_free_buffer(ggml_backend_buffer_t buffer) try {
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
     ggml_sycl_set_device(ctx->device);
+    ggml_sycl_upload_join(ctx->device);
 
     delete ctx;
 }
@@ -794,6 +848,7 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG("[SYCL] call %s", __func__);
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor, "\n").c_str());
     ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *)buffer->context;
+    ggml_sycl_upload_join(ctx->device);
 
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);
@@ -866,7 +921,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     ggml_sycl_set_device(ctx->device);
 
     // copy through pinned memory so the device never reads mmap()ed pages directly
-    // chunks pipeline on the in-order compute queue, so no drain per tensor is needed
+    // wait for a staging slot only when it is reused
     if (ggml_sycl_buffer_init_staging(ctx)) {
         queue_ptr    stream    = ctx->stream;
         char *       dst       = (char *) tensor->data + offset;
@@ -881,7 +936,8 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
             }
             void * stage = (char *) ctx->staging.data + slot * ctx->staging_slot_size;
             memcpy(stage, src, chunk);
-            ctx->staging.events[slot] = stream->memcpy(dst, stage, chunk);
+            ctx->staging.events[slot] = ggml_sycl_use_upload_queue(ctx->device, *stream) ?
+                ggml_sycl_upload_memcpy(ctx->device, *stream, dst, stage, chunk) : stream->memcpy(dst, stage, chunk);
             ctx->staging.submitted[slot] = true;
             src       += chunk;
             dst       += chunk;
@@ -890,6 +946,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         return;
     }
 
+    ggml_sycl_upload_join(ctx->device);
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
 #ifndef _WIN32
@@ -942,7 +999,9 @@ static void ggml_backend_sycl_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         for (size_t i = 0; i < n; ++i) {
             memcpy(stage + i * size, src + (i0 + i) * stride_data, size);
         }
-        ctx->staging.events[slot]    = stream->memcpy(dst + i0 * size, stage, n * size);
+        ctx->staging.events[slot] = ggml_sycl_use_upload_queue(ctx->device, *stream) ?
+            ggml_sycl_upload_memcpy(ctx->device, *stream, dst + i0 * size, stage, n * size) :
+            stream->memcpy(dst + i0 * size, stage, n * size);
         ctx->staging.submitted[slot] = true;
     }
 }
@@ -962,6 +1021,7 @@ static void ggml_backend_sycl_buffer_get_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_sycl_buffer_context * ctx = ( ggml_backend_sycl_buffer_context *)buffer->context;
 
     ggml_sycl_set_device(ctx->device);
+    ggml_sycl_upload_join(ctx->device);
     auto stream = dpct::dev_mgr::instance().get_device(ctx->device).default_queue();
 
     SYCL_CHECK(CHECK_TRY_ERROR(
@@ -1050,6 +1110,8 @@ ggml_backend_sycl_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     if (is_cpy_supported) {
         ggml_backend_sycl_buffer_context * src_ctx = (ggml_backend_sycl_buffer_context *)src->buffer->context;
         ggml_backend_sycl_buffer_context * dst_ctx = (ggml_backend_sycl_buffer_context *)dst->buffer->context;
+        ggml_sycl_upload_join(src_ctx->device);
+        ggml_sycl_upload_join(dst_ctx->device);
 
         ggml_sycl_set_device(src_ctx->device);
         /*
@@ -1108,6 +1170,7 @@ static void ggml_backend_sycl_buffer_clear(ggml_backend_buffer_t buffer,
     ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
 
     ggml_sycl_set_device(ctx->device);
+    ggml_sycl_upload_join(ctx->device);
     queue_ptr stream = ctx->stream;
     SYCL_CHECK(
         CHECK_TRY_ERROR(dpct::get_current_device().queues_wait_and_throw()));
@@ -1135,6 +1198,7 @@ static void ggml_backend_sycl_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     GGML_SYCL_DEBUG(" size=%zu offset=%zu value=%u\n", size, offset, value);
     ggml_backend_sycl_buffer_context * ctx = (ggml_backend_sycl_buffer_context *) buffer->context;
     SYCL_CHECK(ggml_sycl_set_device(ctx->device));
+    ggml_sycl_upload_join(ctx->device);
     auto stream = &(dpct::dev_mgr::instance().get_device(ctx->device).default_queue());
     if (size == 0) {
         return;  // Nothing to do
@@ -6518,6 +6582,7 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+    ggml_sycl_upload_join(sycl_ctx->device);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
@@ -6539,6 +6604,7 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
     GGML_SYCL_DEBUG("%s", debug_get_tensor_str(": tensor", tensor).c_str());
     GGML_SYCL_DEBUG(" size=%zu offset=%zu\n", size, offset);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+    ggml_sycl_upload_join(sycl_ctx->device);
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
@@ -6585,6 +6651,7 @@ catch (sycl::exception const &exc) {
 static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
+    ggml_sycl_upload_join(sycl_ctx->device);
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
 
@@ -6958,6 +7025,7 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
+    ggml_sycl_upload_join(sycl_ctx->device);
 
     // set the device on every call: a graph replay does not go through
     // ggml_backend_sycl_graph_compute_impl()
@@ -7068,6 +7136,7 @@ try
 {
     ggml_backend_sycl_context *sycl_ctx =
         (ggml_backend_sycl_context *)backend->context;
+    ggml_sycl_upload_join(sycl_ctx->device);
 
     sycl::event *sycl_event = static_cast<sycl::event *>(event->context);
 
