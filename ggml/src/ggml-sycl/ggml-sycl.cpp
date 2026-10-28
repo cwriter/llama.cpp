@@ -1044,6 +1044,11 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
             case GGML_TYPE_Q5_K:
             case GGML_TYPE_Q6_K:
             case GGML_TYPE_MXFP4:{
+                // a compute buffer copy of a host weight (e.g. -ncmoe experts offloaded for prompt processing) is
+                // refilled in the normal layout before every run, so reordering it is wasted work
+                if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                    break;
+                }
                 ggml_tensor_extra_gpu * extra = new ggml_tensor_extra_gpu{};
                 tensor->extra                 = extra;
                 ctx->tensor_extras.push_back(extra);
