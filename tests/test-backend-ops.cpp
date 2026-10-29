@@ -1313,6 +1313,7 @@ struct test_case {
     }
 
     virtual bool run_whole_graph() { return false; }
+    virtual bool perf_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
@@ -1688,8 +1689,18 @@ struct test_case {
         }
 
         // duplicate the op
-        for (int i = 1; i < n_runs; i++) {
-            ggml_graph_add_node(gf, out);
+        if (perf_whole_graph()) {
+            const int n_nodes = ggml_graph_n_nodes(gf);
+            n_runs = std::min(n_runs, ggml_graph_size(gf) / n_nodes);
+            for (int i = 1; i < n_runs; i++) {
+                for (int j = 0; j < n_nodes; j++) {
+                    ggml_graph_add_node(gf, ggml_graph_node(gf, j));
+                }
+            }
+        } else {
+            for (int i = 1; i < n_runs; i++) {
+                ggml_graph_add_node(gf, out);
+            }
         }
 
         // calculate memory
@@ -5640,6 +5651,69 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, bool skip = 
     }
     init_mul_mat_id_ids(ctx, n_mats, skip);
 }
+
+struct test_f32_mat_vec : public test_mul_mat {
+    const int offset;
+
+    test_f32_mat_vec(int64_t m, int64_t n, int64_t k, int offset = 0,
+                    std::array<int64_t, 2> bs = {1, 1}, std::array<int64_t, 2> nr = {1, 1}, int64_t k_v = 0)
+        : test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, n, k, bs, nr, {0, 1, 2, 3}, k_v), offset(offset) {}
+
+    std::string op_desc(ggml_tensor *) override { return "F32_MAT_VEC"; }
+    std::string vars() override { return test_mul_mat::vars() + "," + VAR_TO_STR(offset); }
+    double max_nmse_err() override { return 1e-7; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        if (offset == 0) {
+            return test_mul_mat::build_graph(ctx);
+        }
+        ggml_tensor * a = offset == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m) :
+            ggml_view_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k * m + 1), k, m, k * sizeof(float), sizeof(float));
+        ggml_tensor * b = offset == 1 ?
+            ggml_view_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, k + 1), k, 1, k * sizeof(float), sizeof(float)) :
+            ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        return ggml_mul_mat(ctx, a, b);
+    }
+};
+
+struct test_mul_mat_stream : public test_case {
+    const ggml_type type_a;
+    const int64_t m;
+    const int64_t k;
+    const int n_w;
+
+    std::string vars() override {
+        return VARS_TO_STR4(type_a, m, k, n_w);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_STREAM";
+    }
+
+    double max_nmse_err() override { return type_a == GGML_TYPE_F32 ? 1e-7 : 5e-4; }
+
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    test_mul_mat_stream(ggml_type type_a = GGML_TYPE_Q8_0, int64_t m = 256, int64_t k = 256, int n_w = 4)
+        : type_a(type_a), m(m), k(k), n_w(n_w) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < n_w; ++i) {
+            ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, m);
+            ggml_set_name(a, ("a" + std::to_string(i)).c_str());
+            ggml_tensor * y = ggml_mul_mat(ctx, a, b);
+            out = out ? ggml_add(ctx, out, y) : y;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
 
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
@@ -12583,6 +12657,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t m : {127, 128, 129, 143, 145, 511, 512, 513}) {
+        for (int64_t k : {128, 384, 768, 1408, 2560}) {
+            test_cases.emplace_back(new test_f32_mat_vec(m, 1, k));
+        }
+    }
+    for (int64_t k : {127, 129, 130}) {
+        test_cases.emplace_back(new test_f32_mat_vec(129, 1, k));
+    }
+    test_cases.emplace_back(new test_f32_mat_vec(129, 2, 2560));
+    test_cases.emplace_back(new test_f32_mat_vec(129, 1, 2560, 1));
+    test_cases.emplace_back(new test_f32_mat_vec(129, 1, 2560, 2));
+    test_cases.emplace_back(new test_f32_mat_vec(129, 1, 384, 0, {2, 3}, {2, 1}));
+    test_cases.emplace_back(new test_f32_mat_vec(129, 1, 384, 0, {1, 1}, {1, 1}, 388));
+    test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_F32, 512, 2560, 1));
+    test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_F32, 512, 2560, 16));
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -13131,6 +13221,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+
+    test_cases.emplace_back(new test_f32_mat_vec(128, 1, 2048));
+    test_cases.emplace_back(new test_f32_mat_vec(512, 1, 2560));
+    test_cases.emplace_back(new test_f32_mat_vec(513, 1, 2560));
+    test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_F32, 512, 2560, 1));
+    test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_F32, 512, 2560, 16));
 
     return test_cases;
 }

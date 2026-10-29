@@ -33,4 +33,8 @@ bool ggml_sycl_dequantize_mul_mat_vec_glu_reorder_esimd(
     const void * vx, const void * vgate, const float * y,
     float * dst, int ncols, int nrows, dpct::queue_ptr stream);
 
+// Returns false when the single-token FP32 mat-vec must use the library fallback.
+bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                 dpct::queue_ptr stream);
+
 #endif // GGML_SYCL_DMMV_HPP

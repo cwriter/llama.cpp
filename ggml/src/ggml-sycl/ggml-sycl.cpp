@@ -3371,6 +3371,12 @@ inline void ggml_sycl_op_mul_mat_sycl(
         const float * src0_ddf_i = src0->type == GGML_TYPE_F32 ? (const float *) src0_dd_i : src0_ddq_as_f32.get();
         const float * src1_ddf1_i = src1->type == GGML_TYPE_F32 ? (const float *) src1_ddf_i : src1_ddq_as_f32.get();
 
+        if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            src1_ncols == 1 && ldc >= row_diff &&
+            ggml_sycl_f32_mat_vec_esimd(src0_ddf_i, src1_ddf1_i, dst_dd_i, row_diff, ne10, ne00, stream)) {
+            return;
+        }
+
         {
 #if GGML_SYCL_DNNL
             const int64_t gemm_flops = (int64_t)row_diff * src1_ncols * ne10;

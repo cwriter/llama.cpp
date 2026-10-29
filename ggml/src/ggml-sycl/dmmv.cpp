@@ -3,6 +3,8 @@
 #include "dequantize.hpp"
 #include "presets.hpp"
 
+#include <climits>
+
 #if defined(__INTEL_LLVM_COMPILER)
     #if __has_include(<sycl/ext/oneapi/bfloat16.hpp>)
         #include <sycl/ext/oneapi/bfloat16.hpp>
@@ -2480,4 +2482,67 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     GGML_UNUSED(src1_ncols);
     GGML_UNUSED(src1_padded_row_size);
     GGML_UNUSED(ctx);
+}
+
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+// Two threads share each row; load weight and activation chunks before the FMAs.
+template <int KS, int RG, int CH>
+static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * dst, const int M, const int K,
+                                     const int lda, dpct::queue_ptr stream) {
+    constexpr int WG = KS * RG;
+    const int     n_wg = ceil_div(M, RG);
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) n_wg * WG), sycl::range<1>(WG)),
+        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            slm_init<WG * sizeof(float)>();
+            const int tid = it.get_local_id(0);
+            const int rg  = tid / KS;
+            const int ks  = tid % KS;
+            const int m   = it.get_group(0) * RG + rg;
+            const int nch = K / 128;
+
+            simd<float, 128> acc = 0.0f;
+            if (m < M) {
+                const float * arow = a + (size_t) m * lda;
+                int c = ks * CH;
+                for (; c + CH <= nch; c += KS * CH) {
+                    simd<float, 128 * CH> av = block_load<float, 128 * CH>(arow + c * 128);
+                    simd<float, 128 * CH> bv = block_load<float, 128 * CH>(b + c * 128);
+#pragma unroll
+                    for (int i = 0; i < CH; ++i) {
+                        acc += av.template select<128, 1>(i * 128) * bv.template select<128, 1>(i * 128);
+                    }
+                }
+                // Process the remaining 128-element chunks.
+                for (int i = 0; i < CH && c + i < nch; ++i) {
+                    acc += block_load<float, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
+                }
+            }
+            slm_scalar_store<float>(tid * sizeof(float), reduce<float>(acc, std::plus<>{}));
+            barrier();
+            if (ks == 0 && m < M) {
+                simd<float, KS> part = slm_block_load<float, KS>(tid * sizeof(float));
+                dst[m] = reduce<float>(part, std::plus<>{});
+            }
+        });
+}
+#endif
+
+bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                 dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    static const int level = ggml_sycl_get_env("GGML_SYCL_F32_MMV_ESIMD", 1);
+    const auto family = ggml_sycl_info().devices[ggml_sycl_get_device()].hw_info.gpu_family;
+    if (level == 0 || !g_ggml_sycl_enable_esimd || M < 128 || K <= 0 || K % 128 != 0 || lda < K || lda % 4 != 0 ||
+        ((uintptr_t) a | (uintptr_t) b) % 16 != 0 || M > INT_MAX - 15 || K > INT_MAX || lda > INT_MAX ||
+        (family != GPU_FAMILY_IGPU_XE && family != GPU_FAMILY_DGPU_CLIENT_GAME && family != GPU_FAMILY_DGPU_CLOUD)) {
+        return false;
+    }
+    f32_mat_vec_esimd_launch<2, 16, 5>(a, b, dst, (int) M, (int) K, (int) lda, stream);
+    return true;
+#else
+    GGML_UNUSED_VARS(a, b, dst, M, K, lda, stream);
+    return false;
+#endif
 }
