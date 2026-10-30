@@ -1,6 +1,7 @@
 #include <atomic>
 
 #include "fused-gemm.hpp"
+#include "fused-gemm-esimd.hpp"
 #include "dmmv.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -118,6 +119,13 @@ using fg_tf32 = mx::precision::tf32;
 using fg_tuned_combo = fg_combo<fg_half, fg_half, 8, 16, 16, 16>;
 template <typename S> static constexpr bool fg_is_tuned() {
     return std::is_same_v<S, fg_tuned_combo>;
+}
+
+// The combinations the ESIMD grouped GEMM (fused-gemm-esimd.cpp) stands in for: 8x16x16 on sub-group
+// 16 with f16 or bf16 operands, the shape of one dpas. Its B is packed and tiled as theirs is.
+template <typename S> static constexpr bool fg_esimd_combo() {
+    return S::TM == 8 && S::TN == 16 && S::TK == 16 && S::SG == 16 && std::is_same_v<typename S::ta, typename S::tb> &&
+           (std::is_same_v<typename S::ta, sycl::half> || std::is_same_v<typename S::ta, sycl::ext::oneapi::bfloat16>);
 }
 
 // One bit of GGML_SYCL_XMX_GATHER_SHAPES per combination. Only combinations some device lists in
@@ -2368,6 +2376,50 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
     }
 }
 
+// The ESIMD grouped GEMM loads A straight into its dpas operands, so the joint_matrix tile shape
+// means nothing to it; it runs on the fg_esimd_combo of the picked operand type. A grouped call whose
+// weights it covers is moved there from any other sub-group-16 shape of that type, if the device lists
+// it, whatever GGML_SYCL_XMX_GATHER_SHAPES allows: the shape bits choose among joint_matrix tiles.
+// A call the ESIMD kernel then declines (a shape it does not take) runs that combination's joint_matrix
+// kernel.
+static int fg_esimd_remap(dpct::queue_ptr stream, int combo, std::initializer_list<std::pair<ggml_type, bool>> weights) {
+    if (combo < 0 || !ggml_sycl_grouped_gemm_esimd_enabled()) {
+        return combo;
+    }
+    for (const auto & [type, reordered] : weights) {
+        bool covered = false;
+        if (reordered) {
+            fg_visit_type(type, true, [&](auto tag) {
+                using T = decltype(tag);
+                if constexpr (T::reordered) {
+                    covered = ggml_sycl_grouped_gemm_esimd_has<typename T::type>;
+                }
+            });
+        }
+        if (!covered) {
+            return combo;
+        }
+    }
+    int target = -1;
+    fg_visit_combo(combo, [&](auto s) {
+        using S = decltype(s);
+        if constexpr (S::SG == 16 && std::is_same_v<typename S::ta, typename S::tb>) {
+            for (int idx = 0; idx < FG_N_COMBOS; ++idx) {
+                fg_visit_combo(idx, [&](auto t) {
+                    using U = decltype(t);
+                    if constexpr (fg_esimd_combo<U>() && std::is_same_v<typename U::ta, typename S::ta>) {
+                        target = idx;
+                    }
+                });
+            }
+        }
+    });
+    if (target < 0 || target == combo || !(fg_device_combos(stream->get_device()) & (1 << target))) {
+        return combo;
+    }
+    return target;
+}
+
 // Rows of one work-group's M tile. A work-group streams the whole B tile of its column group,
 // so a wider M tile means fewer row-groups and proportionally less packed-B traffic.
 // The 32-row tile (bit 64) and the 64-row tile (bit 256) of the tuned combination.
@@ -2601,6 +2653,14 @@ template <typename S> struct grouped_gemm_launcher {
     }
 
     template <typename block_q_t, bool reordered> void run() const {
+        if constexpr (fg_esimd_combo<S>() && reordered && ggml_sycl_grouped_gemm_esimd_has<block_q_t>) {
+            // the register-operand ESIMD kernel: no SLM A image (GGML_SYCL_MMID_ESIMD)
+            if (ggml_sycl_grouped_gemm_esimd_enabled() && !arms.diag_no_a && !arms.diag_no_mad &&
+                ggml_sycl_grouped_gemm_esimd<block_q_t, typename S::tsb>(src0_dd, expert_stride, tiles, packed, dst, M,
+                                                                         Npad, K, tight, dst_rows, n_tiles, stream)) {
+                return;
+            }
+        }
         if constexpr (!fg_is_tuned<S>()) {
             launch_c<block_q_t, reordered, S::SG_ROWS, false, false, false, false, false, false, false, false>();
         } else if (arms.mrows == FG_HUGE_ROWS) {
@@ -2765,7 +2825,7 @@ bool ggml_sycl_grouped_dequant_gemm(ggml_type src0_type, const void * src0_base,
     // the SoA offsets are derived from the slice block count, so a slice must be exactly that
     GGML_ASSERT(!reordered ||
                 expert_stride == (size_t) M * (K / ggml_blck_size(src0_type)) * ggml_type_size(src0_type));
-    const int combo = fg_pick_combo(stream, GGML_TYPE_F32, src1_prec);
+    const int combo = fg_esimd_remap(stream, fg_pick_combo(stream, GGML_TYPE_F32, src1_prec), { { src0_type, reordered } });
     if (combo < 0) {
         return false;
     }
@@ -2913,7 +2973,8 @@ bool ggml_sycl_grouped_dequant_gemm_dev_ok(ggml_type src0_type, int64_t M, int64
         return false;
     }
     // the device builds its tiles GGML_SYCL_FG_BN wide
-    return fg_pick_combo(stream, GGML_TYPE_F32, src1_prec, GGML_SYCL_FG_BN) >= 0;
+    return fg_esimd_remap(stream, fg_pick_combo(stream, GGML_TYPE_F32, src1_prec, GGML_SYCL_FG_BN),
+                          { { src0_type, reordered } }) >= 0;
 }
 
 template <typename S>
@@ -2962,7 +3023,8 @@ bool ggml_sycl_grouped_dequant_gemm_dev(ggml_type src0_type, const void * src0_b
                 ggml_type_name(src0_type), (int) reordered, (long) M, (long) K, (long) n_tiles_max);
     }
 
-    const int combo = fg_pick_combo(stream, GGML_TYPE_F32, src1_prec, GGML_SYCL_FG_BN);
+    const int combo = fg_esimd_remap(stream, fg_pick_combo(stream, GGML_TYPE_F32, src1_prec, GGML_SYCL_FG_BN),
+                                     { { src0_type, reordered } });
     if (combo < 0) {
         return false;
     }
@@ -3192,6 +3254,17 @@ static bool fg_gate_up_pack(const ggml_tensor * wu, const ggml_tensor * wg, bool
     static const bool reuse_c = ggml_sycl_get_env("GGML_SYCL_MMID_GATE_UP_REDUCE_REUSE", 1) != 0;
     auto launch = [&](auto tag) {
         using T = decltype(tag);
+        if constexpr (T::reordered && (std::is_same_v<typename T::type, block_iq3_s> ||
+                                       std::is_same_v<typename T::type, block_q8_0> ||
+                                       std::is_same_v<typename T::type, block_q4_K>)) {
+            // the register-operand ESIMD kernel: no SLM A image (GGML_SYCL_MMID_ESIMD=1)
+            if (ggml_sycl_grouped_gemm_esimd_enabled() &&
+                ggml_sycl_gate_up_esimd<typename T::type>((const char *) (wg ? wg : wu)->data, (const char *) wu->data,
+                                                          wu->nb[2], tiles, input, output, F, K, Npad, wg == nullptr,
+                                                          count, stream)) {
+                return;
+            }
+        }
         if (grf256 && reuse_c) {
             fg_gate_up_pack_launch<typename T::type, T::reordered, true, true>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
         } else if (grf256) {
@@ -3364,11 +3437,15 @@ bool ggml_sycl_mmid_tiled_moe(ggml_backend_sycl_context & ctx, const ggml_tensor
             return false;
         }
     }
-    const int combo = fg_pick_combo(ctx.stream(), GGML_TYPE_F32, ggml_sycl_src1_prec(up), GGML_SYCL_FG_BN);
-    if (combo != fg_pick_combo(ctx.stream(), GGML_TYPE_F32, ggml_sycl_src1_prec(down), GGML_SYCL_FG_BN) ||
+    // one combination for the whole chain, moved for the ESIMD GEMMs only if they cover both weights
+    const auto pick = [&](const ggml_tensor * op) {
+        return fg_esimd_remap(ctx.stream(), fg_pick_combo(ctx.stream(), GGML_TYPE_F32, ggml_sycl_src1_prec(op), GGML_SYCL_FG_BN),
+                              { { wu->type, ur }, { wd->type, dr } });
+    };
+    const int combo = pick(up);
+    if (combo != pick(down) ||
         (gate && (gate->src[1] != x || gate->src[2] != ids || !ggml_are_same_shape(gate, up) ||
-            !ggml_are_same_shape(gate->src[0], wu) ||
-            combo != fg_pick_combo(ctx.stream(), GGML_TYPE_F32, ggml_sycl_src1_prec(gate), GGML_SYCL_FG_BN)))) {
+            !ggml_are_same_shape(gate->src[0], wu) || combo != pick(gate)))) {
         return false;
     }
     fg_visit_combo(combo, [&](auto s) {
