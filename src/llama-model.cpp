@@ -415,6 +415,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
+    static const std::regex pattern_kv_rot          ("cache_(\\w+_)?(k|v)_rot"); // KV rotation matrices, not per layer
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_gate_bias  ("blk\\.\\d*\\.attn_gate\\.bias");
@@ -505,6 +506,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     auto get_tensor_config = [&]() -> tensor_config {
         if (ud->model->arch == LLM_ARCH_HRM_TEXT) {
             // aliased cache slots cannot satisfy the meta-split invariants, so replicate all tensors
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
+        }
+        if (std::regex_match(tensor_name, pattern_kv_rot)) {
+            // the KV cache's n_rot x n_rot rotations (llama_kv_cache keeps them in backend buffers): one per cache,
+            // not per layer, so they carry no "_l<il>" and every device needs the whole matrix
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
         if (is_dsv4) {
