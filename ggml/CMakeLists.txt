@@ -258,6 +258,8 @@ set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
 set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
+set   (GGML_SYCL_DEVICE_CODE_SPLIT "" CACHE STRING
+                                            "ggml: sycl device code split (per_kernel, per_source, auto; empty: compiler default)")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
 option(GGML_ET                              "ggml: use ET backend"                            OFF)

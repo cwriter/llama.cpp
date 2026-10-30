@@ -783,6 +783,7 @@ User can use the device management in [docs/multi-gpu.md](https://github.com/ggm
 | GGML_SYCL          | ON (mandatory)                        | Enable build with SYCL code path.           |
 | GGML_SYCL_TARGET   | INTEL *(default)*                     | Set the SYCL target device type.            |
 | GGML_SYCL_DEVICE_ARCH | Optional                           | Set the SYCL device architecture. Setting the device architecture can improve the performance. See the table [--offload-arch](https://github.com/intel/llvm/blob/sycl/sycl/doc/design/OffloadDesign.md#--offload-arch) for a list of valid architectures. |
+| GGML_SYCL_DEVICE_CODE_SPLIT | per_kernel, per_source, auto (empty: compiler default) | Passed as `-fsycl-device-code-split`. Under JIT the default groups a source file's kernels into few large device images, and the first use of any kernel compiles its whole image; `per_kernel` compiles only the kernels a run uses, at the cost of a much longer link. |
 | GGML_SYCL_F16      | OFF *(default)* \|ON *(optional)*     | Enable FP16 build with SYCL code path. [1.](#sycl-f16-footnote) |
 | GGML_SYCL_GRAPH    | ON *(default)* \|OFF *(Optional)*     | Enable build with [SYCL Graph extension](https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/experimental/sycl_ext_oneapi_graph.asciidoc). |
 | GGML_SYCL_DNN      | ON *(default)* \|OFF *(Optional)*     | Enable build with oneDNN.                   |
