@@ -2426,8 +2426,11 @@ static const char * ggml_backend_sycl_split_buffer_type_get_name(ggml_backend_bu
     GGML_UNUSED(buft);
 }
 
+// A tensor without a buffer is the pool scratch of a fusion (an absorbed output, e.g. the MoE down
+// reduction's), which is device memory and never split. The per-expert MUL_MAT_ID fallback hands such
+// a dst and src1 to the ordinary matmul, which used to read buffer->buft here and segfault at 0x58.
 static bool ggml_backend_buffer_is_sycl_split(ggml_backend_buffer_t buffer) {
-   return buffer->buft->iface.get_name == ggml_backend_sycl_split_buffer_type_get_name;
+   return buffer != nullptr && buffer->buft->iface.get_name == ggml_backend_sycl_split_buffer_type_get_name;
 }
 
 static ggml_backend_buffer_t ggml_backend_sycl_split_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -3885,7 +3888,11 @@ static dpct::err0 ggml_sycl_cpy_tensor_2d(void *dst,
 
     dpct::memcpy_direction kind;
     char * src_ptr;
-    if (ggml_backend_buffer_is_host(src->buffer)) {
+    if (src->buffer == nullptr) {
+        // pool scratch of a fusion (see ggml_backend_buffer_is_sycl_split): device memory
+        kind    = dpct::device_to_device;
+        src_ptr = (char *) src->data;
+    } else if (ggml_backend_buffer_is_host(src->buffer)) {
         kind = dpct::host_to_device;
         //GGML_SYCL_DEBUG("%s: Host buffer type src tensor\n", __func__);
         src_ptr = (char *) src->data;
