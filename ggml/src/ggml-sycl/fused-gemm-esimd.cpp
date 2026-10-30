@@ -16,7 +16,8 @@
 // fg_reorder_a stage does, so the output is the same bits.
 //
 // A weight format is a gg_esimd_a<block> with: raw, the stored bits of the MR rows for one k step;
-// load(), which fetches them from the reorder (SoA) slice; and decode(), the f16 A of one row group.
+// load(), which fetches them from the expert's slice in either layout (gg_esimd::slice); and
+// decode(), the f16 A of one row group.
 // It reads the same streams at the same offsets as the fg_reorder_a stage of its format.
 static constexpr int GGML_SYCL_GG_KSPLIT = 4; // FG_KSPLIT of the joint_matrix kernel
 static constexpr int GGML_SYCL_GG_BN     = GGML_SYCL_FG_BN;
@@ -38,30 +39,98 @@ template <int I, int N> struct static_for {
     }
 };
 
-// Where one thread's rows sit in an expert's reorder slice. nblocks counts the stored blocks of the
-// slice, bpr those of one row.
+// One field of a format's block. In the reorder (SoA) layout it is a stream of its own, `size` bytes
+// a block, after `pre` bytes a block of the streams before it; in the canonical (AoS) layout it is
+// `aos` bytes into the block.
+struct field {
+    int pre;
+    int size;
+    int aos;
+};
+
+// Where one thread's rows sit in an expert's slice, in either layout. nblocks counts the stored blocks
+// of the slice, bpr those of one row, bs is the size of one block.
 struct slice {
     const uint8_t * x;
     int             M;
     int             bpr;
     int             nblocks;
     int             m0;
+    bool            aos;
+    int             bs;
 
-    // byte offsets of block ib of each of the MR rows in a stream of `size` bytes per block
-    ESIMD_INLINE simd<uint32_t, GG_MR> offsets(const int ib, const int size) const {
-        simd<uint32_t, GG_MR> o(0, (uint32_t) (bpr * size));
-        return o + (uint32_t) ((m0 * bpr + ib) * size);
+    // per row, the byte offset from x of byte `inner` of field f of block ib
+    ESIMD_INLINE simd<uint32_t, GG_MR> at(const field & f, const int ib, const int inner) const {
+        const int             stride = aos ? bs : f.size;
+        simd<uint32_t, GG_MR> o(0, (uint32_t) (bpr * stride));
+        return o + (uint32_t) ((aos ? f.aos : nblocks * f.pre) + (m0 * bpr + ib) * stride + inner);
     }
 
-    // a byte of each row at offsets o of stream s, read as part of its aligned dword
-    ESIMD_INLINE simd<uint32_t, GG_MR> bytes(const uint8_t * s, simd<uint32_t, GG_MR> o) const {
-        simd<uint32_t, GG_MR> w = gather<uint32_t, GG_MR>((const uint32_t *) s, o & ~3u);
-        return (w >> ((o & 3u) * 8)) & 0xffu;
+    // a field's bytes at offset `inner` start on a dword in every block (the AoS block and offset
+    // are multiples of 4); the SoA streams always do
+    ESIMD_INLINE bool dword_aligned(const field & f, const int inner) const {
+        return !aos || (bs % 4 == 0 && (f.aos + inner) % 4 == 0);
     }
 
-    // the MR x W dwords at dword column x of a stream whose rows are `row_bytes` long
-    template <int W> ESIMD_INLINE simd<uint32_t, GG_MR * W> rect(const uint8_t * s, const unsigned row_bytes, const int x) const {
-        return load_2d<uint32_t, W, GG_MR>((const uint32_t *) s, row_bytes - 1, M - 1, row_bytes - 1, x, m0);
+    ESIMD_INLINE simd<uint16_t, GG_MR> u16(const field & f, const int ib, const int inner) const {
+        return gather<uint16_t, GG_MR>((const uint16_t *) x, at(f, ib, inner));
+    }
+
+    ESIMD_INLINE simd<uint32_t, GG_MR> u32(const field & f, const int ib, const int inner) const {
+        if (dword_aligned(f, inner)) {
+            return gather<uint32_t, GG_MR>((const uint32_t *) x, at(f, ib, inner));
+        }
+        return rows<1>(f, ib, inner);
+    }
+
+    // W dwords of each of the MR rows from byte `inner` (a multiple of 4) of field f of block ib, as
+    // [row][W]. SoA: one 2D block message over the stream. AoS: the rows' dwords are gathered, as
+    // [W][row], at offsets rounded down to a dword (every field starts on an even byte), shifted by
+    // 16 bits where a row's block starts on 2 mod 4, and transposed with strided reads.
+    template <int W> ESIMD_INLINE simd<uint32_t, GG_MR * W> rows(const field & f, const int ib, const int inner) const {
+        if (!aos) {
+            const unsigned pitch = (unsigned) (bpr * f.size);
+            return load_2d<uint32_t, W, GG_MR>((const uint32_t *) (x + (size_t) nblocks * f.pre), pitch - 1, M - 1,
+                                               pitch - 1, (ib * f.size + inner) / 4, m0);
+        }
+        const simd<uint32_t, GG_MR> o = at(f, ib, inner);
+        simd<uint32_t, GG_MR * W>   g;
+        if (dword_aligned(f, inner)) {
+            g = gather<uint32_t, GG_MR * W, W>((const uint32_t *) x, o);
+        } else {
+            // per row: sh is 16 where the run starts on 2 mod 4, else 0; hm keeps the next dword's low
+            // half only where it is needed
+            const simd<uint32_t, GG_MR> oa = o & ~3u;
+            const simd<uint32_t, GG_MR> sh = (o & 2u) << 3;
+            const simd<uint32_t, GG_MR> hm = 0u - (sh >> 4);
+            simd<uint32_t, GG_MR * W>   lo = gather<uint32_t, GG_MR * W, W>((const uint32_t *) x, oa);
+            // the dword after the run holds its last 2 bytes where a row needs it; a row that does not
+            // reads its first dword again rather than past the field
+            const simd<uint32_t, GG_MR> tail = gather<uint32_t, GG_MR>((const uint32_t *) x, oa + ((4u * W) & hm));
+            auto shift = [&](auto vc) SYCL_ESIMD_FUNCTION {
+                constexpr int         v = decltype(vc)::value;
+                simd<uint32_t, GG_MR> a = lo.template select<GG_MR, 1>(v * GG_MR);
+                simd<uint32_t, GG_MR> b;
+                if constexpr (v + 1 < W) {
+                    b = lo.template select<GG_MR, 1>((v + 1) * GG_MR);
+                } else {
+                    b = tail;
+                }
+                g.template select<GG_MR, 1>(v * GG_MR) = (a >> sh) | ((b << 16) & hm);
+            };
+            static_for<0, W>::run(shift);
+        }
+        if constexpr (W == 1) {
+            return g;
+        } else {
+            simd<uint32_t, GG_MR * W> t;
+            auto row = [&](auto rc) SYCL_ESIMD_FUNCTION {
+                constexpr int r = decltype(rc)::value;
+                t.template select<W, 1>(r * W) = g.template select<W, GG_MR>(r);
+            };
+            static_for<0, GG_MR>::run(row);
+            return t;
+        }
     }
 };
 
@@ -193,13 +262,13 @@ template <> struct gg_esimd_a<block_q8_0> {
         gg_esimd::simd<uint32_t, GG_MR * 8> q;
         gg_esimd::simd<uint16_t, GG_MR>     d;
     };
-    static bool ok(const int K) { return K % qk == 0 && K >= 64; }
+    static constexpr gg_esimd::field QS = { 0, QK8_0, 2 }, D = { QK8_0, 2, 0 };
+    static bool ok(const int K, const bool aos) { return K % qk == 0 && (aos || K >= 64); }
     struct sb_t {};
     static ESIMD_INLINE void load_sb(sb_t &, const gg_esimd::slice &, const int) {}
     static ESIMD_INLINE void load(raw & r, sb_t &, const gg_esimd::slice & s, const int kb, const int) {
-        using namespace gg_esimd;
-        r.q = s.rect<8>(s.x, (unsigned) s.bpr * QK8_0, kb * 8);
-        r.d = gather<uint16_t, GG_MR>((const uint16_t *) (s.x + (size_t) s.nblocks * QK8_0), s.offsets(kb, 2));
+        r.q = s.rows<8>(QS, kb, 0);
+        r.d = s.u16(D, kb, 0);
     }
     // all MR x 32 quants at once: int8 -> half, times the row's scale. q * d needs at most 19
     // significant bits, so the f32 product the joint_matrix stage rounds to half is exact and one
@@ -224,15 +293,15 @@ template <> struct gg_esimd_a<block_iq4_nl> {
         gg_esimd::simd<uint32_t, GG_MR * 4>  q;
         gg_esimd::simd<sycl::half, GG_MR>    d;
     };
-    static bool ok(const int K) { return K % qk == 0 && K / 2 >= 64; }
+    static constexpr gg_esimd::field QS = { 0, QK4_NL / 2, 2 }, D = { QK4_NL / 2, 2, 0 };
+    static bool ok(const int K, const bool aos) { return K % qk == 0 && (aos || K / 2 >= 64); }
     struct sb_t {};
     static ESIMD_INLINE void load_sb(sb_t &, const gg_esimd::slice &, const int) {}
     static ESIMD_INLINE void load(raw & r, sb_t &, const gg_esimd::slice & s, const int kb, const int) {
         using namespace gg_esimd;
-        r.q = s.rect<4>(s.x, (unsigned) s.bpr * (QK4_NL / 2), kb * 4);
-        simd<uint16_t, GG_MR> d =
-            gather<uint16_t, GG_MR>((const uint16_t *) (s.x + (size_t) s.nblocks * (QK4_NL / 2)), s.offsets(kb, 2));
-        r.d = d.template bit_cast_view<sycl::half>();
+        r.q                     = s.rows<4>(QS, kb, 0);
+        simd<uint16_t, GG_MR> d = s.u16(D, kb, 0);
+        r.d                     = d.template bit_cast_view<sycl::half>();
     }
     // the codebook values are integers below 128, exact in half, and d * value has at most 18
     // significant bits: one correctly rounded half multiply is the stage's f32 product rounded
@@ -265,18 +334,19 @@ template <> struct gg_esimd_a<block_iq4_xs> {
         gg_esimd::simd<uint32_t, GG_MR> sh; // scales_h
         gg_esimd::simd<uint32_t, GG_MR> sl; // scales_l, 4 bytes
     };
-    static bool ok(const int K) { return K % qk == 0; }
+    static constexpr gg_esimd::field QS = { 0, QK_K / 2, 8 }, D = { QK_K / 2, 2, 0 }, SH = { QK_K / 2 + 2, 2, 2 },
+                                     SL = { QK_K / 2 + 4, 4, 4 };
+    static bool ok(const int K, const bool) { return K % qk == 0; }
     static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib) {
         using namespace gg_esimd;
-        const size_t          nb = s.nblocks;
-        simd<uint16_t, GG_MR> dh = gather<uint16_t, GG_MR>((const uint16_t *) (s.x + nb * 128), s.offsets(ib, 2));
+        simd<uint16_t, GG_MR> dh = s.u16(D, ib, 0);
         sb.d  = simd<sycl::half, GG_MR>(dh.template bit_cast_view<sycl::half>());
-        sb.sh = gather<uint16_t, GG_MR>((const uint16_t *) (s.x + nb * 130), s.offsets(ib, 2));
-        sb.sl = gather<uint32_t, GG_MR>((const uint32_t *) (s.x + nb * 132), s.offsets(ib, 4));
+        sb.sh = s.u16(SH, ib, 0);
+        sb.sl = s.u32(SL, ib, 0);
     }
     static ESIMD_INLINE void load(raw & r, sb_t & sb, const gg_esimd::slice & s, const int kb, const int j) {
         using namespace gg_esimd;
-        r.q = s.rect<4>(s.x, (unsigned) s.bpr * (QK_K / 2), (kb / 8) * 32 + j * 4);
+        r.q = s.rows<4>(QS, kb / 8, 16 * j);
         // d * (6-bit scale - 32), in f32 as the stage computes it
         simd<int32_t, GG_MR> sc = simd<int32_t, GG_MR>(((sb.sl >> (4 * j)) & 0xf) | (((sb.sh >> (2 * j)) & 3) << 4)) - 32;
         r.d = sb.d * simd<float, GG_MR>(sc);
@@ -320,25 +390,30 @@ template <> struct gg_esimd_a<block_iq3_s> {
         gg_esimd::simd<float, GG_MR>    d;
         gg_esimd::simd<uint32_t, GG_MR> sc; // the 4 scale bytes
     };
-    // the qh and signs streams are 2D surfaces: their row pitches must be 16-byte aligned
-    static bool ok(const int K) { return K % qk == 0 && (K / QK_K * 8) % 16 == 0 && K / QK_K * 8 >= 64; }
+    // the SoA stream {d, scales} is d and scales of the block in AoS, which are not adjacent there: MS
+    // reads the scales at their SoA offset 2 in the stream, which is AoS offset 2 past 104
+    static constexpr int             META = QK_K / 4 + QK_K / 32 + QK_K / 8;
+    static constexpr gg_esimd::field QS = { 0, QK_K / 4, 2 }, QH = { QK_K / 4, QK_K / 32, 2 + QK_K / 4 },
+                                     SG = { QK_K / 4 + QK_K / 32, QK_K / 8, 2 + QK_K / 4 + QK_K / 32 },
+                                     MD = { META, 2 + IQ3S_N_SCALE, 0 }, MS = { META, 2 + IQ3S_N_SCALE, META };
+    // the SoA qh and signs streams are 2D surfaces: their row pitches must be 16-byte aligned
+    static bool ok(const int K, const bool aos) {
+        return K % qk == 0 && (aos || ((K / QK_K * 8) % 16 == 0 && K / QK_K * 8 >= 64));
+    }
     static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib) {
         using namespace gg_esimd;
-        const uint8_t *       meta = s.x + (size_t) s.nblocks * (QK_K / 4 + QK_K / 32 + QK_K / 8);
-        simd<uint32_t, GG_MR> mo   = s.offsets(ib, 2 + IQ3S_N_SCALE);
-        simd<uint16_t, GG_MR> dh   = gather<uint16_t, GG_MR>((const uint16_t *) meta, mo);
-        simd<uint32_t, GG_MR> s0   = gather<uint16_t, GG_MR>((const uint16_t *) meta, mo + 2u);
-        simd<uint32_t, GG_MR> s1   = gather<uint16_t, GG_MR>((const uint16_t *) meta, mo + 4u);
+        simd<uint16_t, GG_MR> dh = s.u16(MD, ib, 0);
+        simd<uint32_t, GG_MR> s0 = s.u16(MS, ib, 2);
+        simd<uint32_t, GG_MR> s1 = s.u16(MS, ib, 4);
         sb.d  = simd<sycl::half, GG_MR>(dh.template bit_cast_view<sycl::half>());
         sb.sc = s0 | (s1 << 16);
     }
     static ESIMD_INLINE void load(raw & r, sb_t & sb, const gg_esimd::slice & s, const int kb, const int j) {
         using namespace gg_esimd;
-        const size_t nb = s.nblocks;
-        const int    ib = kb / 8;
-        r.q     = s.rect<2>(s.x, (unsigned) s.bpr * (QK_K / 4), ib * 16 + j * 2);
-        r.qh    = (s.rect<1>(s.x + nb * (QK_K / 4), (unsigned) s.bpr * (QK_K / 32), ib * 2 + j / 4) >> (8 * (j % 4))) & 0xffu;
-        r.signs = s.rect<1>(s.x + nb * (QK_K / 4 + QK_K / 32), (unsigned) s.bpr * (QK_K / 8), ib * 8 + j);
+        const int ib = kb / 8;
+        r.q     = s.rows<2>(QS, ib, 8 * j);
+        r.qh    = (s.rows<1>(QH, ib, 4 * (j / 4)) >> (8 * (j % 4))) & 0xffu;
+        r.signs = s.rows<1>(SG, ib, 4 * j);
         r.d     = sb.d * simd<float, GG_MR>(simd<int32_t, GG_MR>(1 + 2 * ((sb.sc >> (4 * j)) & 0xf)));
     }
     template <int g> static ESIMD_INLINE gg_esimd::a_halves decode(raw & r) {
@@ -375,17 +450,17 @@ template <> struct gg_esimd_a<block_q4_K> {
         gg_esimd::simd<uint32_t, GG_MR> sc[3]; // the 12 scale bytes
         gg_esimd::simd<float, GG_MR>    dall, dmin;
     };
-    static bool ok(const int K) { return K % qk == 0 && gg_esimd::surface_ok(K / 2); }
-    static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib, const int qbytes = 128) {
+    static constexpr gg_esimd::field QS = { 0, QK_K / 2, 16 }, SC = { QK_K / 2, K_SCALE_SIZE, 4 },
+                                     DM = { QK_K / 2 + K_SCALE_SIZE, 4, 0 };
+    static bool ok(const int K, const bool aos) { return K % qk == 0 && (aos || gg_esimd::surface_ok(K / 2)); }
+    static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib, const gg_esimd::field & sc = SC,
+                                     const gg_esimd::field & dmf = DM) {
         using namespace gg_esimd;
-        const size_t          nb = s.nblocks;
-        simd<uint32_t, GG_MR> so = s.offsets(ib, K_SCALE_SIZE);
-        const uint32_t *      sp = (const uint32_t *) (s.x + nb * qbytes);
 #pragma unroll
         for (int w = 0; w < 3; ++w) {
-            sb.sc[w] = gather<uint32_t, GG_MR>(sp, so + (uint32_t) (4 * w));
+            sb.sc[w] = s.u32(sc, ib, 4 * w);
         }
-        simd<uint32_t, GG_MR> dm = gather<uint32_t, GG_MR>((const uint32_t *) (s.x + nb * (qbytes + K_SCALE_SIZE)), s.offsets(ib, 4));
+        simd<uint32_t, GG_MR> dm = s.u32(dmf, ib, 0);
         auto                  dh = dm.template bit_cast_view<sycl::half>();
         sb.dall                  = simd<sycl::half, GG_MR>(dh.template select<GG_MR, 2>(0));
         sb.dmin                  = simd<sycl::half, GG_MR>(dh.template select<GG_MR, 2>(1));
@@ -407,7 +482,7 @@ template <> struct gg_esimd_a<block_q4_K> {
     }
     static ESIMD_INLINE void load(raw & r, sb_t & sb, const gg_esimd::slice & s, const int kb, const int j) {
         using namespace gg_esimd;
-        r.q = (s.rect<8>(s.x, (unsigned) s.bpr * (QK_K / 2), (kb / 8) * 32 + 8 * (j / 2)) >> (4 * (j & 1))) & 0x0F0F0F0Fu;
+        r.q = (s.rows<8>(QS, kb / 8, 32 * (j / 2)) >> (4 * (j & 1))) & 0x0F0F0F0Fu;
         scale_min(sb, j, r.d, r.m);
     }
     template <int g> static ESIMD_INLINE gg_esimd::a_halves decode(raw & r) {
@@ -427,15 +502,18 @@ template <> struct gg_esimd_a<block_q5_K> {
     static ESIMD_INLINE void init_slm() {}
     using raw  = q4::raw;
     using sb_t = q4::sb_t;
-    static bool ok(const int K) { return K % qk == 0 && gg_esimd::surface_ok(K / 2) && gg_esimd::surface_ok(K / 8); }
-    static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib) {
-        q4::load_sb(sb, s, ib, QK_K / 2 + QK_K / 8);
+    static constexpr gg_esimd::field QS = { 0, QK_K / 2, 48 }, QH = { QK_K / 2, QK_K / 8, 16 },
+                                     SC = { QK_K / 2 + QK_K / 8, K_SCALE_SIZE, 4 },
+                                     DM = { QK_K / 2 + QK_K / 8 + K_SCALE_SIZE, 4, 0 };
+    static bool ok(const int K, const bool aos) {
+        return K % qk == 0 && (aos || (gg_esimd::surface_ok(K / 2) && gg_esimd::surface_ok(K / 8)));
     }
+    static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib) { q4::load_sb(sb, s, ib, SC, DM); }
     static ESIMD_INLINE void load(raw & r, sb_t & sb, const gg_esimd::slice & s, const int kb, const int j) {
         using namespace gg_esimd;
-        const int             ib = kb / 8;
-        simd<uint32_t, GG_MR * 8> qh = s.rect<8>(s.x + (size_t) s.nblocks * (QK_K / 2), (unsigned) s.bpr * (QK_K / 8), ib * 8);
-        r.q = ((s.rect<8>(s.x, (unsigned) s.bpr * (QK_K / 2), ib * 32 + 8 * (j / 2)) >> (4 * (j & 1))) & 0x0F0F0F0Fu) |
+        const int                 ib = kb / 8;
+        simd<uint32_t, GG_MR * 8> qh = s.rows<8>(QH, ib, 0);
+        r.q = ((s.rows<8>(QS, ib, 32 * (j / 2)) >> (4 * (j & 1))) & 0x0F0F0F0Fu) |
               (((qh >> j) & 0x01010101u) << 4);
         q4::scale_min(sb, j, r.d, r.m);
     }
@@ -459,25 +537,26 @@ template <> struct gg_esimd_a<block_q6_K> {
         gg_esimd::simd<uint32_t, GG_MR> sc[4]; // the 16 int8 scales
         gg_esimd::simd<float, GG_MR>    d;
     };
-    static bool ok(const int K) { return K % qk == 0 && gg_esimd::surface_ok(K / 2) && gg_esimd::surface_ok(K / 4); }
+    static constexpr gg_esimd::field QL = { 0, QK_K / 2, 0 }, QH = { QK_K / 2, QK_K / 4, QK_K / 2 },
+                                     SC = { QK_K / 2 + QK_K / 4, QK_K / 16, QK_K / 2 + QK_K / 4 },
+                                     D = { QK_K / 2 + QK_K / 4 + QK_K / 16, 2, QK_K / 2 + QK_K / 4 + QK_K / 16 };
+    static bool ok(const int K, const bool aos) {
+        return K % qk == 0 && (aos || (gg_esimd::surface_ok(K / 2) && gg_esimd::surface_ok(K / 4)));
+    }
     static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib) {
         using namespace gg_esimd;
-        const size_t          nb = s.nblocks;
-        simd<uint32_t, GG_MR> so = s.offsets(ib, QK_K / 16);
-        const uint32_t *      sp = (const uint32_t *) (s.x + nb * (QK_K / 2 + QK_K / 4));
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
-            sb.sc[w] = gather<uint32_t, GG_MR>(sp, so + (uint32_t) (4 * w));
+            sb.sc[w] = s.u32(SC, ib, 4 * w);
         }
-        simd<uint16_t, GG_MR> dh = gather<uint16_t, GG_MR>((const uint16_t *) (s.x + nb * (QK_K / 2 + QK_K / 4 + QK_K / 16)),
-                                                           s.offsets(ib, 2));
+        simd<uint16_t, GG_MR> dh = s.u16(D, ib, 0);
         sb.d = simd<sycl::half, GG_MR>(dh.template bit_cast_view<sycl::half>());
     }
     static ESIMD_INLINE void load(raw & r, sb_t & sb, const gg_esimd::slice & s, const int kb, const int j) {
         using namespace gg_esimd;
         const int ib = kb / 8, h = j / 4, q = j % 4;
-        simd<uint32_t, GG_MR * 8> ql = s.rect<8>(s.x, (unsigned) s.bpr * (QK_K / 2), ib * 32 + 16 * h + 8 * (q & 1));
-        simd<uint32_t, GG_MR * 8> qh = s.rect<8>(s.x + (size_t) s.nblocks * (QK_K / 2), (unsigned) s.bpr * (QK_K / 4), ib * 16 + 8 * h);
+        simd<uint32_t, GG_MR * 8> ql = s.rows<8>(QL, ib, 64 * h + 32 * (q & 1));
+        simd<uint32_t, GG_MR * 8> qh = s.rows<8>(QH, ib, 32 * h);
         r.q = ((ql >> (4 * (q >> 1))) & 0x0F0F0F0Fu) | (((qh >> (2 * q)) & 0x03030303u) << 4);
         // scales 2j and 2j + 1: bytes 2 (j % 2) and 2 (j % 2) + 1 of dword j / 2, sign extended
         simd<uint32_t, GG_MR> w  = dword_of(sb.sc, j / 2);
@@ -510,24 +589,23 @@ template <> struct gg_esimd_a<block_q2_K> {
         gg_esimd::simd<uint32_t, GG_MR> sc[4];
         gg_esimd::simd<float, GG_MR>    d, dmin;
     };
-    static bool ok(const int K) { return K % qk == 0 && gg_esimd::surface_ok(K / 4); }
+    static constexpr gg_esimd::field QS = { 0, QK_K / 4, QK_K / 16 }, SC = { QK_K / 4, QK_K / 16, 0 },
+                                     DM = { QK_K / 4 + QK_K / 16, 4, QK_K / 4 + QK_K / 16 };
+    static bool ok(const int K, const bool aos) { return K % qk == 0 && (aos || gg_esimd::surface_ok(K / 4)); }
     static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib) {
         using namespace gg_esimd;
-        const size_t          nb = s.nblocks;
-        simd<uint32_t, GG_MR> so = s.offsets(ib, QK_K / 16);
-        const uint32_t *      sp = (const uint32_t *) (s.x + nb * (QK_K / 4));
 #pragma unroll
         for (int w = 0; w < 4; ++w) {
-            sb.sc[w] = gather<uint32_t, GG_MR>(sp, so + (uint32_t) (4 * w));
+            sb.sc[w] = s.u32(SC, ib, 4 * w);
         }
-        simd<uint32_t, GG_MR> dm = gather<uint32_t, GG_MR>((const uint32_t *) (s.x + nb * (QK_K / 4 + QK_K / 16)), s.offsets(ib, 4));
+        simd<uint32_t, GG_MR> dm = s.u32(DM, ib, 0);
         auto                  dh = dm.template bit_cast_view<sycl::half>();
         sb.d                     = simd<sycl::half, GG_MR>(dh.template select<GG_MR, 2>(0));
         sb.dmin                  = simd<sycl::half, GG_MR>(dh.template select<GG_MR, 2>(1));
     }
     static ESIMD_INLINE void load(raw & r, sb_t & sb, const gg_esimd::slice & s, const int kb, const int j) {
         using namespace gg_esimd;
-        r.q = (s.rect<8>(s.x, (unsigned) s.bpr * (QK_K / 4), (kb / 8) * 16 + 8 * (j / 4)) >> (2 * (j % 4))) & 0x03030303u;
+        r.q = (s.rows<8>(QS, kb / 8, 32 * (j / 4)) >> (2 * (j % 4))) & 0x03030303u;
         simd<uint32_t, GG_MR> w  = dword_of(sb.sc, j / 2);
         simd<uint32_t, GG_MR> s0 = byte_of(w, 2 * (j % 2)), s1 = byte_of(w, 2 * (j % 2) + 1);
         r.d0 = sb.d * simd<float, GG_MR>(s0 & 0xf);
@@ -559,19 +637,20 @@ template <> struct gg_esimd_a<block_q3_K> {
         gg_esimd::simd<uint32_t, GG_MR> sc[4]; // 12 scale bytes, sc[3] unused
         gg_esimd::simd<float, GG_MR>    d;
     };
-    static bool ok(const int K) { return K % qk == 0 && gg_esimd::surface_ok(K / 4) && gg_esimd::surface_ok(K / 8); }
+    static constexpr gg_esimd::field QS = { 0, QK_K / 4, QK_K / 8 }, HM = { QK_K / 4, QK_K / 8, 0 },
+                                     SC = { QK_K / 4 + QK_K / 8, 12, QK_K / 4 + QK_K / 8 },
+                                     D = { QK_K / 4 + QK_K / 8 + 12, 2, QK_K / 4 + QK_K / 8 + 12 };
+    static bool ok(const int K, const bool aos) {
+        return K % qk == 0 && (aos || (gg_esimd::surface_ok(K / 4) && gg_esimd::surface_ok(K / 8)));
+    }
     static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib) {
         using namespace gg_esimd;
-        const size_t          nb = s.nblocks;
-        simd<uint32_t, GG_MR> so = s.offsets(ib, 12);
-        const uint32_t *      sp = (const uint32_t *) (s.x + nb * (QK_K / 4 + QK_K / 8));
 #pragma unroll
         for (int w = 0; w < 3; ++w) {
-            sb.sc[w] = gather<uint32_t, GG_MR>(sp, so + (uint32_t) (4 * w));
+            sb.sc[w] = s.u32(SC, ib, 4 * w);
         }
         sb.sc[3] = 0;
-        simd<uint16_t, GG_MR> dh = gather<uint16_t, GG_MR>((const uint16_t *) (s.x + nb * (QK_K / 4 + QK_K / 8 + 12)),
-                                                           s.offsets(ib, 2));
+        simd<uint16_t, GG_MR> dh = s.u16(D, ib, 0);
         sb.d = simd<sycl::half, GG_MR>(dh.template bit_cast_view<sycl::half>());
     }
     static ESIMD_INLINE gg_esimd::simd<float, GG_MR> scale(sb_t & sb, const int sidx) {
@@ -583,8 +662,8 @@ template <> struct gg_esimd_a<block_q3_K> {
     static ESIMD_INLINE void load(raw & r, sb_t & sb, const gg_esimd::slice & s, const int kb, const int j) {
         using namespace gg_esimd;
         const int                 ib = kb / 8;
-        simd<uint32_t, GG_MR * 8> hm = s.rect<8>(s.x + (size_t) s.nblocks * (QK_K / 4), (unsigned) s.bpr * (QK_K / 8), ib * 8);
-        r.q = ((s.rect<8>(s.x, (unsigned) s.bpr * (QK_K / 4), ib * 16 + 8 * (j / 4)) >> (2 * (j % 4))) & 0x03030303u) |
+        simd<uint32_t, GG_MR * 8> hm = s.rows<8>(HM, ib, 0);
+        r.q = ((s.rows<8>(QS, ib, 32 * (j / 4)) >> (2 * (j % 4))) & 0x03030303u) |
               (((hm >> j) & 0x01010101u) << 2);
         r.d0 = scale(sb, 2 * j);
         r.d1 = scale(sb, 2 * j + 1);
@@ -629,18 +708,18 @@ template <> struct gg_esimd_a<block_iq3_xxs> {
     struct sb_t {
         gg_esimd::simd<float, GG_MR> d;
     };
-    static bool ok(const int K) { return K % qk == 0 && gg_esimd::surface_ok(K / QK_K * 96); }
+    static constexpr gg_esimd::field QS = { 0, 3 * QK_K / 8, 2 }, D = { 3 * QK_K / 8, 2, 0 };
+    static bool ok(const int K, const bool aos) { return K % qk == 0 && (aos || gg_esimd::surface_ok(K / QK_K * 96)); }
     static ESIMD_INLINE void load_sb(sb_t & sb, const gg_esimd::slice & s, const int ib) {
         using namespace gg_esimd;
-        simd<uint16_t, GG_MR> dh = gather<uint16_t, GG_MR>((const uint16_t *) (s.x + (size_t) s.nblocks * 96), s.offsets(ib, 2));
+        simd<uint16_t, GG_MR> dh = s.u16(D, ib, 0);
         sb.d = simd<sycl::half, GG_MR>(dh.template bit_cast_view<sycl::half>());
     }
     static ESIMD_INLINE void load(raw & r, sb_t & sb, const gg_esimd::slice & s, const int kb, const int j) {
         using namespace gg_esimd;
-        const int      ib = kb / 8;
-        const unsigned pw = (unsigned) s.bpr * 96;
-        r.q   = s.rect<2>(s.x, pw, ib * 24 + 2 * j);
-        r.aux = s.rect<1>(s.x, pw, ib * 24 + 16 + j);
+        const int ib = kb / 8;
+        r.q   = s.rows<2>(QS, ib, 8 * j);
+        r.aux = s.rows<1>(QS, ib, 64 + 4 * j);
         r.d   = sb.d * (0.5f + simd<float, GG_MR>(r.aux >> 28)) * 0.5f;
     }
     template <int g> static ESIMD_INLINE gg_esimd::a_halves decode(raw & r) {
@@ -659,8 +738,9 @@ template <> struct gg_esimd_a<block_iq3_xxs> {
 };
 
 // T is the dpas operand type, sycl::half or bfloat16: the type B is packed in. A is decoded in half
-// either way and converted for bf16 (see the double rounding note at the conversion).
-template <typename block_q_t, int KS, typename T> struct grouped_gemm_esimd_kernel {
+// either way and converted for bf16 (see the double rounding note at the conversion). AOS: the weight
+// is in the canonical block layout rather than the reorder (SoA) one.
+template <typename block_q_t, int KS, typename T, bool AOS> struct grouped_gemm_esimd_kernel {
     using F = gg_esimd_a<block_q_t>;
 
     const char *              src0_dd;
@@ -700,9 +780,10 @@ template <typename block_q_t, int KS, typename T> struct grouped_gemm_esimd_kern
         }
         const int b0 = tight ? tile.n0 : t * BN;
 
-        // the reorder (SoA) slice of this expert
+        // the slice of this expert
         const int             bpr = K / F::qk;
-        const gg_esimd::slice sl  = { (const uint8_t *) src0_dd + (size_t) tile.expert * expert_stride, M, bpr, M * bpr, m0 };
+        const gg_esimd::slice sl  = { (const uint8_t *) src0_dd + (size_t) tile.expert * expert_stride, M, bpr, M * bpr, m0,
+                                      AOS, (int) sizeof(block_q_t) };
         const uint32_t *      bp  = (const uint32_t *) packed;
         const unsigned        bw  = (unsigned) Npad * 4; // bytes of one packed B row
         const int             nstep = K / GG_QK;
@@ -872,7 +953,7 @@ template <typename block_q_t, int KS, typename T> struct grouped_gemm_esimd_kern
 // between the two. One thread holding both products' accumulators kept too few registers for loads
 // in flight and ran 1.5x slower than two separate launches, and interleaving the products' k steps
 // in one thread evicted the weight lines from L1 between steps (6.8x slower with distinct weights).
-template <typename block_q_t> struct gate_up_esimd_kernel {
+template <typename block_q_t, bool AOS> struct gate_up_esimd_kernel {
     using F = gg_esimd_a<block_q_t>;
     static constexpr int SLM_X  = (F::slm_bytes + 63) / 64 * 64; // the exchange, past the format's table
     static constexpr int X_SIZE = GG_MR * GGML_SYCL_GG_BN * sizeof(float);
@@ -920,7 +1001,7 @@ template <typename block_q_t> struct gate_up_esimd_kernel {
         const int             rows = merged ? 2 * FR : FR; // rows of one reorder slice
         const char *          base = q == 0 ? gate : up;
         const gg_esimd::slice sl   = { (const uint8_t *) base + (size_t) tile.expert * expert_stride, rows, bpr, rows * bpr,
-                                       m0 + (merged && q == 1 ? FR : 0) };
+                                       m0 + (merged && q == 1 ? FR : 0), AOS, (int) sizeof(block_q_t) };
         const uint32_t *      bp    = (const uint32_t *) input;
         const unsigned        bw    = (unsigned) Npad * 4;
         const int             nstep = K / GG_QK;
@@ -1024,18 +1105,31 @@ template <typename block_q_t> struct gate_up_esimd_kernel {
     auto get(syclexp::properties_tag) const { return syclexp::properties{ sycl::ext::intel::experimental::grf_size<256> }; }
 };
 
+// the weights' surfaces: 2D block loads (SoA) want 64-byte aligned bases, the AoS dword gathers 4
+static bool gg_esimd_weights_ok(const char * w, const size_t expert_stride, const bool reordered) {
+    const size_t a = reordered ? 64 : 4;
+    return (uintptr_t) w % a == 0 && expert_stride % a == 0;
+}
+
 template <typename block_q_t>
 bool ggml_sycl_gate_up_esimd(const char * gate, const char * up, size_t expert_stride, const ggml_sycl_gg_tile * tiles,
                              const sycl::half * input, sycl::half * output, int F, int K, int Npad, bool merged,
-                             int64_t n_tiles, dpct::queue_ptr stream) {
+                             bool reordered, int64_t n_tiles, dpct::queue_ptr stream) {
     using FT = gg_esimd_a<block_q_t>;
-    if (F % GG_MR != 0 || !FT::ok(K) || ((uintptr_t) gate % 64) != 0 || ((uintptr_t) up % 64) != 0 ||
-        expert_stride % 64 != 0 || ((uintptr_t) input % 64) != 0 || ((uintptr_t) output % 64) != 0 || Npad % 16 != 0) {
+    if (F % GG_MR != 0 || !FT::ok(K, !reordered) || !gg_esimd_weights_ok(gate, expert_stride, reordered) ||
+        !gg_esimd_weights_ok(up, expert_stride, reordered) || ((uintptr_t) input % 64) != 0 ||
+        ((uintptr_t) output % 64) != 0 || Npad % 16 != 0) {
         return false;
     }
     const size_t groups = (size_t) n_tiles * (F / GG_MR);
-    stream->parallel_for(sycl::nd_range<1>(groups * 2, 2), gate_up_esimd_kernel<block_q_t>{ gate, up, expert_stride, tiles,
-                                                                                           input, output, F, K, Npad, merged });
+    const sycl::nd_range<1> range(groups * 2, 2);
+    if (reordered) {
+        stream->parallel_for(range, gate_up_esimd_kernel<block_q_t, false>{ gate, up, expert_stride, tiles, input, output,
+                                                                           F, K, Npad, merged });
+    } else {
+        stream->parallel_for(range, gate_up_esimd_kernel<block_q_t, true>{ gate, up, expert_stride, tiles, input, output,
+                                                                          F, K, Npad, merged });
+    }
     return true;
 }
 
@@ -1049,52 +1143,56 @@ bool ggml_sycl_grouped_gemm_esimd_enabled() {
     return ggml_sycl_grouped_gemm_esimd_mode() != 0;
 }
 
-template <typename block_q_t, typename T>
-static bool grouped_gemm_esimd_launch(const char * src0_dd, size_t expert_stride, const ggml_sycl_gg_tile * tiles,
+template <typename block_q_t, typename T, bool AOS>
+static void grouped_gemm_esimd_launch(const char * src0_dd, size_t expert_stride, const ggml_sycl_gg_tile * tiles,
                                       const T * packed, float * dst, int M, int Npad, int K, bool tight,
                                       const ggml_sycl_gg_rows & dst_rows, int64_t n_tiles, dpct::queue_ptr stream) {
-    using F = gg_esimd_a<block_q_t>;
-    // whole row groups and stored blocks, every K-split range non-empty (also in mode 1, so both
-    // modes take the same shapes); 2D block loads want
-    // 64-byte aligned surfaces and pitches
-    if (M % GG_MR != 0 || !F::ok(K) || K < GG_QK * GGML_SYCL_GG_KSPLIT || ((uintptr_t) src0_dd % 64) != 0 ||
-        expert_stride % 64 != 0 || ((uintptr_t) packed % 64) != 0 || Npad % 16 != 0) {
-        return false;
-    }
-    const size_t threads = (size_t) n_tiles * (M / GG_MR);
+    const sycl::nd_range<1> range((size_t) n_tiles * (M / GG_MR), 1);
     if (ggml_sycl_grouped_gemm_esimd_mode() == 2) {
-        stream->parallel_for(sycl::nd_range<1>(threads, 1),
-                             grouped_gemm_esimd_kernel<block_q_t, GGML_SYCL_GG_KSPLIT, T>{
-                                 src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, tight, dst_rows });
+        stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, GGML_SYCL_GG_KSPLIT, T, AOS>{
+                                        src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, tight, dst_rows });
     } else {
-        stream->parallel_for(sycl::nd_range<1>(threads, 1),
-                             grouped_gemm_esimd_kernel<block_q_t, 1, T>{ src0_dd, expert_stride, tiles, packed, dst, M,
-                                                                      Npad, K, tight, dst_rows });
+        stream->parallel_for(range, grouped_gemm_esimd_kernel<block_q_t, 1, T, AOS>{
+                                        src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, tight, dst_rows });
     }
-    return true;
 }
 
 template <typename block_q_t, typename T>
 bool ggml_sycl_grouped_gemm_esimd(const char * src0_dd, size_t expert_stride, const ggml_sycl_gg_tile * tiles,
                                   const T * packed, float * dst, int M, int Npad, int K, bool tight,
-                                  const ggml_sycl_gg_rows & dst_rows, int64_t n_tiles, dpct::queue_ptr stream) {
+                                  const ggml_sycl_gg_rows & dst_rows, bool reordered, int64_t n_tiles,
+                                  dpct::queue_ptr stream) {
     static_assert(gg_esimd_a<block_q_t>::supported == ggml_sycl_grouped_gemm_esimd_has<block_q_t>,
                   "the header's format list and the formats implemented here must agree");
-    return grouped_gemm_esimd_launch<block_q_t, T>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, tight,
-                                                   dst_rows, n_tiles, stream);
+    using F = gg_esimd_a<block_q_t>;
+    // whole row groups and stored blocks, every K-split range non-empty (also in mode 1, so both
+    // modes take the same shapes); B is read with 2D block loads, which want 64-byte aligned
+    // surfaces and pitches
+    if (M % GG_MR != 0 || !F::ok(K, !reordered) || K < GG_QK * GGML_SYCL_GG_KSPLIT ||
+        !gg_esimd_weights_ok(src0_dd, expert_stride, reordered) || ((uintptr_t) packed % 64) != 0 || Npad % 16 != 0) {
+        return false;
+    }
+    if (reordered) {
+        grouped_gemm_esimd_launch<block_q_t, T, false>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, tight,
+                                                       dst_rows, n_tiles, stream);
+    } else {
+        grouped_gemm_esimd_launch<block_q_t, T, true>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K, tight,
+                                                      dst_rows, n_tiles, stream);
+    }
+    return true;
 }
 
 #define GG_ESIMD_INSTANCE_T(block_q_t, T)                                                                         \
     template bool ggml_sycl_grouped_gemm_esimd<block_q_t, T>(const char *, size_t, const ggml_sycl_gg_tile *,       \
                                                              const T *, float *, int, int, int, bool,               \
-                                                             const ggml_sycl_gg_rows &, int64_t, dpct::queue_ptr);
+                                                             const ggml_sycl_gg_rows &, bool, int64_t, dpct::queue_ptr);
 #define GG_ESIMD_INSTANCE(block_q_t)              \
     GG_ESIMD_INSTANCE_T(block_q_t, sycl::half) \
     GG_ESIMD_INSTANCE_T(block_q_t, sycl::ext::oneapi::bfloat16)
 #define GG_ESIMD_GATE_UP_INSTANCE(block_q_t)                                                                     \
     template bool ggml_sycl_gate_up_esimd<block_q_t>(const char *, const char *, size_t, const ggml_sycl_gg_tile *, \
-                                                     const sycl::half *, sycl::half *, int, int, int, bool, int64_t, \
-                                                     dpct::queue_ptr);
+                                                     const sycl::half *, sycl::half *, int, int, int, bool, bool,  \
+                                                     int64_t, dpct::queue_ptr);
 GG_ESIMD_GATE_UP_INSTANCE(block_iq3_s)
 GG_ESIMD_GATE_UP_INSTANCE(block_q8_0)
 GG_ESIMD_GATE_UP_INSTANCE(block_q4_K)

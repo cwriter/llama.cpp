@@ -2388,14 +2388,10 @@ static int fg_esimd_remap(dpct::queue_ptr stream, int combo, std::initializer_li
     }
     for (const auto & [type, reordered] : weights) {
         bool covered = false;
-        if (reordered) {
-            fg_visit_type(type, true, [&](auto tag) {
-                using T = decltype(tag);
-                if constexpr (T::reordered) {
-                    covered = ggml_sycl_grouped_gemm_esimd_has<typename T::type>;
-                }
-            });
-        }
+        fg_visit_type(type, reordered, [&](auto tag) {
+            using T = decltype(tag);
+            covered = ggml_sycl_grouped_gemm_esimd_has<typename T::type>;
+        });
         if (!covered) {
             return combo;
         }
@@ -2653,11 +2649,12 @@ template <typename S> struct grouped_gemm_launcher {
     }
 
     template <typename block_q_t, bool reordered> void run() const {
-        if constexpr (fg_esimd_combo<S>() && reordered && ggml_sycl_grouped_gemm_esimd_has<block_q_t>) {
-            // the register-operand ESIMD kernel: no SLM A image (GGML_SYCL_MMID_ESIMD)
+        if constexpr (fg_esimd_combo<S>() && ggml_sycl_grouped_gemm_esimd_has<block_q_t>) {
+            // the register-operand ESIMD kernel, either weight layout: no SLM A image (GGML_SYCL_MMID_ESIMD)
             if (ggml_sycl_grouped_gemm_esimd_enabled() && !arms.diag_no_a && !arms.diag_no_mad &&
                 ggml_sycl_grouped_gemm_esimd<block_q_t, typename S::tsb>(src0_dd, expert_stride, tiles, packed, dst, M,
-                                                                         Npad, K, tight, dst_rows, n_tiles, stream)) {
+                                                                         Npad, K, tight, dst_rows, reordered, n_tiles,
+                                                                         stream)) {
                 return;
             }
         }
@@ -3254,14 +3251,13 @@ static bool fg_gate_up_pack(const ggml_tensor * wu, const ggml_tensor * wg, bool
     static const bool reuse_c = ggml_sycl_get_env("GGML_SYCL_MMID_GATE_UP_REDUCE_REUSE", 1) != 0;
     auto launch = [&](auto tag) {
         using T = decltype(tag);
-        if constexpr (T::reordered && (std::is_same_v<typename T::type, block_iq3_s> ||
-                                       std::is_same_v<typename T::type, block_q8_0> ||
-                                       std::is_same_v<typename T::type, block_q4_K>)) {
-            // the register-operand ESIMD kernel: no SLM A image (GGML_SYCL_MMID_ESIMD=1)
+        if constexpr (std::is_same_v<typename T::type, block_iq3_s> || std::is_same_v<typename T::type, block_q8_0> ||
+                      std::is_same_v<typename T::type, block_q4_K>) {
+            // the register-operand ESIMD kernel, either weight layout: no SLM A image (GGML_SYCL_MMID_ESIMD)
             if (ggml_sycl_grouped_gemm_esimd_enabled() &&
                 ggml_sycl_gate_up_esimd<typename T::type>((const char *) (wg ? wg : wu)->data, (const char *) wu->data,
                                                           wu->nb[2], tiles, input, output, F, K, Npad, wg == nullptr,
-                                                          count, stream)) {
+                                                          T::reordered, count, stream)) {
                 return;
             }
         }
