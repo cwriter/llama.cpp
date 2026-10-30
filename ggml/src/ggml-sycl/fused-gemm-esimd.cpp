@@ -677,27 +677,19 @@ template <> struct gg_esimd_a<block_q3_K> {
 };
 
 // [qs 96][d]: per sub-block j, 8 grid indices at 8j and an aux dword at 64 + 4j whose 4 x 7 bits
-// pick sign bytes from ksigns_iq2xs and whose top 4 bits scale d * (0.5 + s) * 0.5
+// are sign bytes of ksigns_iq2xs and whose top 4 bits scale d * (0.5 + s) * 0.5. ksigns_iq2xs[i] is
+// i with the parity of its 7 bits as bit 7, so the sign bytes are computed, not looked up.
 template <> struct gg_esimd_a<block_iq3_xxs> {
     static constexpr bool supported = true;
     static constexpr int  qk        = QK_K;
     static constexpr bool whole     = false;
-    // the 256-entry grid and the 128 sign bytes (one a dword), read-only tables in SLM
-    static constexpr int  slm_bytes = (256 + 128) * sizeof(uint32_t);
+    // the 256-entry grid, a read-only table in SLM
+    static constexpr int  slm_bytes = 256 * sizeof(uint32_t);
     static ESIMD_INLINE void init_slm() {
         using namespace gg_esimd;
 #pragma unroll
         for (int i = 0; i < 256; i += 64) {
             slm_block_store<uint32_t, 64>(i * 4, block_load<uint32_t, 64>(iq3xxs_grid + i));
-        }
-#pragma unroll
-        for (int i = 0; i < 128; i += 32) {
-            simd<uint32_t, 32> v;
-#pragma unroll
-            for (int t = 0; t < 32; ++t) {
-                v[t] = ksigns_iq2xs[i + t];
-            }
-            slm_block_store<uint32_t, 32>(1024 + i * 4, v);
         }
     }
     struct raw {
@@ -731,7 +723,7 @@ template <> struct gg_esimd_a<block_iq3_xxs> {
 #pragma unroll
         for (int il = 0; il < 4; ++il) {
             simd<uint32_t, GG_RC> si = (ax >> (7 * il)) & 127;
-            sg |= slm_gather<uint32_t, GG_RC>(1024 + si * 4) << (8 * il);
+            sg |= (si | ((cbit(si) & 1) << 7)) << (8 * il);
         }
         return grid_signed(ge, sg, r.d.template select<GG_RC, 1>(g * GG_RC));
     }
