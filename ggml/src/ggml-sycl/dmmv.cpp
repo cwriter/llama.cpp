@@ -2572,6 +2572,12 @@ static void q8_0_moe_esimd_launch(const void * vx_base, const float * y_base, co
 
                 const int tid  = it.get_local_id(2);
                 const int row0 = it.get_group(2) * NR;
+                if (i02 < 0) { // skipped slot (id -1); the whole work-group leaves before the barrier
+                    for (int r = tid; r < NR && row0 + r < nrows; r += WG) {
+                        dst[row0 + r] = 0.0f;
+                    }
+                    return;
+                }
                 size_t    base[NR];
 #pragma unroll
                 for (int r = 0; r < NR; ++r) {
@@ -3096,6 +3102,14 @@ ESIMD_INLINE void mul_mat_vec_iq4_nl_moe_reorder_esimd(
     const sycl::half * d   = (const sycl::half *) (qs + (size_t) nrows * (ncols / 2));
     const float *      y   = (const float *) ((const char *) y_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride);
     float *            dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+    if (i02 < 0) { // skipped slot (id -1)
+        for (int r = 0; r < R; ++r) {
+            if (row0 + r < nrows) {
+                dst[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
 
     simd<float, 16 * R> acc = 0.0f;
 
@@ -3167,6 +3181,14 @@ ESIMD_INLINE void mul_mat_vec_iq4_nl_moe_reorder_row_esimd(
     const sycl::half * d   = (const sycl::half *) (qs + (size_t) nrows * (ncols / 2));
     const float *      y   = (const float *) ((const char *) y_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride);
     float *            dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+    if (i02 < 0) { // skipped slot (id -1)
+        for (int r = 0; r < R; ++r) {
+            if (row0 + r < nrows) {
+                dst[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
 
     simd<float, 16 * R> acc = 0.0f;
     iq4_nl_moe_mac_stripe<NB, R>(qs, d, row0, nrows, ncols, 0, y, acc);
@@ -3230,6 +3252,14 @@ static void iq4_nl_moe_persist_esimd_launch(const void * vx_base, const float * 
                 const sycl::half * d   = (const sycl::half *) (qs + (size_t) nrows * (ncols / 2));
                 const float *      yr  = (const float *) ((const char *) y + (size_t) token_idx * src1_token_stride + (size_t) e * src1_row_stride);
                 float *            dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) e * dst_row_stride);
+                if (i02 < 0) { // skipped slot (id -1)
+                    for (int r = 0; r < R; ++r) {
+                        if (row0 + r < nrows) {
+                            dst[row0 + r] = 0.0f;
+                        }
+                    }
+                    continue;
+                }
 
                 simd<float, 16 * R> acc = 0.0f;
                 iq4_nl_moe_mac_stripe<NB, R>(qs, d, row0, nrows, ncols, 0, yr, acc);
@@ -3314,6 +3344,14 @@ ESIMD_INLINE void mul_mat_vec_iq3_s_moe_glu_esimd(
     const uint8_t * vu  = (const uint8_t *) vx_up_base   + (size_t) i02 * expert_weight_stride;
     const float *   y   = (const float *) ((const char *) y_base + (size_t) token_idx * src1_token_stride + (size_t) expert_idx * src1_row_stride);
     float *         dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+    if (i02 < 0) { // skipped slot (id -1)
+        for (int r = 0; r < R; ++r) {
+            if (row0 + r < nrows) {
+                dst[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
 
     const int    blocks_per_row = ncols / QK_K;
     const size_t nb             = (size_t) nrows * blocks_per_row;
@@ -3502,6 +3540,14 @@ ESIMD_INLINE void mul_mat_vec_iq3_s_moe_glu_dp4a_esimd(
     const uint8_t * vg  = (const uint8_t *) vx_gate_base + (size_t) i02 * expert_weight_stride;
     const uint8_t * vu  = (const uint8_t *) vx_up_base   + (size_t) i02 * expert_weight_stride;
     float *         dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+    if (i02 < 0) { // skipped slot (id -1)
+        for (int r = 0; r < R; ++r) {
+            if (row0 + r < nrows) {
+                dst[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
 
     const int blocks_per_row = ncols / QK_K;
 
@@ -3597,6 +3643,11 @@ ESIMD_INLINE void mul_mat_vec_iq3_s_moe_glu_dp4a_persist_esimd(
         const int i02 = *(const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride + e * sizeof(int32_t));
         const uint8_t * vg = (const uint8_t *) vx_gate_base + (size_t) i02 * expert_weight_stride;
         const uint8_t * vu = (const uint8_t *) vx_up_base   + (size_t) i02 * expert_weight_stride;
+        float *         dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) e * dst_row_stride);
+        if (i02 < 0) { // skipped slot (id -1)
+            dst[row] = 0.0f;
+            continue;
+        }
 
         simd<float, 8> acc_g = 0.0f;
         simd<float, 8> acc_u = 0.0f;
@@ -3609,7 +3660,6 @@ ESIMD_INLINE void mul_mat_vec_iq3_s_moe_glu_dp4a_persist_esimd(
         }
         const float g = reduce<float>(acc_g, std::plus<>{});
         const float v = reduce<float>(acc_u, std::plus<>{});
-        float * dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) e * dst_row_stride);
         dst[row] = v * g / (1.0f + sycl::exp(-g));
     }
 }
@@ -3679,6 +3729,16 @@ ESIMD_INLINE void mul_mat_vec_iq3_s_moe_glu_dp4a_ks_esimd(
     const uint8_t * vg  = (const uint8_t *) vx_gate_base + (size_t) i02 * expert_weight_stride;
     const uint8_t * vu  = (const uint8_t *) vx_up_base   + (size_t) i02 * expert_weight_stride;
     float *         dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) expert_idx * dst_row_stride);
+    if (i02 < 0) { // skipped slot (id -1); the id is the work-group's, so no thread reaches the barrier below
+        if (ks == 0) {
+            for (int r = 0; r < R; ++r) {
+                if (row0 + r < nrows) {
+                    dst[row0 + r] = 0.0f;
+                }
+            }
+        }
+        return;
+    }
 
     const int blocks_per_row = ncols / QK_K;
 

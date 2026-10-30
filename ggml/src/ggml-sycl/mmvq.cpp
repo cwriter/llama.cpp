@@ -3772,6 +3772,15 @@ static void mul_mat_vec_q_moe_reorder_glu(
 
     const auto sg = item_ct1.get_sub_group();
 
+    if (i02 == -1) { // skipped slot
+        if (sg.leader()) {
+            for (int r = 0; r < ROWS && row0 + r < nrows; ++r) {
+                dst[row0 + r] = 0.0f;
+            }
+        }
+        return;
+    }
+
     const int     blocks_per_row              = ncols / block_traits::qk;
     constexpr int blocks_per_subgroup         = ceil_div(block_traits::vdr_mmvq * WARP_SIZE, block_traits::qi);
     constexpr int block_elements_per_subgroup = block_traits::qi / block_traits::vdr_mmvq;
