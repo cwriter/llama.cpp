@@ -121,11 +121,13 @@ template <typename S> static constexpr bool fg_is_tuned() {
     return std::is_same_v<S, fg_tuned_combo>;
 }
 
-// The combinations the ESIMD grouped GEMM (fused-gemm-esimd.cpp) stands in for: 8x16x16 on sub-group
-// 16 with f16 or bf16 operands, the shape of one dpas. Its B is packed and tiled as theirs is.
+// The combinations the ESIMD grouped GEMM (fused-gemm-esimd.cpp) stands in for: 8 x SG x 16 with f16
+// or bf16 operands, the shape of one dpas, on sub-group 16 (Xe2, Xe-HPC) or 8 (Xe-HPG). Its B is
+// packed and tiled as theirs is.
 template <typename S> static constexpr bool fg_esimd_combo() {
-    return S::TM == 8 && S::TN == 16 && S::TK == 16 && S::SG == 16 && std::is_same_v<typename S::ta, typename S::tb> &&
-           (std::is_same_v<typename S::ta, sycl::half> || std::is_same_v<typename S::ta, sycl::ext::oneapi::bfloat16>);
+    return S::TM == 8 && S::TN == S::SG && S::TK == 16 && (S::SG == 16 || S::SG == 8) &&
+           std::is_same_v<typename S::ta, typename S::tb> &&
+           (std::is_same_v<typename S::ta, fg_half> || std::is_same_v<typename S::ta, fg_bf16>);
 }
 
 // One bit of GGML_SYCL_XMX_GATHER_SHAPES per combination. Only combinations some device lists in
@@ -167,29 +169,7 @@ template <typename F> static void fg_visit_combo(int idx, F && f) {
 // size, since IGC fails on the other ones. A JIT build keeps them all, but each combination lands in
 // its own device image (joint_matrix is an optional kernel feature) and only a combination the
 // device reports is launched, so the runtime never asks IGC for the others.
-#if defined(__SYCL_DEVICE_ONLY__)
-#    if __SYCL_TARGET_INTEL_GPU_ACM_G10__ || __SYCL_TARGET_INTEL_GPU_ACM_G11__ || __SYCL_TARGET_INTEL_GPU_ACM_G12__ || \
-        __SYCL_TARGET_INTEL_GPU_ARL_H__
-#        define FG_AOT_SG 8
-#    elif __SYCL_TARGET_INTEL_GPU_PVC__ || __SYCL_TARGET_INTEL_GPU_PVC_VG__ || __SYCL_TARGET_INTEL_GPU_BMG_G21__ || \
-        __SYCL_TARGET_INTEL_GPU_BMG_G31__ || __SYCL_TARGET_INTEL_GPU_LNL_M__ || __SYCL_TARGET_INTEL_GPU_PTL_H__ ||   \
-        __SYCL_TARGET_INTEL_GPU_PTL_U__ || __SYCL_TARGET_INTEL_GPU_WCL__ || __SYCL_TARGET_INTEL_GPU_NVL_S__ ||       \
-        __SYCL_TARGET_INTEL_GPU_NVL_U__ || __SYCL_TARGET_INTEL_GPU_NVL_P__
-#        define FG_AOT_SG 16
-#    elif __SYCL_TARGET_INTEL_GPU_TGLLP__ || __SYCL_TARGET_INTEL_GPU_RKL__ || __SYCL_TARGET_INTEL_GPU_ADL_S__ || \
-        __SYCL_TARGET_INTEL_GPU_ADL_P__ || __SYCL_TARGET_INTEL_GPU_ADL_N__ || __SYCL_TARGET_INTEL_GPU_DG1__ ||   \
-        __SYCL_TARGET_INTEL_GPU_MTL_U__ || __SYCL_TARGET_INTEL_GPU_MTL_H__
-#        define FG_AOT_SG 0 // no XMX
-#    endif
-#endif
-
-template <int SG> static constexpr bool fg_built() {
-#if defined(FG_AOT_SG)
-    return SG == FG_AOT_SG;
-#else
-    return true;
-#endif
-}
+// (FG_AOT_SG is defined in fused-gemm.hpp, which the ESIMD kernels share)
 
 static size_t grouped_gemm_packed_capacity(size_t size) {
     size_t capacity = 1;
@@ -2377,9 +2357,10 @@ template <typename F> static bool fg_visit_type(ggml_type type, bool reordered, 
 }
 
 // The ESIMD grouped GEMM loads A straight into its dpas operands, so the joint_matrix tile shape
-// means nothing to it; it runs on the fg_esimd_combo of the picked operand type. A grouped call whose
-// weights it covers is moved there from any other sub-group-16 shape of that type, if the device lists
-// it, whatever GGML_SYCL_XMX_GATHER_SHAPES allows: the shape bits choose among joint_matrix tiles.
+// means nothing to it; it runs on the fg_esimd_combo of the picked operand type and sub-group size. A
+// grouped call whose weight it covers is moved there from any other shape of that type and sub-group
+// size, if the device lists it, whatever GGML_SYCL_XMX_GATHER_SHAPES allows: the shape bits choose
+// among joint_matrix tiles.
 // A call the ESIMD kernel then declines (a shape it does not take) runs that combination's joint_matrix
 // kernel.
 static int fg_esimd_remap(dpct::queue_ptr stream, int combo, std::initializer_list<std::pair<ggml_type, bool>> weights) {
@@ -2399,11 +2380,11 @@ static int fg_esimd_remap(dpct::queue_ptr stream, int combo, std::initializer_li
     int target = -1;
     fg_visit_combo(combo, [&](auto s) {
         using S = decltype(s);
-        if constexpr (S::SG == 16 && std::is_same_v<typename S::ta, typename S::tb>) {
+        if constexpr (std::is_same_v<typename S::ta, typename S::tb>) {
             for (int idx = 0; idx < FG_N_COMBOS; ++idx) {
                 fg_visit_combo(idx, [&](auto t) {
                     using U = decltype(t);
-                    if constexpr (fg_esimd_combo<U>() && std::is_same_v<typename U::ta, typename S::ta>) {
+                    if constexpr (fg_esimd_combo<U>() && U::SG == S::SG && std::is_same_v<typename U::ta, typename S::ta>) {
                         target = idx;
                     }
                 });
@@ -2652,7 +2633,7 @@ template <typename S> struct grouped_gemm_launcher {
         if constexpr (fg_esimd_combo<S>() && ggml_sycl_grouped_gemm_esimd_has<block_q_t>) {
             // the register-operand ESIMD kernel, either weight layout: no SLM A image (GGML_SYCL_MMID_ESIMD)
             if (ggml_sycl_grouped_gemm_esimd_enabled() && !arms.diag_no_a && !arms.diag_no_mad &&
-                ggml_sycl_grouped_gemm_esimd<block_q_t, typename S::tsb>(src0_dd, expert_stride, tiles, packed, dst, M,
+                ggml_sycl_grouped_gemm_esimd<block_q_t, typename S::tsb, S::SG>(src0_dd, expert_stride, tiles, packed, dst, M,
                                                                          Npad, K, tight, dst_rows, reordered, n_tiles,
                                                                          stream)) {
                 return;
