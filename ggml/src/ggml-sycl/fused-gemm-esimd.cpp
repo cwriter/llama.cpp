@@ -4,6 +4,8 @@
 #include <sycl/ext/intel/esimd/xmx/dpas.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#include "xmx-compat.hpp"
+
 // One thread owns MR rows of one expert's weight and one BN-wide tile of the schedule, over the
 // whole K. Per k step (32 values) it loads the rows' stored bits, dequantizes them in registers to
 // the f16 A operand of dpas (RC = 8 rows x 16 k, row major) and multiplies it with the packed B,
@@ -39,19 +41,11 @@ template <int NW_, int MR_, bool L2D_> struct gg_arch {
 using gg_xe2   = gg_arch<16, GG_MR, true>;
 using gg_xehpg = gg_arch<8, 16, false>;
 
-// GGML_SYCL_GG_ESIMD_EMULATE_DPAS8 (a test build): the 8-wide dpas is computed in software, so the
-// Xe-HPG kernel runs, and can be checked, on an Xe2 device; GGML_SYCL_MMID_ESIMD_XEHPG=1 then routes
-// the 16-wide calls to it
-#if defined(GGML_SYCL_GG_ESIMD_EMULATE_DPAS8)
-static constexpr bool gg_emulate_dpas8 = true;
-#else
-static constexpr bool gg_emulate_dpas8 = false;
-#endif
-
-// An AOT build compiles each kernel only for the targets of its dpas width (FG_AOT_SG, fused-gemm.hpp)
+// An AOT build compiles each kernel only for the targets of its dpas width (FG_AOT_SG, fused-gemm.hpp),
+// unless XMX is emulated (xmx-compat.hpp), where any width runs anywhere
 template <typename A> static constexpr bool gg_built() {
 #if defined(FG_AOT_SG)
-    return A::NW == FG_AOT_SG || (A::NW == 8 && gg_emulate_dpas8);
+    return A::NW == FG_AOT_SG || ggml_sycl_xmx::emulated;
 #else
     return true;
 #endif
@@ -764,27 +758,6 @@ template <int MR> struct gg_esimd_a<block_iq3_xxs, MR> {
     }
 };
 
-// The 8-wide dpas computed in software (GGML_SYCL_GG_ESIMD_EMULATE_DPAS8): acc[r][n] += a[r][k] b[k][n]
-// over the 16 k, a row major [RC][16 k], b the VNNI operand [8 k pairs][NW][2]. The f32 sum order is
-// not the hardware's, so the result matches it to rounding, not in bits.
-template <int NW, typename T>
-ESIMD_INLINE gg_esimd::simd<float, GG_RC * NW> gg_dpas_soft(gg_esimd::simd<float, GG_RC * NW> acc,
-                                                            gg_esimd::simd<T, 16 * NW>         b,
-                                                            gg_esimd::simd<T, GG_RC * 16>      a) {
-    using namespace gg_esimd;
-    simd<float, 16 * NW>    bf = b;
-    simd<float, GG_RC * 16> af = a;
-#pragma unroll
-    for (int k = 0; k < 16; ++k) {
-        simd<float, NW> bk = bf.template select<NW, 2>((k / 2) * 2 * NW + (k % 2));
-#pragma unroll
-        for (int r = 0; r < GG_RC; ++r) {
-            acc.template select<NW, 1>(r * NW) += bk * (float) af[r * 16 + k];
-        }
-    }
-    return acc;
-}
-
 // T is the dpas operand type, sycl::half or bfloat16: the type B is packed in. A is decoded in half
 // either way and converted for bf16 (see the double rounding note at the conversion). AOS: the weight
 // is in the canonical block layout rather than the reorder (SoA) one. A: the gg_arch built for.
@@ -809,7 +782,7 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
 
     ESIMD_INLINE void run(sycl::nd_item<1> it) const {
         using namespace sycl::ext::intel::esimd;
-        namespace xmx = sycl::ext::intel::esimd::xmx;
+        namespace xmx = ggml_sycl_xmx::esimd;
         constexpr int MR = A::MR;
         constexpr int NW = A::NW;
         constexpr int RC = GG_RC;
@@ -942,11 +915,7 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
                     for (int nt = 0; nt < NT; ++nt) {
                         simd<uint32_t, 8 * NW> bh32 = b[nt].template select<8 * NW, 1>(h * 8 * NW);
                         simd<T, 16 * NW>       bh   = bh32.template bit_cast_view<T>();
-                        if constexpr (NW == 8 && gg_emulate_dpas8) {
-                            acc[g][nt] = gg_dpas_soft<NW, T>(acc[g][nt], bh, at);
-                        } else {
-                            acc[g][nt] = xmx::dpas<8, RC, float, float>(acc[g][nt], bh, at);
-                        }
+                        acc[g][nt] = xmx::dpas<8, RC, float, float>(acc[g][nt], bh, at);
                     }
                 }
             };
@@ -1015,20 +984,6 @@ bool ggml_sycl_grouped_gemm_esimd_enabled() {
     return ggml_sycl_grouped_gemm_esimd_mode() != 0;
 }
 
-// GGML_SYCL_MMID_ESIMD_XEHPG=1 in a GGML_SYCL_GG_ESIMD_EMULATE_DPAS8 build: run the Xe-HPG kernel
-// (software 8-wide dpas) for the 16-wide calls, to check it on an Xe2 device
-static bool ggml_sycl_grouped_gemm_esimd_xehpg_forced() {
-    static const bool forced = [] {
-        const bool f = gg_emulate_dpas8 && ggml_sycl_get_env("GGML_SYCL_MMID_ESIMD_XEHPG", 0) != 0;
-        if (f) {
-            GGML_LOG_INFO("%s: the Xe-HPG kernel (8-wide software dpas, %d rows a thread) runs the 16-wide calls\n",
-                          __func__, gg_xehpg::MR);
-        }
-        return f;
-    }();
-    return forced;
-}
-
 template <typename block_q_t, typename T, bool AOS, typename A>
 static void grouped_gemm_esimd_launch(const char * src0_dd, size_t expert_stride, const ggml_sycl_gg_tile * tiles,
                                       const T * packed, float * dst, int M, int Npad, int K,
@@ -1043,16 +998,23 @@ static void grouped_gemm_esimd_launch(const char * src0_dd, size_t expert_stride
     }
 }
 
+template <int NW> using gg_arch_of = std::conditional_t<NW == 16, gg_xe2, gg_xehpg>;
+
+// the shapes the kernel takes: whole row groups and stored blocks, every K-split range non-empty
+// (also in mode 1, so both modes take the same shapes)
+template <typename block_q_t, typename A> static bool grouped_gemm_esimd_shape_ok(int M, int K, bool reordered) {
+    using F = gg_esimd_a<block_q_t, A::MR>;
+    return M % A::MR == 0 && F::ok(K, !reordered) && K >= GG_QK * GGML_SYCL_GG_KSPLIT;
+}
+
 template <typename block_q_t, typename T, typename A>
 static bool grouped_gemm_esimd_run(const char * src0_dd, size_t expert_stride, const ggml_sycl_gg_tile * tiles,
                                    const T * packed, float * dst, int M, int Npad, int K,
                                    const ggml_sycl_gg_rows & dst_rows, bool reordered, int64_t n_tiles,
                                    dpct::queue_ptr stream) {
-    using F = gg_esimd_a<block_q_t, A::MR>;
-    // whole row groups and stored blocks, every K-split range non-empty (also in mode 1, so both
-    // modes take the same shapes); B is read with 2D block loads, which want 64-byte aligned
-    // surfaces and pitches, or with 16-byte aligned block loads of whole tiles
-    if (M % A::MR != 0 || !F::ok(K, !reordered) || K < GG_QK * GGML_SYCL_GG_KSPLIT ||
+    // B is read with 2D block loads, which want 64-byte aligned surfaces and pitches, or with 16-byte
+    // aligned block loads of whole tiles
+    if (!grouped_gemm_esimd_shape_ok<block_q_t, A>(M, K, reordered) ||
         !gg_esimd_weights_ok(src0_dd, expert_stride, reordered && A::L2D) || ((uintptr_t) packed % 64) != 0 ||
         Npad % 16 != 0) {
         return false;
@@ -1075,17 +1037,8 @@ bool ggml_sycl_grouped_gemm_esimd(const char * src0_dd, size_t expert_stride, co
     static_assert(gg_esimd_a<block_q_t>::supported == ggml_sycl_grouped_gemm_esimd_has<block_q_t>,
                   "the header's format list and the formats implemented here must agree");
     static_assert(NW == 8 || NW == 16, "the dpas widths of Xe-HPG and of Xe2 / Xe-HPC");
-    if constexpr (NW == 16) {
-        if (ggml_sycl_grouped_gemm_esimd_xehpg_forced()) {
-            return grouped_gemm_esimd_run<block_q_t, T, gg_xehpg>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
-                                                                  dst_rows, reordered, n_tiles, stream);
-        }
-        return grouped_gemm_esimd_run<block_q_t, T, gg_xe2>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
-                                                            dst_rows, reordered, n_tiles, stream);
-    } else {
-        return grouped_gemm_esimd_run<block_q_t, T, gg_xehpg>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
-                                                              dst_rows, reordered, n_tiles, stream);
-    }
+    return grouped_gemm_esimd_run<block_q_t, T, gg_arch_of<NW>>(src0_dd, expert_stride, tiles, packed, dst, M, Npad, K,
+                                                                dst_rows, reordered, n_tiles, stream);
 }
 
 #define GG_ESIMD_INSTANCE_T(block_q_t, T, NW)                                                                      \
@@ -1093,10 +1046,10 @@ bool ggml_sycl_grouped_gemm_esimd(const char * src0_dd, size_t expert_stride, co
                                                                  const T *, float *, int, int, int,                 \
                                                                  const ggml_sycl_gg_rows &, bool, int64_t,          \
                                                                  dpct::queue_ptr);
-#define GG_ESIMD_INSTANCE(block_q_t)                     \
-    GG_ESIMD_INSTANCE_T(block_q_t, sycl::half, 16)                  \
-    GG_ESIMD_INSTANCE_T(block_q_t, sycl::ext::oneapi::bfloat16, 16) \
-    GG_ESIMD_INSTANCE_T(block_q_t, sycl::half, 8)                   \
+#define GG_ESIMD_INSTANCE(block_q_t)                                       \
+    GG_ESIMD_INSTANCE_T(block_q_t, sycl::half, 16)                                    \
+    GG_ESIMD_INSTANCE_T(block_q_t, sycl::ext::oneapi::bfloat16, 16)                   \
+    GG_ESIMD_INSTANCE_T(block_q_t, sycl::half, 8)                                     \
     GG_ESIMD_INSTANCE_T(block_q_t, sycl::ext::oneapi::bfloat16, 8)
 GG_ESIMD_INSTANCE(block_q8_0)
 GG_ESIMD_INSTANCE(block_iq4_nl)
