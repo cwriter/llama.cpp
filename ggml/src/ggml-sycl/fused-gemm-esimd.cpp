@@ -33,13 +33,15 @@ static constexpr int GG_MR               = 32; // rows of one thread on Xe2: one
 static constexpr int GG_RC               = 8;  // rows of one dpas
 static constexpr int GG_QK               = 32; // values of one k step
 
-template <int NW_, int MR_, bool L2D_> struct gg_arch {
-    static constexpr int  NW  = NW_;
+// HW: the architecture (ggml_sycl_xmx::xe2, xehpg), MR: the rows of one thread
+template <typename HW_, int MR_> struct gg_arch {
+    using HW                  = HW_;
+    static constexpr int  NW  = HW::dpas_width;
     static constexpr int  MR  = MR_;
-    static constexpr bool L2D = L2D_;
+    static constexpr bool L2D = HW::block_2d;
 };
-using gg_xe2   = gg_arch<16, GG_MR, true>;
-using gg_xehpg = gg_arch<8, 16, false>;
+using gg_xe2   = gg_arch<ggml_sycl_xmx::xe2, GG_MR>;
+using gg_xehpg = gg_arch<ggml_sycl_xmx::xehpg, 16>;
 
 // An AOT build compiles each kernel only for the targets of its dpas width (FG_AOT_SG, fused-gemm.hpp),
 // unless XMX is emulated (xmx-compat.hpp), where any width runs anywhere
@@ -53,6 +55,7 @@ template <typename A> static constexpr bool gg_built() {
 
 namespace gg_esimd {
 using namespace sycl::ext::intel::esimd;
+namespace xmx = ggml_sycl_xmx::esimd;
 
 // f(std::integral_constant<int, I>) for I in [0, N): register selects at a runtime offset become
 // indirect accesses, so loops whose index picks registers are spelled out at compile time
@@ -76,7 +79,7 @@ struct field {
 
 // Where one thread's rows sit in an expert's slice, in either layout. nblocks counts the stored blocks
 // of the slice, bpr those of one row, bs is the size of one block.
-template <int MR, bool L2D> struct slice {
+template <int MR, typename HW> struct slice {
     const uint8_t * x;
     int             M;
     int             bpr;
@@ -110,16 +113,16 @@ template <int MR, bool L2D> struct slice {
     }
 
     // W dwords of each of the MR rows from byte `inner` (a multiple of 4) of field f of block ib, as
-    // [row][W]. SoA with 2D block loads (L2D): one message over the stream. Otherwise the rows' dwords
+    // [row][W]. SoA with 2D block loads (HW::block_2d): one message over the stream. Otherwise the rows' dwords
     // are gathered, as [W][row], at offsets rounded down to a dword (every field starts on an even
     // byte; the SoA streams are dword aligned), shifted by 16 bits where an AoS row's block starts on
     // 2 mod 4, and transposed with strided reads.
     template <int W> ESIMD_INLINE simd<uint32_t, MR * W> rows(const field & f, const int ib, const int inner) const {
-        if constexpr (L2D) {
+        if constexpr (HW::block_2d) {
             if (!aos) {
                 const unsigned pitch = (unsigned) (bpr * f.size);
-                return load_2d<uint32_t, W, MR>((const uint32_t *) (x + (size_t) nblocks * f.pre), pitch - 1, M - 1,
-                                                pitch - 1, (ib * f.size + inner) / 4, m0);
+                return xmx::load_2d<HW, uint32_t, W, MR>((const uint32_t *) (x + (size_t) nblocks * f.pre), pitch - 1,
+                                                         M - 1, pitch - 1, (ib * f.size + inner) / 4, m0);
             }
         }
         const simd<uint32_t, MR> o = at(f, ib, inner);
@@ -810,7 +813,7 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
 
         // the slice of this expert
         const int             bpr = K / F::qk;
-        const gg_esimd::slice<MR, A::L2D> sl = { (const uint8_t *) src0_dd + (size_t) tile.expert * expert_stride,
+        const gg_esimd::slice<MR, typename A::HW> sl = { (const uint8_t *) src0_dd + (size_t) tile.expert * expert_stride,
                                                  M, bpr, M * bpr, m0, AOS, (int) sizeof(block_q_t) };
         const uint32_t *      bp  = (const uint32_t *) packed;
         const unsigned        bw  = (unsigned) Npad * 4; // bytes of one packed B row
@@ -874,7 +877,8 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
             if constexpr (A::L2D) {
 #pragma unroll
                 for (int nt = 0; nt < NT; ++nt) {
-                    b[nt] = load_2d<uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1, b0 + nt * NW, kb * 16);
+                    b[nt] = xmx::load_2d<typename A::HW, uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1, b0 + nt * NW,
+                                                                           kb * 16);
                 }
             } else {
                 simd<uint32_t, 16 * BN> bm;
@@ -1049,7 +1053,7 @@ template <typename block_q_t, bool AOS> struct gate_up_esimd_kernel {
         const int             bpr  = K / F::qk;
         const int             rows = merged ? 2 * FR : FR; // rows of one reorder slice
         const char *          base = q == 0 ? gate : up;
-        const gg_esimd::slice<GG_MR, true> sl = { (const uint8_t *) base + (size_t) tile.expert * expert_stride, rows, bpr, rows * bpr,
+        const gg_esimd::slice<GG_MR, typename gg_xe2::HW> sl = { (const uint8_t *) base + (size_t) tile.expert * expert_stride, rows, bpr, rows * bpr,
                                        m0 + (merged && q == 1 ? FR : 0), AOS, (int) sizeof(block_q_t) };
         const uint32_t *      bp    = (const uint32_t *) input;
         const unsigned        bw    = (unsigned) Npad * 4;
