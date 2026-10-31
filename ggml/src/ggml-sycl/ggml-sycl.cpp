@@ -109,6 +109,7 @@
 #include "ggml-sycl/solve_tri.hpp"
 #include "ggml-sycl/gated_delta_net.hpp"
 #include "ggml-sycl/pool.hpp"
+#include "ggml-sycl/xmx-compat.hpp"
 #include "ggml-sycl/cross_entropy_loss.hpp"
 #include "ggml-sycl/pipe-trace.hpp"
 #include <deque>
@@ -169,6 +170,7 @@ int g_ggml_sycl_topk_moe_radix = 1;
 int g_ggml_sycl_reorder_types = GGML_SYCL_REORDER_DEFAULT;
 int g_ggml_sycl_xmx_gather_types = GGML_SYCL_XMX_GATHER_TYPES_DEFAULT;
 int g_ggml_sycl_xmx_gather_shapes = GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT;
+int g_ggml_sycl_hwemul = 0;
 int g_ggml_sycl_dynamic_precision = GGML_SYCL_DYNAMIC_PRECISION_DEFAULT;
 int g_ggml_sycl_dynamic_required_precision = GGML_SYCL_DYNAMIC_PRECISION_F32;
 static const char * ggml_sycl_dynamic_precision_names[] = { "F16", "BF16", "TF32", "F32" };
@@ -543,6 +545,13 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_graph_eviction_timeout = ggml_sycl_get_env("GGML_SYCL_GRAPH_EVICTION_TIMEOUT", 10);
         g_ggml_sycl_xmx_gather_types = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_TYPES", GGML_SYCL_XMX_GATHER_TYPES_DEFAULT);
         g_ggml_sycl_xmx_gather_shapes = ggml_sycl_get_env("GGML_SYCL_XMX_GATHER_SHAPES", GGML_SYCL_XMX_GATHER_SHAPES_DEFAULT);
+        g_ggml_sycl_hwemul = ggml_sycl_get_env("GGML_SYCL_HWEMUL", 0);
+        if (g_ggml_sycl_hwemul != 0 && !ggml_sycl_xmx::emulated) {
+            // the emulated architectures' instructions would run on this device's XMX and compute garbage
+            GGML_LOG_WARN("GGML_SYCL_HWEMUL=%d is ignored: it needs a build with GGML_SYCL_XMX_EMULATION\n",
+                          g_ggml_sycl_hwemul);
+            g_ggml_sycl_hwemul = 0;
+        }
         g_ggml_sycl_dynamic_precision =
             ggml_sycl_get_env_precision("GGML_SYCL_DYNAMIC_PRECISION", GGML_SYCL_DYNAMIC_PRECISION_DEFAULT);
         g_ggml_sycl_dynamic_required_precision =
@@ -617,6 +626,12 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_F16: yes\n");
 #else
         GGML_LOG_INFO("  GGML_SYCL_F16: no\n");
+#endif
+
+#if defined(GGML_SYCL_XMX_EMULATION)
+        GGML_LOG_INFO("  GGML_SYCL_XMX_EMULATION: yes (dpas and joint_matrix in software, slow)\n");
+#else
+        GGML_LOG_INFO("  GGML_SYCL_XMX_EMULATION: no\n");
 #endif
 
 #if defined(GGML_SYCL_FORCE_MMQ)
@@ -744,6 +759,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_FA_MAX_MEM_MIB: %d\n", g_ggml_sycl_fa_max_mem_mib);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_TYPES: %d\n", g_ggml_sycl_xmx_gather_types);
         GGML_LOG_INFO("  GGML_SYCL_XMX_GATHER_SHAPES: %d\n", g_ggml_sycl_xmx_gather_shapes);
+        GGML_LOG_INFO("  GGML_SYCL_HWEMUL: %d\n", g_ggml_sycl_hwemul);
         GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_PRECISION: %s\n",
                       ggml_sycl_dynamic_precision_names[g_ggml_sycl_dynamic_precision]);
         GGML_LOG_INFO("  GGML_SYCL_DYNAMIC_REQUIRED_PRECISION: %s\n",

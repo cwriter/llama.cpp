@@ -5,7 +5,7 @@
 #include "dmmv.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
-#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include "xmx-compat.hpp"
 
 #include <algorithm>
 #include <mutex>
@@ -14,7 +14,7 @@
 #include <tuple>
 #include <unordered_map>
 
-namespace mx = sycl::ext::oneapi::experimental::matrix;
+namespace mx = ggml_sycl_xmx::matrix;
 
 // A k step is one 32-value weight sub-block; iq3_s and the other superblock formats split their
 // superblock into steps of this width. The sub-groups of a work-group each walk their own K range
@@ -136,9 +136,10 @@ template <typename F> static void fg_visit_combo(int idx, F && f);
 static constexpr int FG_N_COMBOS = 8;
 
 // A spir64_gen AOT build (GGML_SYCL_XMX_AOT_SG) drops the combinations of the other sub-group size
-// entirely: ocloc rejects even an empty kernel that asks for a sub-group size it lacks.
+// entirely: ocloc rejects even an empty kernel that asks for a sub-group size it lacks. An XMX-emulation
+// build asks for hardware sub-groups of 16 (ggml_sycl_xmx::hw_sub_group_size) and keeps them all.
 template <int SG> static constexpr bool fg_listed() {
-#if defined(GGML_SYCL_XMX_AOT_SG)
+#if defined(GGML_SYCL_XMX_AOT_SG) && !defined(GGML_SYCL_XMX_EMULATION)
     return SG == GGML_SYCL_XMX_AOT_SG;
 #else
     return true;
@@ -208,8 +209,27 @@ static std::string fg_combo_name(int idx) {
     return name;
 }
 
-// Combinations this build has kernels for and the device lists, one bit each. Cached per device:
-// on a mixed box the first caller's verdict is not the others'.
+// The combinations of the architectures GGML_SYCL_HWEMUL selects, one bit each: Xe-HPG's are those
+// on sub-group 8, Xe2's those on sub-group 16
+static int fg_hwemul_combos() {
+    int m = 0;
+    for (int idx = 0; idx < FG_N_COMBOS; ++idx) {
+        fg_visit_combo(idx, [&](auto s) {
+            using S = decltype(s);
+            if (((g_ggml_sycl_hwemul & GGML_SYCL_HWEMUL_XEHPG) && S::SG == 8) ||
+                ((g_ggml_sycl_hwemul & GGML_SYCL_HWEMUL_XE2) && S::SG == 16)) {
+                m |= 1 << idx;
+            }
+        });
+    }
+    return m;
+}
+
+// Combinations this build has kernels for and the device offers, one bit each: those it lists, plus
+// those of the architectures GGML_SYCL_HWEMUL emulates (the device's own stay available), each only if
+// the device has the hardware sub-group size its joint_matrix kernel launches with
+// (ggml_sycl_xmx::hw_sub_group_size: emulated, a logical sub-group of 8 runs on hardware sub-groups of
+// 16). Cached per device: on a mixed box the first caller's verdict is not the others'.
 static int fg_device_combos(const sycl::device & dev) {
     static std::mutex                            mtx;
     static std::unordered_map<sycl::device, int> known;
@@ -218,24 +238,33 @@ static int fg_device_combos(const sycl::device & dev) {
     if (it != known.end()) {
         return it->second;
     }
-    int available = 0;
+    int native = 0, launchable = 0;
     try {
-        const auto combinations = dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
-        const auto sg_sizes     = dev.get_info<sycl::info::device::sub_group_sizes>();
+        const auto sg_sizes = dev.get_info<sycl::info::device::sub_group_sizes>();
         for (int idx = 0; idx < FG_N_COMBOS; ++idx) {
             fg_visit_combo(idx, [&](auto s) {
-                using S = decltype(s);
-                const bool sg_ok = std::find(sg_sizes.begin(), sg_sizes.end(), (size_t) S::SG) != sg_sizes.end();
-                if (sg_ok && fg_device_has_combo<S>(combinations)) {
-                    available |= 1 << idx;
+                const size_t hw = ggml_sycl_xmx::hw_sub_group_size(decltype(s)::SG);
+                if (std::find(sg_sizes.begin(), sg_sizes.end(), hw) != sg_sizes.end()) {
+                    launchable |= 1 << idx;
+                }
+            });
+        }
+        const auto combinations = dev.get_info<sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
+        for (int idx = 0; idx < FG_N_COMBOS; ++idx) {
+            fg_visit_combo(idx, [&](auto s) {
+                if (fg_device_has_combo<decltype(s)>(combinations)) {
+                    native |= 1 << idx;
                 }
             });
         }
     } catch (const sycl::exception &) {
-        available = 0;
+        native = 0; // no XMX
     }
-    GGML_LOG_INFO("%s: %s: XMX dequant-GEMM combinations available 0x%x, allowed 0x%x\n", __func__,
-                  dev.get_info<sycl::info::device::name>().c_str(), available, g_ggml_sycl_xmx_gather_shapes);
+    const int emulated  = fg_hwemul_combos();
+    const int available = (native | emulated) & launchable;
+    GGML_LOG_INFO("%s: %s: XMX dequant-GEMM combinations available 0x%x (emulated 0x%x), allowed 0x%x\n", __func__,
+                  dev.get_info<sycl::info::device::name>().c_str(), available, available & ~native,
+                  g_ggml_sycl_xmx_gather_shapes);
     known.emplace(dev, available);
     return available;
 }
@@ -1774,7 +1803,7 @@ static void fused_dequant_gemm_tile(
                       "a C pass must be a whole number of accumulator tiles, and the M tile a whole number of C passes");
         static_assert(MT_PASS * PASSES == MT, "every accumulator tile must be stored by exactly one pass");
 
-        const auto sg     = item.get_sub_group();
+        const auto sg     = ggml_sycl_xmx::sub_group_of<S::SG>(item);
         const int  sg_id  = sg.get_group_id()[0];
         const int  lane   = sg.get_local_id()[0];
         const int  m0     = item.get_group(1) * SG_ROWS;
@@ -1956,10 +1985,10 @@ static void fused_dequant_gemm_tile(
                                 }
                             }
                         }
-                        sycl::group_barrier(sg);
+                        ggml_sycl_xmx::group_barrier(sg);
                         mad_a(a_base, kb);
                         // the next k step overwrites tile_a
-                        sycl::group_barrier(sg);
+                        ggml_sycl_xmx::group_barrier(sg);
                     }
                 }
             }
@@ -1976,17 +2005,17 @@ static void fused_dequant_gemm_tile(
             }
             int kb = kb_begin;
             for (; kb + 1 < kb_end; kb += 2) {
-                sycl::group_barrier(sg);
+                ggml_sycl_xmx::group_barrier(sg);
                 stage_a(a[1], kb + 1);
                 mad_a(a_base, kb);
-                sycl::group_barrier(sg);
+                ggml_sycl_xmx::group_barrier(sg);
                 if (kb + 2 < kb_end) {
                     stage_a(a[0], kb + 2);
                 }
                 mad_a(a_base + fg_a_image<SG_ROWS>(), kb + 1);
             }
             if (kb < kb_end) {
-                sycl::group_barrier(sg);
+                ggml_sycl_xmx::group_barrier(sg);
                 mad_a(a_base, kb);
             }
         } else {
@@ -2000,14 +2029,14 @@ static void fused_dequant_gemm_tile(
                         fg_stage_block_slm<block_q_t, reordered, SG_ROWS>((const uint8_t *) x, slm_x, blocks_per_row,
                                                                           nblocks, m0, M, kb / KPB, lane, base_al);
                         // written by the whole sub-group, read below by every lane
-                        sycl::group_barrier(sg);
+                        ggml_sycl_xmx::group_barrier(sg);
                     }
                 }
                 stage_a(a[0], kb);
-                sycl::group_barrier(sg);
+                ggml_sycl_xmx::group_barrier(sg);
                 mad_a(a_base, kb);
                 // the next step overwrites tile_a
-                sycl::group_barrier(sg);
+                ggml_sycl_xmx::group_barrier(sg);
             }
         }
 
@@ -2074,7 +2103,7 @@ static void fused_dequant_gemm_launch(const void * src0, const typename S::tsb *
         sycl::local_accessor<float, 1>          tile_c(FG_KSPLIT * S::SG_ROWS * S::BN, cgh);
         cgh.parallel_for(
             sycl::nd_range<2>(sycl::range<2>(groups_n, groups_m * S::WG_SIZE), sycl::range<2>(1, S::WG_SIZE)),
-            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(S::SG)]] {
+            [=](sycl::nd_item<2> item) [[sycl::reqd_sub_group_size(ggml_sycl_xmx::hw_sub_group_size(S::SG))]] {
                 const int n0 = item.get_group(0) * S::BN;
                 // the plain path has at most two column groups, so its B re-read is already small: it keeps
                 // the narrow M tile and the tuned variants are instantiated for the grouped path only
@@ -2108,7 +2137,7 @@ struct grouped_dequant_gemm_kernel {
     sycl::local_accessor<typename S::tsa, 1> tile_a;
     sycl::local_accessor<float, 1>           tile_c;
 
-    [[sycl::reqd_sub_group_size(S::SG)]]
+    [[sycl::reqd_sub_group_size(ggml_sycl_xmx::hw_sub_group_size(S::SG))]]
     void operator()(sycl::nd_item<2> item) const {
         const int               t    = item.get_group(0);
         const ggml_sycl_gg_tile tile = tiles[t];
@@ -3033,7 +3062,7 @@ struct fg_gate_up_pack_kernel {
     sycl::local_accessor<S::tsa, 1> tile_a;
     sycl::local_accessor<float, 1> tile_c;
 
-    [[sycl::reqd_sub_group_size(S::SG)]]
+    [[sycl::reqd_sub_group_size(ggml_sycl_xmx::hw_sub_group_size(S::SG))]]
     void operator()(sycl::nd_item<2> item) const {
         if constexpr (fg_built<S::SG>()) {
             constexpr int MT = S::SG_ROWS / S::TM;
@@ -3044,7 +3073,7 @@ struct fg_gate_up_pack_kernel {
             if (tile.n1 <= tile.n0) {
                 return;
             }
-            const auto sg = item.get_sub_group();
+            const auto sg = ggml_sycl_xmx::sub_group_of<S::SG>(item);
             const int split = sg.get_group_id()[0];
             const int lane = sg.get_local_id()[0];
             const int m0 = item.get_group(1) * S::SG_ROWS;
@@ -3098,7 +3127,7 @@ struct fg_gate_up_pack_kernel {
                         }
                     }
                 }
-                sycl::group_barrier(sg);
+                ggml_sycl_xmx::group_barrier(sg);
 #pragma unroll
                 for (int kt = 0; kt < FG_BK / S::TK; ++kt) {
                     mx::joint_matrix<sycl::sub_group, S::tb, mx::use::b, S::TK, S::TN, S::b_layout> b[S::NT];
@@ -3121,7 +3150,7 @@ struct fg_gate_up_pack_kernel {
                         }
                     }
                 }
-                sycl::group_barrier(sg);
+                ggml_sycl_xmx::group_barrier(sg);
             }
 #pragma unroll
             for (int mt = 0; mt < MT; ++mt) {

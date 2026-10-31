@@ -6,6 +6,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include "common.hpp"
+#include "xmx-compat.hpp"
 
 namespace ggml_sycl_esimd {
 
@@ -1119,7 +1120,7 @@ ESIMD_INLINE simd<float, RC * NT> xmx_term(const simd<int8_t, 512> &    B,
                                            const simd<int8_t, RC * 32> & A,
                                            const simd<float, NT> &       s) {
     using namespace sycl::ext::intel::esimd;
-    namespace xmx = sycl::ext::intel::esimd::xmx;
+    namespace xmx = ggml_sycl_xmx::esimd;
 
     simd<int, RC * NT> C = xmx::dpas<8, RC, int>(B, A);
     return convert<float>(C) * s.template replicate<RC>();
