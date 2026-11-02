@@ -85,6 +85,7 @@
 #include "ggml-sycl/norm-rope.hpp"
 #include "ggml-sycl/hc-ffn-tail.hpp"
 #include "ggml-sycl/census.hpp"
+#include "ggml-sycl/graph-dump.hpp"
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/repeat_back.hpp"
 #include "ggml-sycl/set_rows.hpp"
@@ -9303,6 +9304,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         census = ggml_sycl_census_begin(*sycl_ctx, cgraph, absorbed_by);
     }
+    ggml_sycl_graph_dump * dump = ggml_sycl_graph_dump_begin(*sycl_ctx, cgraph);
 
     const bool    trace      = ggml_sycl_pipe_trace_on();
     double        trace_t    = trace ? ggml_sycl_pipe_trace_now() : 0.0;
@@ -9342,6 +9344,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (census) {
             ggml_sycl_census_visit(census, i);
         }
+        ggml_sycl_graph_dump_visit(dump, i);
         if (node == q8_sibling_pending) {
             q8_sibling_pending = nullptr;
             continue;
@@ -9801,6 +9804,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     if (census) {
         ggml_sycl_census_end(census);
     }
+    ggml_sycl_graph_dump_end(dump);
 }
 
 #ifdef GGML_SYCL_GRAPH
