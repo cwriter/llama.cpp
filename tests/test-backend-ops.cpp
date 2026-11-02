@@ -10627,6 +10627,77 @@ struct test_fill : public test_case {
     }
 };
 
+struct test_fill_consumers : public test_case {
+    const ggml_type type, type_idx;
+    const int mode;
+    const int64_t rows;
+    std::vector<ggml_tensor *> outputs;
+
+    test_fill_consumers(ggml_type type, ggml_type type_idx, int mode, int64_t rows = 515)
+        : type(type), type_idx(type_idx), mode(mode), rows(rows) {}
+
+    std::string vars() override { return VARS_TO_STR4(type, type_idx, mode, rows); }
+    std::string op_desc(ggml_tensor *) override { return "FILL_CONSUMERS"; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+    double max_nmse_err() override { return 0.0; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        outputs.clear();
+        const int64_t cols = mode == 2 ? 1 : 3;
+        const int64_t count = 259;
+        const float initial = mode == 2 ? -INFINITY : -3.25f;
+        const float value = mode == 2 ? 0.0f : 1.333333f;
+        auto filled = [&](int64_t n, float c) {
+            auto * seed = ggml_new_tensor_1d(ctx, type, mode == 0 ? n : 1);
+            auto * fill = ggml_fill(ctx, seed, c);
+            return mode == 0 ? fill : ggml_repeat_4d(ctx, fill, n, 1, 1, 1);
+        };
+        auto * base = ggml_reshape_4d(ctx, filled(cols * rows * 4, initial), cols, rows, 2, 2);
+        auto * values = ggml_reshape_4d(ctx, filled(cols * count * 4, value), cols, count, 2, 2);
+        auto * ids = ggml_new_tensor_3d(ctx, type_idx, count, 1, 2);
+        ggml_set_name(ids, "fill_indices");
+        if (mode == 3) {
+            auto * copy = ggml_cont(ctx, values);
+            ggml_build_forward_expand(gf, copy);
+            outputs.push_back(copy);
+        }
+        if (mode == 4) {
+            ggml_build_forward_expand(gf, ggml_add_inplace(ctx, base, base));
+        }
+        if (mode == 5) {
+            ggml_set_output(values);
+            outputs.push_back(values);
+        }
+        auto * out = ggml_set_rows(ctx, base, values, ids);
+        outputs.push_back(out);
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (auto * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64) {
+                std::vector<int64_t> ids(ggml_nelements(t));
+                for (size_t i = 0; i < ids.size(); ++i) {
+                    ids[i] = (i * 7) % (rows / 2);
+                }
+                if (t->type == GGML_TYPE_I64) {
+                    ggml_backend_tensor_set(t, ids.data(), 0, ids.size() * sizeof(int64_t));
+                } else {
+                    std::vector<int32_t> ids32(ids.begin(), ids.end());
+                    ggml_backend_tensor_set(t, ids32.data(), 0, ids32.size() * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_SOLVE_TRI
 struct test_solve_tri : public test_case {
     const ggml_type              type;
@@ -10712,9 +10783,10 @@ struct test_lightning_indexer : public test_case {
 
     const ggml_type type_K;
     const bool      pool;  // a 0/-inf mask named like qwen4exp's pool mask, which a backend may pack
+    const int       fill;
 
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K) + (pool ? ",pool=1" : "");
+        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K) + (pool ? ",pool=1" : "") + ",fill=" + std::to_string(fill);
     }
 
     double max_nmse_err() override {
@@ -10727,8 +10799,11 @@ struct test_lightning_indexer : public test_case {
     }
 
     test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1,
-                           ggml_type type_K = GGML_TYPE_F16, bool pool = false)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), pool(pool) {}
+                           ggml_type type_K = GGML_TYPE_F16, bool pool = false, int fill = 0)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), pool(pool), fill(fill) {}
+
+    bool run_whole_graph() override { return fill != 0; }
+    bool perf_whole_graph() override { return fill != 0; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -10747,6 +10822,15 @@ struct test_lightning_indexer : public test_case {
         ggml_set_param(m);
         ggml_set_name(m, pool ? "inp_pool_mask" : "m");
 
+        if (fill) {
+            w = ggml_fill(ctx, fill == 1 ? w : ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1), 0.088388346f);
+            if (fill != 1) {
+                w = ggml_repeat_4d(ctx, w, nh, nb, 1, ns);
+            }
+            if (fill == 3) {
+                ggml_build_forward_expand(gf, ggml_scale_inplace(ctx, w, 2.0f));
+            }
+        }
         ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
         ggml_set_name(out, "out");
 
@@ -13874,6 +13958,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_tri(GGML_TRI_TYPE_UPPER));
     test_cases.emplace_back(new test_tri(GGML_TRI_TYPE_UPPER_DIAG));
 
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (ggml_type type_idx : { GGML_TYPE_I32, GGML_TYPE_I64 }) {
+            for (int mode = 0; mode <= 5; ++mode) {
+                test_cases.emplace_back(new test_fill_consumers(type, type_idx, mode));
+            }
+        }
+    }
+    test_cases.emplace_back(new test_fill_consumers(GGML_TYPE_F32, GGML_TYPE_I32, 1, 65537));
+    test_cases.emplace_back(new test_fill_consumers(GGML_TYPE_F32, GGML_TYPE_I32, 1, 30000));
+    for (int fill = 1; fill <= 3; ++fill) {
+        for (int64_t batch : { 1, 17 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, 259, batch, 2, 1, GGML_TYPE_F32, false, fill));
+        }
+    }
     test_cases.emplace_back(new test_fill(0.0f));
     test_cases.emplace_back(new test_fill(2.0f, GGML_TYPE_F32, { 303, 207, 11, 3 }));
     test_cases.emplace_back(new test_fill(-152.0f, GGML_TYPE_F32, { 800, 600, 4, 4 }));
@@ -14476,6 +14574,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int mode : { 1, 2 }) {
+            test_cases.emplace_back(new test_fill_consumers(type, GGML_TYPE_I32, mode));
+        }
+    }
+    for (int64_t batch : { 1, 17 }) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, 259, batch, 2, 1, GGML_TYPE_F32, false, 2));
+    }
 
     // qwen4exp QSA attention chain: dense mask + flash attention, or the SYCL gather mode
     for (int64_t n_kv : { 2304, 8192, 32768, 131072 }) {

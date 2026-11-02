@@ -8524,6 +8524,8 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
     const auto * k = score->src[1];
     const auto * w = score->src[2];
     const auto * m = score->src[3];
+    float weight_value;
+    const bool constant_weight = ggml_sycl_constant_input(graph, w, weight_value);
     const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", GGML_SYCL_INDEXER_QUERY_TILE_DEFAULT);
     const auto workspace = ggml_sycl_indexer_workspace_size(top);
     void * staging = score->data ? score->data : top->data;
@@ -8556,7 +8558,7 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
         ggml_tensor qt = *q, wt = *w, mt = *m, st = *score, tk = *top;
         qt.data = (char *) q->data + first * q->nb[2];
         qt.ne[2] = count;
-        wt.data = (char *) w->data + first * w->nb[1];
+        wt.data = constant_weight ? nullptr : (char *) w->data + first * w->nb[1];
         wt.ne[1] = count;
         // a packed mask (kq-mask-bits.hpp) keeps its f16 nb[] but stores packed rows
         const size_t m_row = ggml_sycl_kq_mask_is_bits(m) ? ggml_sycl_kq_mask_row_bytes(m->ne[0]) : m->nb[1];
@@ -8571,7 +8573,7 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
         tk.data = (char *) staging + first * top->nb[1];
         tk.ne[1] = count;
         tk.src[0] = &st;
-        ggml_sycl_op_lightning_indexer(ctx, &st);
+        ggml_sycl_op_lightning_indexer(ctx, &st, constant_weight ? &weight_value : nullptr);
         if (ggml_sycl_kq_mask_is_bits(m)) {
             ggml_sycl_kq_mask_taught(ctx, score);  // the op reported the tile copy, the graph knows the node
         }
@@ -9314,6 +9316,22 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // the nodes of a QSA mask chain whose flash attention reads the selection list itself
+        if (ggml_sycl_qsa_mask_absorbs(cgraph, i)) {
+            continue;
+        }
+
+        if (ggml_sycl_fill_absorbs(cgraph, i, false)) {
+            continue;
+        }
+        if (node->op == GGML_OP_SET_ROWS) {
+            float initial, value;
+            if (ggml_sycl_fill_set_rows(cgraph, node, initial, value)) {
+                ggml_sycl_op_set_rows_filled(*sycl_ctx, node, initial, value);
+                continue;
+            }
+        }
+
         if (node->op == GGML_OP_LIGHTNING_INDEXER && !indexer_selected &&
             ggml_sycl_indexer_topk_tiled(*sycl_ctx, cgraph, i, indexer_selected)) {
             indexer_top = cgraph->nodes[i + 1];
@@ -9323,9 +9341,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
-        // the nodes of a QSA mask chain whose flash attention reads the selection list itself
-        if (ggml_sycl_qsa_mask_absorbs(cgraph, i)) {
-            continue;
+        if (node->op == GGML_OP_LIGHTNING_INDEXER) {
+            float value;
+            if (ggml_sycl_constant_input(cgraph, node->src[2], value)) {
+                ggml_sycl_op_lightning_indexer(*sycl_ctx, node, &value);
+                continue;
+            }
         }
 
         // the MoE down projection whose expert output is never materialized
@@ -10270,6 +10291,9 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 // every predicate here is purely structural, so it holds for every later execution
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
+    if (ggml_sycl_fill_absorbs(cgraph, node_idx, true)) {
+        return 1;
+    }
     if (ggml_sycl_indexer_compact_on()) {
         ggml_tensor * view = nullptr;
         ggml_tensor * selected = nullptr;

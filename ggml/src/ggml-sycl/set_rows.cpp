@@ -1,10 +1,68 @@
 #include "set_rows.hpp"
 #include "kv-soa.hpp"
 #include "cpy.hpp"
+#include "fill.hpp"
 
 #include "ggml-quants.h"
 
 #include <vector>
+
+// Uniform updates let duplicate indices share one selection bit.
+template <typename T, typename I, typename Initial, typename Value>
+static void set_rows_filled(ggml_backend_sycl_context & ctx, ggml_tensor * dst, Initial initial, Value value) {
+    const ggml_tensor * indices = dst->src[1];
+    const int64_t cols = dst->ne[0], rows = dst->ne[1], batches = dst->ne[2] * dst->ne[3];
+    const int64_t ne2 = dst->ne[2], ni = indices->ne[0], ni1 = indices->ne[1], ni2 = indices->ne[2];
+    const size_t nb0 = indices->nb[0], nb1 = indices->nb[1], nb2 = indices->nb[2];
+    const char * ids = static_cast<const char *>(indices->data);
+    T * out = static_cast<T *>(dst->data);
+    const size_t words = (rows + 31) / 32;
+    constexpr size_t block = 256;
+    ctx.stream()->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<uint32_t, 1> selected(words, cgh);
+        cgh.parallel_for(sycl::nd_range<1>(batches * block, block), [=](sycl::nd_item<1> item) {
+            const size_t lane = item.get_local_linear_id();
+            const int64_t batch = item.get_group_linear_id();
+            for (size_t w = lane; w < words; w += block) {
+                selected[w] = 0;
+            }
+            sycl::group_barrier(item.get_group());
+            const size_t offset = (batch % ne2 % ni1) * nb1 + (batch / ne2 % ni2) * nb2;
+            for (int64_t i = lane; i < ni; i += block) {
+                const int64_t row = *reinterpret_cast<const I *>(ids + offset + i * nb0);
+                if (row >= 0 && row < rows) {
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                     sycl::access::address_space::local_space> bits(selected[row >> 5]);
+                    bits.fetch_or(1u << (row & 31));
+                }
+            }
+            sycl::group_barrier(item.get_group());
+            for (int64_t i = lane; i < cols * rows; i += block) {
+                const int64_t row = i / cols;
+                const size_t offset = (batch * cols * rows + i) * sizeof(T);
+                out[batch * cols * rows + i] = static_cast<T>(
+                    (selected[row >> 5] & (1u << (row & 31))) ? value(offset) : initial(offset));
+            }
+        });
+    });
+}
+
+void ggml_sycl_op_set_rows_filled(ggml_backend_sycl_context & ctx, ggml_tensor * dst, float initial, float value) {
+    const ggml_sycl_value_reader<float, true> init{nullptr, initial}, val{nullptr, value};
+    if (dst->type == GGML_TYPE_F16) {
+        if (dst->src[1]->type == GGML_TYPE_I32) {
+            set_rows_filled<sycl::half, int32_t>(ctx, dst, init, val);
+        } else {
+            set_rows_filled<sycl::half, int64_t>(ctx, dst, init, val);
+        }
+    } else {
+        if (dst->src[1]->type == GGML_TYPE_I32) {
+            set_rows_filled<float, int32_t>(ctx, dst, init, val);
+        } else {
+            set_rows_filled<float, int64_t>(ctx, dst, init, val);
+        }
+    }
+}
 
 namespace utils {
 template<typename T>
