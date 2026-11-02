@@ -3436,8 +3436,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
         // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
         // this will be our source of zero values for unmasking top k mask elements
-        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-        zeros = ggml_fill(ctx0, zeros, 0.0f);
+        // the fill only takes its shape from its source, which ggml-alloc still allocates, and every
+        // layer's source is live from the start of the graph: fill one element and repeat it
+        ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), 0.0f);
+        zeros = ggml_repeat_4d(ctx0, zeros, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
 
         // modify KQ mask by unmasking elements that are in top_k indices
         // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])

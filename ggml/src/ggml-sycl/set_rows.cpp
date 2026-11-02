@@ -2,22 +2,25 @@
 #include "kv-soa.hpp"
 #include "cpy.hpp"
 #include "fill.hpp"
+#include "kq-mask-bits.hpp"
 
 #include "ggml-quants.h"
 
 #include <vector>
 
-// Uniform updates let duplicate indices share one selection bit.
-template <typename T, typename I, typename Initial, typename Value>
-static void set_rows_filled(ggml_backend_sycl_context & ctx, ggml_tensor * dst, Initial initial, Value value) {
-    const ggml_tensor * indices = dst->src[1];
-    const int64_t cols = dst->ne[0], rows = dst->ne[1], batches = dst->ne[2] * dst->ne[3];
-    const int64_t ne2 = dst->ne[2], ni = indices->ne[0], ni1 = indices->ne[1], ni2 = indices->ne[2];
+// Uniform updates let duplicate indices share one selection bit. out[L] = (selected ? value :
+// initial) + addend(L), L the linear index of the SET_ROWS element, which out shares
+template <typename TO, typename I, typename Addend>
+static void set_rows_filled(ggml_backend_sycl_context & ctx, const ggml_tensor * sr, TO * out, float initial,
+                            float value, Addend addend) {
+    const ggml_tensor * indices = sr->src[1];
+    const int64_t cols = sr->ne[0], rows = sr->ne[1], batches = sr->ne[2] * sr->ne[3];
+    const int64_t ne2 = sr->ne[2], ni = indices->ne[0], ni1 = indices->ne[1], ni2 = indices->ne[2];
     const size_t nb0 = indices->nb[0], nb1 = indices->nb[1], nb2 = indices->nb[2];
     const char * ids = static_cast<const char *>(indices->data);
-    T * out = static_cast<T *>(dst->data);
     const size_t words = (rows + 31) / 32;
     constexpr size_t block = 256;
+    GGML_ASSERT(rows <= GGML_SYCL_FILL_SET_ROWS_MAX_ROWS);
     ctx.stream()->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint32_t, 1> selected(words, cgh);
         cgh.parallel_for(sycl::nd_range<1>(batches * block, block), [=](sycl::nd_item<1> item) {
@@ -37,30 +40,79 @@ static void set_rows_filled(ggml_backend_sycl_context & ctx, ggml_tensor * dst, 
                 }
             }
             sycl::group_barrier(item.get_group());
+            const int64_t base = batch * cols * rows;
             for (int64_t i = lane; i < cols * rows; i += block) {
                 const int64_t row = i / cols;
-                const size_t offset = (batch * cols * rows + i) * sizeof(T);
-                out[batch * cols * rows + i] = static_cast<T>(
-                    (selected[row >> 5] & (1u << (row & 31))) ? value(offset) : initial(offset));
+                const float   v   = (selected[row >> 5] & (1u << (row & 31))) ? value : initial;
+                out[base + i]     = static_cast<TO>(v + addend(base + i));
             }
         });
     });
 }
 
-void ggml_sycl_op_set_rows_filled(ggml_backend_sycl_context & ctx, ggml_tensor * dst, float initial, float value) {
-    const ggml_sycl_value_reader<float, true> init{nullptr, initial}, val{nullptr, value};
-    if (dst->type == GGML_TYPE_F16) {
-        if (dst->src[1]->type == GGML_TYPE_I32) {
-            set_rows_filled<sycl::half, int32_t>(ctx, dst, init, val);
-        } else {
-            set_rows_filled<sycl::half, int64_t>(ctx, dst, init, val);
-        }
+struct set_rows_no_addend {
+    float operator()(int64_t) const { return 0.0f; }
+};
+
+template <typename T>
+struct set_rows_dense_addend {
+    const T * data;
+    float operator()(int64_t i) const { return static_cast<float>(data[i]); }
+};
+
+// the packed causal mask (kq-mask-bits.hpp), whole and in its own row order
+struct set_rows_bits_addend {
+    const char * bits;
+    size_t       rbyte;
+    int64_t      ne0;
+    float operator()(int64_t i) const {
+        const int64_t  r = i / ne0;
+        const int64_t  c = i - r * ne0;
+        const uint32_t w = ((const uint32_t *) (bits + (size_t) r * rbyte))[c >> 5];
+        return ((w >> (c & 31)) & 1u) ? 0.0f : -INFINITY;
+    }
+};
+
+template <typename TO, typename Addend>
+static void set_rows_filled_idx(ggml_backend_sycl_context & ctx, const ggml_tensor * sr, TO * out, float initial,
+                                float value, Addend addend) {
+    if (sr->src[1]->type == GGML_TYPE_I32) {
+        set_rows_filled<TO, int32_t>(ctx, sr, out, initial, value, addend);
     } else {
-        if (dst->src[1]->type == GGML_TYPE_I32) {
-            set_rows_filled<float, int32_t>(ctx, dst, init, val);
-        } else {
-            set_rows_filled<float, int64_t>(ctx, dst, init, val);
-        }
+        set_rows_filled<TO, int64_t>(ctx, sr, out, initial, value, addend);
+    }
+}
+
+template <typename Addend>
+static void set_rows_filled_out(ggml_backend_sycl_context & ctx, const ggml_tensor * sr, ggml_tensor * out,
+                                float initial, float value, Addend addend) {
+    if (out->type == GGML_TYPE_F16) {
+        set_rows_filled_idx(ctx, sr, static_cast<sycl::half *>(out->data), initial, value, addend);
+    } else {
+        GGML_ASSERT(out->type == GGML_TYPE_F32);
+        set_rows_filled_idx(ctx, sr, static_cast<float *>(out->data), initial, value, addend);
+    }
+}
+
+void ggml_sycl_op_set_rows_filled(ggml_backend_sycl_context & ctx, ggml_tensor * dst, float initial, float value) {
+    set_rows_filled_out(ctx, dst, dst, initial, value, set_rows_no_addend{});
+}
+
+void ggml_sycl_op_set_rows_filled_add(ggml_backend_sycl_context & ctx, ggml_tensor * add,
+                                      const ggml_sycl_fill_set_rows_fold & f) {
+    const ggml_tensor * m = f.addend;
+    GGML_ASSERT(ggml_nelements(add) == ggml_nelements(f.set_rows) && ggml_is_contiguous(add) && ggml_is_contiguous(m));
+    if (ggml_sycl_kq_mask_is_bits(m)) {
+        // the packed mask only reaches a taught ADD whole (kq_mask_add_operand), so its rows are back to back
+        const set_rows_bits_addend a{ static_cast<const char *>(m->data), ggml_sycl_kq_mask_row_bytes(m->ne[0]), m->ne[0] };
+        set_rows_filled_out(ctx, f.set_rows, add, f.initial, f.value, a);
+        ggml_sycl_kq_mask_taught(ctx, add);
+    } else if (m->type == GGML_TYPE_F16) {
+        set_rows_filled_out(ctx, f.set_rows, add, f.initial, f.value,
+                            set_rows_dense_addend<sycl::half>{ static_cast<const sycl::half *>(m->data) });
+    } else {
+        set_rows_filled_out(ctx, f.set_rows, add, f.initial, f.value,
+                            set_rows_dense_addend<float>{ static_cast<const float *>(m->data) });
     }
 }
 

@@ -91,6 +91,7 @@
 #include "ggml-sycl/set.hpp"
 #include "ggml-sycl/dsv4-hc.hpp"
 #include "ggml-sycl/lightning-indexer.hpp"
+#include "ggml-sycl/top-k-mask.hpp"
 #include "ggml-sycl/conv2d.hpp"
 #include "ggml-sycl/conv2d-dw.hpp"
 #include "ggml-sycl/conv2d-transpose.hpp"
@@ -7639,6 +7640,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_sycl_op_lightning_indexer(ctx, dst);
             break;
+        case GGML_OP_TOP_K_MASK:
+            ggml_sycl_op_top_k_mask(ctx, dst);
+            break;
         case GGML_OP_DUP:
             ggml_sycl_dup(ctx, dst);
             break;
@@ -8436,8 +8440,13 @@ static bool ggml_sycl_tensors_overlap(const ggml_tensor * a, const ggml_tensor *
     return ab != nullptr && bb != nullptr && ab < bb + ggml_nbytes(b) && bb < ab + ggml_nbytes(a);
 }
 
+// The scores of the picks, [n_top, n_tokens] in pick order, which the tiled indexer writes next to its
+// top-k when a reader needs them; the tensor itself is never materialized
+static float * ggml_sycl_indexer_picked_data(const ggml_tensor * score, const ggml_tensor * top);
+
 static bool ggml_sycl_match_indexer_topk(const ggml_cgraph * graph, int i,
-                                         ggml_tensor * & view_out, ggml_tensor * & selected_scores_out) {
+                                         ggml_tensor * & view_out, ggml_tensor * & selected_scores_out,
+                                         ggml_tensor ** top_k_mask_out = nullptr) {
     static const int tile = ggml_sycl_get_env("GGML_SYCL_INDEXER_QUERY_TILE", GGML_SYCL_INDEXER_QUERY_TILE_DEFAULT);
     // Keep compact allocation eligibility stable for the worst-case reservation.
     auto * score = graph->nodes[i];
@@ -8461,10 +8470,19 @@ static bool ggml_sycl_match_indexer_topk(const ggml_cgraph * graph, int i,
     }
     ggml_tensor * view = nullptr;
     ggml_tensor * selected_scores = nullptr;
+    ggml_tensor * top_k_mask = nullptr;
+    int32_t       n_readers = 1;  // the top-k
     for (int j = i + 1; j < graph->n_nodes; ++j) {
         auto * node = graph->nodes[j];
         for (const auto * src : node->src) {
             if (src != score || node == top) {
+                continue;
+            }
+            ++n_readers;
+            // TOP_K_MASK reads the score of each of its picks only, which the tiled indexer keeps
+            if (node->op == GGML_OP_TOP_K_MASK && !top_k_mask && node->src[1] == top && node->src[2] == score &&
+                node->src[0] != score && node->src[3] != score && node->src[4] != score) {
+                top_k_mask = node;
                 continue;
             }
             if (view || node->op != GGML_OP_RESHAPE || node->src[0] != score ||
@@ -8494,8 +8512,17 @@ static bool ggml_sycl_match_indexer_topk(const ggml_cgraph * graph, int i,
             return false;
         }
     }
+    // a reader in another split (another backend) would be handed a score that was never computed
+    {
+        const size_t pos = ggml_hash_find(&graph->visited_hash_set, score);
+        if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(graph->visited_hash_set.used, pos) ||
+            graph->use_counts[pos] != n_readers) {
+            return false;
+        }
+    }
+    const bool picked = selected_scores || top_k_mask;
     if (ggml_sycl_indexer_compact_on() ? !ggml_sycl_indexer_workspace_size(top).size
-        : ggml_nbytes(score) < ggml_nbytes(top) * (selected_scores ? 2 : 1)) {
+        : ggml_nbytes(score) < ggml_nbytes(top) * (picked ? 2 : 1)) {
         return false;
     }
     if (selected_scores) {
@@ -8507,7 +8534,26 @@ static bool ggml_sycl_match_indexer_topk(const ggml_cgraph * graph, int i,
     }
     view_out = view;
     selected_scores_out = selected_scores;
+    if (top_k_mask_out) {
+        *top_k_mask_out = top_k_mask;
+    }
     return true;
+}
+
+static float * ggml_sycl_indexer_picked_data(const ggml_tensor * score, const ggml_tensor * top) {
+    if (score->data) {
+        return (float *) ((char *) score->data + ggml_nbytes(top));
+    }
+    return (float *) ((char *) top->data + ggml_sycl_indexer_workspace_size(top).selected);
+}
+
+const float * ggml_sycl_indexer_picked(const ggml_backend_sycl_context & ctx, const ggml_tensor * top) {
+    for (const auto & p : ctx.indexer_picked) {
+        if (p.first == top) {
+            return p.second;
+        }
+    }
+    return nullptr;
 }
 
 
@@ -8515,7 +8561,8 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
                                         ggml_tensor * & selected_scores_out) {
     ggml_tensor * view = nullptr;
     ggml_tensor * selected_scores = nullptr;
-    if (!ggml_sycl_match_indexer_topk(graph, i, view, selected_scores)) {
+    ggml_tensor * top_k_mask = nullptr;
+    if (!ggml_sycl_match_indexer_topk(graph, i, view, selected_scores, &top_k_mask)) {
         return false;
     }
     auto * score = graph->nodes[i];
@@ -8531,7 +8578,7 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
     void * staging = score->data ? score->data : top->data;
     GGML_ASSERT(staging);
     if (score->data) {
-        if (ggml_nbytes(score) < ggml_nbytes(top) * (selected_scores ? 2 : 1) ||
+        if (ggml_nbytes(score) < ggml_nbytes(top) * (selected_scores || top_k_mask ? 2 : 1) ||
             ggml_sycl_tensors_overlap(score, top)) {
             return false;
         }
@@ -8546,12 +8593,11 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
     float * selected = nullptr;
     if (score->data) {
         values = scores.alloc(ctx.pool(), (size_t) score->ne[0] * std::min<int64_t>(tile + 7, score->ne[1]));
-        selected = (float *) ((char *) staging + ggml_nbytes(top));
     } else {
         GGML_ASSERT(workspace.size);
         values = (float *) ((char *) top->data + workspace.scores);
-        selected = (float *) ((char *) top->data + workspace.selected);
     }
+    selected = ggml_sycl_indexer_picked_data(score, top);
     for (int64_t first = 0; first < score->ne[1];) {
         // Keep short tails on the same XMX path as the full query batch.
         const int64_t count = score->ne[1] - first <= tile + 7 ? score->ne[1] - first : tile;
@@ -8578,7 +8624,7 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
             ggml_sycl_kq_mask_taught(ctx, score);  // the op reported the tile copy, the graph knows the node
         }
         ggml_sycl_op_top_k(ctx, &tk);
-        if (selected_scores) {
+        if (selected_scores || top_k_mask) {
             const auto * indices = (const int32_t *) tk.data;
             auto * selected_tile = selected + first * top->ne[0];
             const int64_t width = score->ne[0], n_top = top->ne[0];
@@ -8590,6 +8636,10 @@ static bool ggml_sycl_indexer_topk_tiled(ggml_backend_sycl_context & ctx, ggml_c
         first += count;
     }
     selected_scores_out = selected_scores;
+    if (top_k_mask) {
+        // its TOP_K_MASK reads these instead of the score, which holds the top-k staging now
+        ctx.indexer_picked.emplace_back(top, selected);
+    }
     static std::atomic<int> trace_left{ getenv("GGML_SYCL_INDEXER_QUERY_TRACE") ? 12 : 0 };
     if (trace_left.fetch_sub(1) > 0) {
         fprintf(stderr, "[INDEXER-TILE] fired queries=%ld pools=%ld tile=%d selected_scores=%d\n",
@@ -9282,6 +9332,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
     void * indexer_data = nullptr;
     void * indexer_selected_data = nullptr;
     ggml_tensor * indexer_selected = nullptr;
+    sycl_ctx->indexer_picked.clear();
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -9328,6 +9379,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             float initial, value;
             if (ggml_sycl_fill_set_rows(cgraph, node, initial, value)) {
                 ggml_sycl_op_set_rows_filled(*sycl_ctx, node, initial, value);
+                continue;
+            }
+        }
+        if (node->op == GGML_OP_ADD) {
+            ggml_sycl_fill_set_rows_fold fold;
+            if (ggml_sycl_fill_set_rows_add(cgraph, node, fold)) {
+                ggml_sycl_op_set_rows_filled_add(*sycl_ctx, node, fold);
                 continue;
             }
         }
@@ -10953,6 +11011,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 op->src[2]->type == GGML_TYPE_F32 &&
                 (op->src[3] == nullptr || op->src[3]->type == GGML_TYPE_F32) &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_TOP_K_MASK:
+            return ggml_sycl_top_k_mask_supported(op);
         case GGML_OP_LIGHTNING_INDEXER:
             return op->src[0]->type == GGML_TYPE_F32 &&
                 (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32 ||
