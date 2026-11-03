@@ -671,6 +671,19 @@ constexpr int XMX_ROWS        = 16;  // weight rows per thread (DPAS N)
 constexpr int XMX_CHUNK       = 64;  // widest single launch, more columns run as repeated launches
 constexpr int XMX_FUSED_CHUNK = GGML_SYCL_XMX_GLU_MAX_COLS;  // widest launch of the fused gate and up kernel
 
+constexpr bool xmx_built() {
+#if defined(__SYCL_DEVICE_ONLY__) && \
+    (__SYCL_TARGET_INTEL_GPU_ACM_G10__ || __SYCL_TARGET_INTEL_GPU_ACM_G11__ || __SYCL_TARGET_INTEL_GPU_ACM_G12__ || \
+     __SYCL_TARGET_INTEL_GPU_ARL_H__ || __SYCL_TARGET_INTEL_GPU_PVC__ || __SYCL_TARGET_INTEL_GPU_PVC_VG__ || \
+     __SYCL_TARGET_INTEL_GPU_TGLLP__ || __SYCL_TARGET_INTEL_GPU_RKL__ || __SYCL_TARGET_INTEL_GPU_ADL_S__ || \
+     __SYCL_TARGET_INTEL_GPU_ADL_P__ || __SYCL_TARGET_INTEL_GPU_ADL_N__ || __SYCL_TARGET_INTEL_GPU_DG1__ || \
+     __SYCL_TARGET_INTEL_GPU_MTL_U__ || __SYCL_TARGET_INTEL_GPU_MTL_H__)
+    return false;
+#else
+    return true;
+#endif
+}
+
 // threads that split K for one tile, sized so that the shared memory stays small
 template <int NC> constexpr int xmx_n_split() {
     return NC <= 8 ? 32 : (NC == 16 ? 16 : 8);
@@ -678,7 +691,7 @@ template <int NC> constexpr int xmx_n_split() {
 
 inline bool xmx_supported(const void * vx, const int ncols) {
     // 2D block loads need a 64 byte aligned base
-    return ncols % QK_K == 0 && (uintptr_t) vx % 64 == 0;
+    return ggml_sycl_xmx_supports_shape(ncols, 1) && (uintptr_t) vx % 64 == 0;
 }
 
 // transposed 2D block load of 16 rows, dword (kd, n) lands at [kd * 16 + n]
@@ -688,6 +701,7 @@ ESIMD_INLINE simd<uint32_t, W * XMX_ROWS> xmx_load_t(const void * base, unsigned
     using namespace sycl::ext::intel::esimd;
     if constexpr (SR) {
         simd<uint32_t, W * XMX_ROWS> r;
+#pragma unroll
         for (int n = 0; n < XMX_ROWS; ++n) {
             const unsigned row                = y + n < (int) h ? y + n : h;
             const char *   p                  = (const char *) base + (size_t) row * (pitch + 1);
@@ -1384,20 +1398,23 @@ static void xmx_mul_mat_launch_ks(const void *    vx,
                                   const int       glu_op,
                                   dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK_K == 0);
+    GGML_ASSERT(ncv > 0 && ncv <= NC && (NC > 8 || ncv == NC));
     const size_t n_tiles = (nrows + XMX_ROWS - 1) / XMX_ROWS;
     const int    bpr     = ncols / QK_K;
     const int    rounds  = (bpr + KS_MAX - 1) / KS_MAX;
     const int    ks      = (bpr + rounds - 1) / rounds;
-    stream->submit([&](sycl::handler & cgh) {
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_tiles * ks), sycl::range<1>(ks)),
-                         sycl::ext::oneapi::experimental::properties{
-                             sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, FUSED>()> },
-                         [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
-                             xmx_mul_mat<T, NC, KS_MAX, FUSED>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd,
-                                                               glu_op, (int) it.get_group(0), (int) it.get_local_id(0),
-                                                               ks);
-                         });
-    });
+    if constexpr (xmx_built()) {
+        stream->submit([&](sycl::handler & cgh) {
+            cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(n_tiles * ks), sycl::range<1>(ks)),
+                             sycl::ext::oneapi::experimental::properties{
+                                 sycl::ext::intel::experimental::grf_size<xmx_grf<T, NC, FUSED>()> },
+                             [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                                 xmx_mul_mat<T, NC, KS_MAX, FUSED>(vx, vg, vy, dst, ncols, nrows, ncv, stride_y_bytes, ldd,
+                                                                   glu_op, (int) it.get_group(0), (int) it.get_local_id(0),
+                                                                   ks);
+                             });
+        });
+    }
 }
 
 template <typename T, int NC, bool FUSED>
@@ -1431,6 +1448,8 @@ static void xmx_mul_mat_ncols(const void *    vx,
                               const int       ldd,
                               const int       glu_op,
                               dpct::queue_ptr stream) {
+    GGML_ASSERT(ggml_sycl_xmx_supports_shape(ncols, ncols_dst));
+    GGML_ASSERT(!FUSED || ncols_dst <= XMX_FUSED_CHUNK);
     constexpr int chunk_max = FUSED ? XMX_FUSED_CHUNK : XMX_CHUNK;
     for (int c0 = 0; c0 < ncols_dst; c0 += chunk_max) {
         const int    n  = std::min(chunk_max, ncols_dst - c0);
@@ -1456,6 +1475,8 @@ static void xmx_mul_mat_ncols(const void *    vx,
     case N:                                                                                                      \
         if constexpr (!T::short_rows && (!FUSED || N <= XMX_FUSED_CHUNK)) {                                      \
             xmx_mul_mat_launch<T, N, FUSED>(vx, vg, y, d, ncols, nrows, n, stride_y_bytes, ldd, glu_op, stream); \
+        } else {                                                                                                \
+            GGML_ABORT("unsupported XMX tile: ncols_dst=%d", n);                                                \
         }                                                                                                        \
         break
             XMX_CASE_WIDE(16);

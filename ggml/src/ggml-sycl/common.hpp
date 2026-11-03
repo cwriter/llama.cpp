@@ -443,7 +443,8 @@ typedef sycl::float2 dfloat2;
 
 #define MMVQ_MAX_BATCH_SIZE  8
 
-#if defined(__INTEL_LLVM_COMPILER) && __has_include(<sycl/ext/intel/esimd/xmx/dpas.hpp>)
+#if defined(__INTEL_LLVM_COMPILER) && __has_include(<sycl/ext/intel/esimd/xmx/dpas.hpp>) && \
+    (!defined(GGML_SYCL_MMVQ_XMX_AOT) || GGML_SYCL_MMVQ_XMX_AOT)
 #    define GGML_SYCL_MMVQ_HAS_XMX
 #endif // __INTEL_LLVM_COMPILER
 
@@ -476,6 +477,11 @@ static inline bool ggml_sycl_xmx_supports_arch(gpu_arch arch) {
 // fewest columns for which the XMX kernel is faster than the other kernels
 static inline int ggml_sycl_xmx_min_cols(ggml_type type) {
     return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ? 1 : 2;
+}
+
+static inline bool ggml_sycl_xmx_supports_shape(int64_t k, int64_t ncols) {
+    // The activation scales need a 64-byte surface. Short weight rows have no wide tile.
+    return k >= 2 * QK_K && k % QK_K == 0 && ncols > 0 && (k >= 4 * QK_K || ncols <= 8);
 }
 
 static int g_all_sycl_device_count = -1;

@@ -2154,7 +2154,8 @@ static bool ggml_sycl_mul_mat_vec_q_xmx(int                 device,
         !extra->optimized_feature.is_reordered()) {
         return false;
     }
-    if (src1_ncols < ggml_sycl_xmx_min_cols(src0->type) || src1_ncols > g_ggml_sycl_xmx_max_cols) {
+    if (src1_ncols < ggml_sycl_xmx_min_cols(src0->type) || src1_ncols > g_ggml_sycl_xmx_max_cols ||
+        !ggml_sycl_xmx_supports_shape(src0->ne[0], src1_ncols)) {
         return false;
     }
 
@@ -2166,9 +2167,6 @@ static bool ggml_sycl_mul_mat_vec_q_xmx(int                 device,
 
     // rows under 64 bytes use the variant without 2D block loads, it is not built for the widest tile
     const bool short_rows = ne00 < 4 * QK_K;
-    if (short_rows && src1_ncols > 8) {
-        return false;
-    }
 
     const int stride_y_bytes = src1_padded_col_size * sizeof(block_q8_1) / QK8_1;
     // the 2D block loads of the activations need a 64 byte aligned base and a pitch of 16 bytes
@@ -2200,7 +2198,8 @@ bool ggml_sycl_mul_mat_vec_q_glu_xmx(int              device,
     if (glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_GEGLU) {
         return false;
     }
-    if (ncols_dst < ggml_sycl_xmx_min_cols(src0_type) || ncols_dst > g_ggml_sycl_xmx_glu_max_cols) {
+    if (ncols_dst < ggml_sycl_xmx_min_cols(src0_type) || ncols_dst > g_ggml_sycl_xmx_glu_max_cols ||
+        !ggml_sycl_xmx_supports_shape(ncols, ncols_dst)) {
         return false;
     }
     if (!ggml_sycl_esimd::xmx_supported(vx, ncols) || !ggml_sycl_esimd::xmx_supported(vgate, ncols) ||
@@ -2209,9 +2208,6 @@ bool ggml_sycl_mul_mat_vec_q_glu_xmx(int              device,
     }
     // rows under 64 bytes use the variant without 2D block loads, it is not built for the wide tiles
     const bool short_rows = ncols < 4 * QK_K;
-    if (short_rows && ncols_dst > 8) {
-        return false;
-    }
     return ggml_sycl_mul_mat_vec_q_xmx_type(src0_type, short_rows, vx, vgate, (const char *) vy, dst, ncols, nrows,
                                             ncols_dst, stride_col_y_bytes, stride_col_dst, (int) glu_op, stream);
 #else

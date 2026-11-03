@@ -6152,7 +6152,9 @@ static bool can_use_xmx_batch(int device, const ggml_tensor * src0, const ggml_t
 #ifdef GGML_SYCL_MMVQ_HAS_XMX
     const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
     return ggml_sycl_xmx_enabled(device) && ggml_sycl_xmx_supports_type(src0->type) && extra &&
-           extra->optimized_feature.is_reordered() && src1->ne[1] <= g_ggml_sycl_xmx_max_cols && src1->ne[2] == 1 &&
+           extra->optimized_feature.is_reordered() && ggml_sycl_xmx_supports_shape(src0->ne[0], src1->ne[1]) &&
+           (uintptr_t) src0->data % 64 == 0 && src1->ne[1] >= ggml_sycl_xmx_min_cols(src0->type) &&
+           src1->ne[1] <= g_ggml_sycl_xmx_max_cols && src1->ne[2] == 1 &&
            src1->ne[3] == 1;
 #else
     GGML_UNUSED(device);
@@ -6474,6 +6476,10 @@ static bool ggml_sycl_mul_mat_glu_xmx(ggml_backend_sycl_context & ctx,
                                       const ggml_tensor *         wu,
                                       const ggml_tensor *         wg,
                                       const ggml_tensor *         act) {
+    const auto * eu = static_cast<const ggml_tensor_extra_gpu *>(wu->extra);
+    const auto * eg = static_cast<const ggml_tensor_extra_gpu *>(wg->extra);
+    GGML_ASSERT(eu && eu->optimized_feature.is_reordered());
+    GGML_ASSERT(eg && eg->optimized_feature.is_reordered());
     const int64_t ne00 = wu->ne[0];
     const int64_t ne11 = act->ne[1];
 

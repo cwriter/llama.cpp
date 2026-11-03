@@ -9294,6 +9294,49 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 };
 
+struct test_mul_mat_reused_weight_tiles : public test_case {
+    const ggml_type type;
+    const int64_t k;
+    const int64_t n;
+    const ggml_glu_op glu_op;
+    std::vector<ggml_tensor *> outputs;
+
+    test_mul_mat_reused_weight_tiles(ggml_type type, int64_t k, int64_t n, ggml_glu_op glu_op = GGML_GLU_OP_COUNT)
+        : type(type), k(k), n(n), glu_op(glu_op) {}
+
+    std::string vars() override { return VARS_TO_STR4(type, k, n, glu_op); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_REUSED_WEIGHT_TILES"; }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return outputs; }
+    double max_nmse_err() override { return glu_op == GGML_GLU_OP_COUNT ? 5e-4 : 5e-3; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        outputs.clear();
+        ggml_tensor * up = ggml_new_tensor_2d(ctx, type, k, n);
+        ggml_tensor * gate = glu_op == GGML_GLU_OP_COUNT ? nullptr : ggml_new_tensor_2d(ctx, type, k, n);
+        // The first narrow call lets the backend reorder the weights before the wide calls.
+        for (int64_t tokens : {1, 3, 8, 9, 16, 17, 32, 33, 64, 65, 80}) {
+            if (gate && tokens > 17) {
+                break;
+            }
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+            ggml_tensor * u = ggml_mul_mat(ctx, up, x);
+            ggml_tensor * out = gate ? ggml_glu_split(ctx, ggml_mul_mat(ctx, gate, x), u, glu_op) : u;
+            outputs.push_back(out);
+            ggml_build_forward_expand(gf, out);
+        }
+        return outputs.back();
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        for (ggml_tensor * out : outputs) {
+            std::vector<float> poison(ggml_nelements(out), NAN);
+            ggml_backend_tensor_set(out, poison.data(), 0, ggml_nbytes(out));
+        }
+    }
+};
+
 // n_l MoE gate/up mat-vec pairs with SWIGLU, each layer with its own expert weights and routing, summed. With
 // n_l * n_used experts well above the GPU L2, the experts stream from VRAM as in a model; the single-layer perf
 // case of test_mul_mat_vec_fusion keeps hitting the same experts in L2. The time includes the n_l - 1 adds.
@@ -14225,6 +14268,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // columns on both sides of the 8 and 16 column tiles
     for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
                            GGML_TYPE_Q8_0}) {
+        for (int64_t k : {256, 512, 2048}) {
+            for (ggml_glu_op glu_op : {GGML_GLU_OP_COUNT, GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+                test_cases.emplace_back(new test_mul_mat_reused_weight_tiles(type, k, 1001, glu_op));
+            }
+        }
         for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
             for (int64_t m_batch : {1, 2, 3, 5, 8, 9, 16, 17}) {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m_batch, 1000, 1024,
