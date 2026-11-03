@@ -958,8 +958,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     if (cparams.fused_top_k_mask) {
         GGML_ASSERT(kpool*n_top_pool + inp_kpool->tail_idxs->ne[0] == inp_kpool->n_sel);
 
+        // the picks index the scored pools, the first n_list rows of pool_idxs; with several KV streams there are more
+        ggml_tensor * blocks = ggml_view_2d(ctx0, inp_kpool->pool_idxs, kpool, n_list, inp_kpool->pool_idxs->nb[1], 0);
         ggml_tensor * keep = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, type_mask, inp_kpool->n_kv), 0.0f);
-        ggml_tensor * sel  = ggml_top_k_mask(ctx0, keep, top_k, score, inp_kpool->pool_idxs, inp_kpool->tail_idxs); // [n_kv, n_tokens]
+        ggml_tensor * sel  = ggml_top_k_mask(ctx0, keep, top_k, score, blocks, inp_kpool->tail_idxs); // [n_kv, n_tokens]
         res->add_fused_node({LLM_FUSED_OP_TOP_K_MASK, sel, il});
         cb(sel, "indexer_sel", il);
 
