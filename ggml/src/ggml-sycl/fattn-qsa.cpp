@@ -673,7 +673,9 @@ void ggml_sycl_qsa_sparse_fa(ggml_backend_sycl_context & ctx, ggml_tensor * fa, 
         fprintf(stderr, "[QSASPARSE] causal mask %s\n", ggml_sycl_kq_mask_is_bits(mask) ? "packed" : "f16");
     }
 
-    if (!take) {
+    // the bits path is the chunked oneMKL kernel; GGML_SYCL_ENABLE_MKL_FA=0 runs the dense kernels (oneDNN)
+    // over the exact mask in scratch instead
+    if (!take || (bits && !g_ggml_sycl_enable_mkl_fa)) {
         qsa_dense_scratch_fa(ctx, fa, mask, idx);
         return;
     }
