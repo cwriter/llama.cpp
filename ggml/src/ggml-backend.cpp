@@ -2482,6 +2482,14 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    // GGML_SCHED_COPIES: fewer pipeline copies than the compiled maximum. Every copy pins its own split inputs
+    // (a boundary activation at -ub 1024 is 40 MiB), so this trades pipeline depth for memory.
+    if (parallel) {
+        const char * copies = getenv("GGML_SCHED_COPIES");
+        if (copies && atoi(copies) >= 1) {
+            sched->n_copies = std::min(atoi(copies), GGML_SCHED_MAX_COPIES);
+        }
+    }
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

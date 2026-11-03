@@ -598,6 +598,48 @@ static void kernel_ssm_conv_window(queue & q, const float * state, const float *
     });
 }
 
+int ggml_sycl_conv_window_absorbs(const ggml_cgraph * cgraph, int node_idx) {
+    const ggml_tensor * n      = cgraph->nodes[node_idx];
+    const ggml_tensor * concat = nullptr;
+    switch (n->op) {
+        case GGML_OP_CONCAT:
+            concat = n;
+            break;
+        case GGML_OP_CONT:
+            concat = n->src[0]->op == GGML_OP_VIEW && n->src[0]->src[0]->op == GGML_OP_CONCAT ? n->src[0]->src[0] : nullptr;
+            break;
+        case GGML_OP_SSM_CONV:
+            concat = n->src[0]->op == GGML_OP_CONCAT ? n->src[0] : nullptr;
+            break;
+        case GGML_OP_ADD:
+            for (int s = 0; s < 2 && !concat; ++s) {
+                const ggml_tensor * c = n->src[s];
+                concat = c->op == GGML_OP_SSM_CONV && c->src[0]->op == GGML_OP_CONCAT ? c->src[0] : nullptr;
+            }
+            break;
+        default:
+            return 0;
+    }
+    if (!concat) {
+        return 0;
+    }
+    // the matcher looks at most 64 nodes past the concat
+    for (int i = node_idx; i >= 0 && i >= node_idx - 64; --i) {
+        if (cgraph->nodes[i] != concat) {
+            continue;
+        }
+        ggml_sycl_conv_window_match m;
+        if (!ggml_sycl_match_conv_window(cgraph, i, m)) {
+            return 0;
+        }
+        if (n == m.concat || n == m.conv || n == m.add) {
+            return 1;
+        }
+        return std::find(m.cont, m.cont + m.n_slots, n) != m.cont + m.n_slots ? 1 : 0;
+    }
+    return 0;
+}
+
 void ggml_sycl_ssm_conv_window(ggml_backend_sycl_context & ctx, const ggml_sycl_conv_window_match & m) {
     scope_op_debug_print scope_dbg_print(__func__, m.conv, /*num_src=*/2, " : fused conv window");
 

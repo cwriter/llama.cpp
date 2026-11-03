@@ -24,3 +24,8 @@ struct ggml_sycl_conv_window_match {
 // Purely structural, so graph_optimize and the compute loop see the same answer.
 bool ggml_sycl_match_conv_window(const ggml_cgraph * cgraph, int node_idx, ggml_sycl_conv_window_match & m);
 void ggml_sycl_ssm_conv_window(ggml_backend_sycl_context & ctx, const ggml_sycl_conv_window_match & m);
+
+// For fusion_absorbs: 1 if node_idx is a node of a matched conv window that the window kernel never writes
+// (the concat, its tail conts, the ssm_conv and the bias add), else 0. Only the silu gets a buffer; the
+// kernel runs at the ssm_conv and reads the state and x, which stay live until the silu releases the chain.
+int ggml_sycl_conv_window_absorbs(const ggml_cgraph * cgraph, int node_idx);

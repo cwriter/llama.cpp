@@ -11054,6 +11054,68 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// The qwen4exp indexer keys: the pooled half of a q8_0 cache row gathered by an index (GET_ROWS), viewed to the
+// scored pools, as the lightning indexer's K. A backend may read the q8_0 rows through the index instead.
+struct test_lightning_indexer_gather : public test_case {
+    const int64_t nh;      // indexer heads
+    const int64_t n_cells; // cache rows
+    const int64_t n_pool;  // gathered rows
+    const int64_t n_list;  // scored pools, the first n_list gathered rows
+    const int64_t nb;      // tokens
+
+    std::string vars() override { return VARS_TO_STR5(nh, n_cells, n_pool, n_list, nb); }
+    std::string op_desc(ggml_tensor *) override { return "LIGHTNING_INDEXER_GATHER"; }
+    double max_nmse_err() override { return 1e-6; }
+    bool run_whole_graph() override { return true; }
+
+    test_lightning_indexer_gather(int64_t nh, int64_t n_cells, int64_t n_pool, int64_t n_list, int64_t nb)
+        : nh(nh), n_cells(n_cells), n_pool(n_pool), n_list(n_list), nb(nb) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // raw | pooled, 128 values each
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 256, n_cells);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * rows = ggml_view_2d(ctx, cache, 128, n_cells, cache->nb[1], ggml_row_size(GGML_TYPE_Q8_0, 128));
+        ggml_tensor * idx  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pool);
+        ggml_set_name(idx, "idx");
+        ggml_tensor * pooled = ggml_reshape_3d(ctx, ggml_get_rows(ctx, rows, idx), 128, 1, n_pool);
+        ggml_tensor * k      = ggml_view_3d(ctx, pooled, 128, 1, n_list, pooled->nb[1], pooled->nb[2], 0);
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 128, nh, nb, 1);
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, 1);
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_list, nb, 1, 1);
+        ggml_set_name(m, "inp_pool_mask");
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(7);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (auto & v : data) {
+                    v = (int32_t) (rng() % n_cells);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "inp_pool_mask") == 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f), drop = ggml_fp32_to_fp16(-INFINITY);
+                for (int64_t r = 0; r < ggml_nrows(t); ++r) {
+                    const int64_t nv = rng() % (t->ne[0] + 1);
+                    for (int64_t c = 0; c < t->ne[0]; ++c) {
+                        data[r*t->ne[0] + c] = c < nv ? keep : drop;
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -14762,6 +14824,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
     // lightning_indexer
+    // the pooled keys read through the gather index: one token (vector kernel), a batch (XMX), keys not a
+    // multiple of the work-group, fewer scored than gathered
+    for (int64_t nb : {1, 7, 32, 100}) {
+        test_cases.emplace_back(new test_lightning_indexer_gather(64, 1000, 300, 300, nb));
+        test_cases.emplace_back(new test_lightning_indexer_gather(64, 1000, 300, 257, nb));
+        test_cases.emplace_back(new test_lightning_indexer_gather(4, 64, 70, 33, nb));
+    }
+
     for (int kv : { 256 }) {
         for (int bs : { 1, 512 }) {
             for (int nh : { 4, 32, 64 }) {
