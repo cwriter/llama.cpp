@@ -2325,6 +2325,200 @@ static void q8_0_siblings_launch(const void * va, const void * vb, const float *
     });
 }
 
+// Sibling mat-vecs of mixed weight types (GGML_SYCL_MV_SIBLINGS): one launch computes up to
+// GGML_SYCL_MV_SIBLINGS_MAX mat-vecs of one f32 activation for one token. The matrices' rows are laid end to end,
+// each padded to MV_SIB_NR rows; a work-group takes MV_SIB_NR rows of one matrix, and that matrix's weight type
+// picks one of up to four slot traits S0..S3 (void: no such slot). The branch is uniform per work-group, so the
+// register file is the largest slot's, not their sum. A trait multiplies MV_SIB_NR rows by one stripe of
+// NBLK * 32 activation values: q8_0 reads the reordered layout, bf16 and f32 multiply the f32 activation as is.
+static constexpr int MV_SIB_WG = 4;
+static constexpr int MV_SIB_NR = 4;
+
+struct mv_sib_args {
+    const char * w[GGML_SYCL_MV_SIBLINGS_MAX];
+    float *      dst[GGML_SYCL_MV_SIBLINGS_MAX];
+    int          nrows[GGML_SYCL_MV_SIBLINGS_MAX];
+    int          row_begin[GGML_SYCL_MV_SIBLINGS_MAX];  // in the padded row space
+    int          slot[GGML_SYCL_MV_SIBLINGS_MAX];
+    int          n;
+    int          k;
+};
+
+struct mv_sib_q8_0 {
+    static constexpr int nblk_max = 8;
+
+    template <int NBLK>
+    static ESIMD_INLINE void mac(const char * w, int nrows, int k, const int * rows, int b,
+                                 sycl::ext::intel::esimd::simd<float, 32 * NBLK> y,
+                                 sycl::ext::intel::esimd::simd<float, 32> * acc) {
+        const int8_t *     qs = (const int8_t *) w;
+        const sycl::half * d  = (const sycl::half *) (qs + (size_t) nrows * k);
+        size_t             base[MV_SIB_NR];
+#pragma unroll
+        for (int r = 0; r < MV_SIB_NR; ++r) {
+            base[r] = (size_t) rows[r] * (k / QK8_0);
+        }
+        q8_0_mac_stripe_rows_loaded<NBLK, MV_SIB_NR>(qs, d, base, b, y, acc);
+    }
+};
+
+struct mv_sib_bf16 {
+    static constexpr int nblk_max = 4;
+
+    template <int NBLK>
+    static ESIMD_INLINE void mac(const char * w, int nrows, int k, const int * rows, int b,
+                                 sycl::ext::intel::esimd::simd<float, 32 * NBLK> y,
+                                 sycl::ext::intel::esimd::simd<float, 32> * acc) {
+        using namespace sycl::ext::intel::esimd;
+        GGML_UNUSED(nrows);
+        const uint16_t *        h = (const uint16_t *) w;
+        simd<uint16_t, 32 * NBLK> raw[MV_SIB_NR];
+#pragma unroll
+        for (int r = 0; r < MV_SIB_NR; ++r) {
+            raw[r] = block_load<uint16_t, 32 * NBLK>(h + (size_t) rows[r] * k + (size_t) b * 32);
+        }
+#pragma unroll
+        for (int r = 0; r < MV_SIB_NR; ++r) {
+            simd<uint32_t, 32 * NBLK> u = convert<uint32_t>(raw[r]);
+            u <<= 16;  // bf16 is the top half of an f32
+            simd<float, 32 * NBLK> f = u.template bit_cast_view<float>();
+#pragma unroll
+            for (int s = 0; s < NBLK; ++s) {
+                acc[r] += y.template select<32, 1>(s * 32) * f.template select<32, 1>(s * 32);
+            }
+        }
+    }
+};
+
+struct mv_sib_f32 {
+    static constexpr int nblk_max = 4;
+
+    template <int NBLK>
+    static ESIMD_INLINE void mac(const char * w, int nrows, int k, const int * rows, int b,
+                                 sycl::ext::intel::esimd::simd<float, 32 * NBLK> y,
+                                 sycl::ext::intel::esimd::simd<float, 32> * acc) {
+        using namespace sycl::ext::intel::esimd;
+        GGML_UNUSED(nrows);
+        const float *          f = (const float *) w;
+        simd<float, 32 * NBLK> v[MV_SIB_NR];
+#pragma unroll
+        for (int r = 0; r < MV_SIB_NR; ++r) {
+            v[r] = block_load<float, 32 * NBLK>(f + (size_t) rows[r] * k + (size_t) b * 32);
+        }
+#pragma unroll
+        for (int r = 0; r < MV_SIB_NR; ++r) {
+#pragma unroll
+            for (int s = 0; s < NBLK; ++s) {
+                acc[r] += y.template select<32, 1>(s * 32) * v[r].template select<32, 1>(s * 32);
+            }
+        }
+    }
+};
+
+// one work-group thread's partial dot products of MV_SIB_NR rows starting at lrow
+template <typename S>
+ESIMD_INLINE sycl::ext::intel::esimd::simd<float, MV_SIB_NR> mv_sib_partial(const char * w, int nrows, int k, int lrow,
+                                                                            int tid, const float * y) {
+    using namespace sycl::ext::intel::esimd;
+    int rows[MV_SIB_NR];
+    simd<float, 32> acc[MV_SIB_NR];
+#pragma unroll
+    for (int r = 0; r < MV_SIB_NR; ++r) {
+        rows[r] = lrow + r < nrows ? lrow + r : nrows - 1;
+        acc[r]  = 0.0f;
+    }
+    const int blocks = k / 32;
+    int       ib     = 0;
+    if constexpr (S::nblk_max >= 8) {
+        for (; ib + MV_SIB_WG * 8 <= blocks; ib += MV_SIB_WG * 8) {
+            const int b = ib + tid * 8;
+            S::template mac<8>(w, nrows, k, rows, b, block_load<float, 256>(y + (size_t) b * 32), acc);
+        }
+    }
+    for (; ib + MV_SIB_WG * 4 <= blocks; ib += MV_SIB_WG * 4) {
+        const int b = ib + tid * 4;
+        S::template mac<4>(w, nrows, k, rows, b, block_load<float, 128>(y + (size_t) b * 32), acc);
+    }
+    for (; ib + MV_SIB_WG * 2 <= blocks; ib += MV_SIB_WG * 2) {
+        const int b = ib + tid * 2;
+        S::template mac<2>(w, nrows, k, rows, b, block_load<float, 64>(y + (size_t) b * 32), acc);
+    }
+    for (int b = ib + tid; b < blocks; b += MV_SIB_WG) {
+        S::template mac<1>(w, nrows, k, rows, b, block_load<float, 32>(y + (size_t) b * 32), acc);
+    }
+    simd<float, MV_SIB_NR> out;
+#pragma unroll
+    for (int r = 0; r < MV_SIB_NR; ++r) {
+        out[r] = reduce<float>(acc[r], std::plus<>{});
+    }
+    return out;
+}
+
+template <typename S0, typename S1 = void, typename S2 = void, typename S3 = void>
+static void mv_siblings_launch(const mv_sib_args & a, int total_rows, const float * y, dpct::queue_ptr stream) {
+    const int groups = total_rows / MV_SIB_NR;
+    stream->submit([&](sycl::handler & h) {
+        sycl::local_accessor<float, 1> lmem(sycl::range<1>(MV_SIB_WG * MV_SIB_NR), h);
+        h.parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) groups * MV_SIB_WG), sycl::range<1>(MV_SIB_WG)),
+            [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+                using namespace sycl::ext::intel::esimd;
+                const int tid  = it.get_local_id(0);
+                const int grow = it.get_group(0) * MV_SIB_NR;
+                // this group's matrix: compile-time indices only, so the argument arrays stay in registers
+                const char * w     = a.w[0];
+                float *      dst   = a.dst[0];
+                int          nrows = a.nrows[0];
+                int          begin = a.row_begin[0];
+                int          slot  = a.slot[0];
+#pragma unroll
+                for (int j = 1; j < GGML_SYCL_MV_SIBLINGS_MAX; ++j) {
+                    if (j < a.n && grow >= a.row_begin[j]) {
+                        w     = a.w[j];
+                        dst   = a.dst[j];
+                        nrows = a.nrows[j];
+                        begin = a.row_begin[j];
+                        slot  = a.slot[j];
+                    }
+                }
+                const int lrow = grow - begin;
+
+                simd<float, MV_SIB_NR> part = 0.0f;
+                if (slot == 0) {
+                    part = mv_sib_partial<S0>(w, nrows, a.k, lrow, tid, y);
+                }
+                if constexpr (!std::is_void_v<S1>) {
+                    if (slot == 1) {
+                        part = mv_sib_partial<S1>(w, nrows, a.k, lrow, tid, y);
+                    }
+                }
+                if constexpr (!std::is_void_v<S2>) {
+                    if (slot == 2) {
+                        part = mv_sib_partial<S2>(w, nrows, a.k, lrow, tid, y);
+                    }
+                }
+                if constexpr (!std::is_void_v<S3>) {
+                    if (slot == 3) {
+                        part = mv_sib_partial<S3>(w, nrows, a.k, lrow, tid, y);
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < MV_SIB_NR; ++r) {
+                    lmem[tid * MV_SIB_NR + r] = part[r];
+                }
+                sycl::group_barrier(it.get_group());
+                if (tid < MV_SIB_NR && lrow + tid < nrows) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (int t = 0; t < MV_SIB_WG; ++t) {
+                        s += lmem[t * MV_SIB_NR + tid];
+                    }
+                    dst[lrow + tid] = s;
+                }
+            });
+    });
+}
+
 template <int WG, int NR>
 ESIMD_INLINE void dequantize_mul_mat_vec_q8_0_reorder_esimd_rows(
         const void * vx, const float * y, float * dst,
@@ -4199,6 +4393,59 @@ bool ggml_sycl_q8_0_siblings_esimd(const void * va, const void * vb, const float
     return true;
 #else
     GGML_UNUSED_VARS(va, vb, y, oa, ob, k, ma, mb, mode, stream);
+    return false;
+#endif
+}
+
+bool ggml_sycl_mv_siblings_esimd(const ggml_sycl_mv_sibling * mats, int n, const float * y, int64_t k,
+                                 dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (!g_ggml_sycl_enable_esimd || n < 1 || n > GGML_SYCL_MV_SIBLINGS_MAX || k <= 0 || k % 32 || k > INT32_MAX / 2) {
+        return false;
+    }
+    // slots in a fixed type order, numbered over the types present
+    static constexpr ggml_type order[] = { GGML_TYPE_Q8_0, GGML_TYPE_BF16 };
+    bool present[2] = {};
+    for (int i = 0; i < n; ++i) {
+        int t = -1;
+        for (int o = 0; o < 2; ++o) {
+            t = mats[i].type == order[o] ? o : t;
+        }
+        // f32 slots (mv_sib_f32) come with the epilogues: not instantiated yet, to keep the JIT small
+        if (t < 0 || mats[i].nrows <= 0 || mats[i].nrows > INT32_MAX / 2) {
+            return false;
+        }
+        present[t] = true;
+    }
+    mv_sib_args a = {};
+    a.n           = n;
+    a.k           = (int) k;
+    int64_t total = 0;
+    for (int i = 0; i < n; ++i) {
+        int slot = 0;
+        for (int o = 0; o < 2 && order[o] != mats[i].type; ++o) {
+            slot += present[o] ? 1 : 0;
+        }
+        a.w[i]         = (const char *) mats[i].w;
+        a.dst[i]       = mats[i].dst;
+        a.nrows[i]     = (int) mats[i].nrows;
+        a.slot[i]      = slot;
+        a.row_begin[i] = (int) total;
+        total += (mats[i].nrows + MV_SIB_NR - 1) / MV_SIB_NR * MV_SIB_NR;
+        if (total > INT32_MAX / 2) {
+            return false;
+        }
+    }
+    if (present[0] && present[1]) {
+        mv_siblings_launch<mv_sib_q8_0, mv_sib_bf16>(a, (int) total, y, stream);
+    } else if (present[0]) {
+        mv_siblings_launch<mv_sib_q8_0>(a, (int) total, y, stream);
+    } else {
+        mv_siblings_launch<mv_sib_bf16>(a, (int) total, y, stream);
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(mats, n, y, k, stream);
     return false;
 #endif
 }

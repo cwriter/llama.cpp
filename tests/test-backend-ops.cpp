@@ -6000,6 +6000,56 @@ struct test_mul_mat_siblings : public test_case {
     }
 };
 
+// Mat-vecs of mixed weight types reading one activation, adjacent (GGML_SYCL_MV_SIBLINGS on SYCL), their outputs
+// concatenated. `between` puts a unary of the first output between the first two mat-vecs, so nothing fuses.
+struct test_mv_siblings : public test_case {
+    const std::vector<ggml_type> types;
+    const std::vector<int64_t>   rows;
+    const int64_t                k;
+    const int64_t                tokens;
+    const bool                   between;
+
+    test_mv_siblings(std::vector<ggml_type> types, std::vector<int64_t> rows, int64_t k = 2560, int64_t tokens = 1,
+                     bool between = false)
+        : types(std::move(types)), rows(std::move(rows)), k(k), tokens(tokens), between(between) {}
+
+    std::string vars() override {
+        std::string t, r;
+        for (size_t i = 0; i < types.size(); ++i) {
+            t += (i ? "," : "") + std::string(ggml_type_name(types[i]));
+            r += (i ? "," : "") + std::to_string(rows[i]);
+        }
+        return "types=[" + t + "],rows=[" + r + "],k=" + std::to_string(k) + ",tokens=" + std::to_string(tokens) +
+               ",between=" + std::to_string(between);
+    }
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MV_SIBLINGS"; }
+    double max_nmse_err() override { return 5e-4; }
+    bool run_whole_graph() override { return true; }
+    bool perf_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        ggml_set_name(x, "x");
+        std::vector<ggml_tensor *> outs;
+        for (size_t i = 0; i < types.size(); ++i) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, types[i], k, rows[i]);
+            ggml_set_name(w, ("w" + std::to_string(i)).c_str());
+            ggml_tensor * y = ggml_mul_mat(ctx, w, x);
+            ggml_build_forward_expand(gf, y);
+            if (between && i == 0) {
+                y = ggml_silu(ctx, y);
+                ggml_build_forward_expand(gf, y);
+            }
+            outs.push_back(y);
+        }
+        ggml_tensor * out = outs[0];
+        for (size_t i = 1; i < outs.size(); ++i) {
+            out = ggml_concat(ctx, out, outs[i], 0);
+        }
+        return out;
+    }
+};
+
 // The decode tail of n_l qwen4exp recurrent layers, each with its own weights so they stream from VRAM:
 // gated_delta_net (state gathered from and written back to the cache) -> rms_norm * w -> * sigmoid(attn_gate x)
 // -> ssm_out, summed. mode 0 replaces the delta net by an input, so the mat-vecs run without its state writes,
@@ -13017,6 +13067,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_mul_mat_siblings(2560, 10240, 6144));
+    // qwen4exp's QSA projections of one activation: indexer k/q (bf16), attention q, v, k (q8_0)
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, { 128, 512, 12288, 512, 512 }));
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, { 12288, 512, 512 }));
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_BF16 }, { 128, 512 }));
+    for (int64_t k : { 2048, 2080, 2560, 3072, 4064 }) {
+        test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 321, 257 }, k));
+        test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 1, 3, 7 }, k));
+    }
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 1, 3, 5, 7, 9, 11, 13, 15 }));
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 64, 65, 66, 67, 68, 69, 70, 71, 72 }));
+    // not taken: two tokens, K out of range, a node in between
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, { 128, 512, 512 }, 2560, 2));
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, { 128, 512, 512 }, 4096));
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, { 128, 512, 512 }, 2560, 1, true));
     test_cases.emplace_back(new test_mul_mat_siblings(2560, 512, 512));
     test_cases.emplace_back(new test_mul_mat_siblings(2560, 12288, 512));
     test_cases.emplace_back(new test_mul_mat_siblings(2560, 321, 257, 2));

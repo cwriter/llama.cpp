@@ -8753,6 +8753,100 @@ static bool ggml_sycl_q8_f32_rows_fused(ggml_backend_sycl_context & ctx, ggml_cg
                                          (float *) b->data, act->ne[0], wa->ne[1], wb->ne[1], ctx.stream());
 }
 
+// GGML_SYCL_MV_SIBLINGS (default 1): the mat-vecs of one f32 activation, of q8_0 and bf16 weights, in one ESIMD
+// launch (ggml_sycl_mv_siblings_esimd). It takes a run of adjacent siblings only where it saves over the q8_0 pair
+// kernel: three or more, or a bf16 one (whose unfused path also converts the activation). graph_optimize moves the
+// siblings together (ggml_sycl_hoist_mv_siblings).
+static bool ggml_sycl_mv_siblings_on() {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_MV_SIBLINGS", 1) != 0;
+    return on && g_ggml_sycl_enable_fusion && g_ggml_sycl_enable_esimd && !g_ggml_sycl_prioritize_dmmv &&
+           g_ggml_sycl_q8_0_mmv_shapes && ggml_sycl_supports_reorder_esimd(GGML_TYPE_Q8_0);
+}
+
+// structural, so graph_optimize can ask it for any batch size; the fused launch adds act->ne[1] == 1
+static bool ggml_sycl_mv_sibling_eligible(const ggml_cgraph * cgraph, int idx, const ggml_tensor * act) {
+    const ggml_tensor * n = cgraph->nodes[idx];
+    if (n->op != GGML_OP_MUL_MAT || n->src[1] != act || n->type != GGML_TYPE_F32 || n->view_src ||
+        !ggml_is_contiguous(n) || !(n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+        return false;
+    }
+    if (act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || act->ne[2] != 1 || act->ne[3] != 1 ||
+        act->ne[0] % 32 || act->ne[0] < 2048 || act->ne[0] >= 4096) {
+        return false;
+    }
+    const ggml_tensor * w = n->src[0];
+    if ((w->type != GGML_TYPE_Q8_0 && w->type != GGML_TYPE_BF16) || !ggml_is_contiguous(w) || w->ne[0] != act->ne[0] ||
+        w->ne[2] != 1 || w->ne[3] != 1 || n->ne[0] != w->ne[1] || (w->buffer && ggml_backend_buffer_is_sycl_split(w->buffer))) {
+        return false;
+    }
+    // leave the gate/up mat-vecs to the GLU fusions
+    for (int j = idx + 1; j < cgraph->n_nodes && j <= idx + 64; ++j) {
+        const ggml_tensor * c = cgraph->nodes[j];
+        if (c->op == GGML_OP_GLU && (c->src[0] == n || c->src[1] == n)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int ggml_sycl_mv_siblings_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * cgraph, int i) {
+    if (!ggml_sycl_mv_siblings_on()) {
+        return 0;
+    }
+    const ggml_tensor * act = cgraph->nodes[i]->src[1];
+    if (!act || act->ne[1] != 1 || !ggml_sycl_mv_sibling_eligible(cgraph, i, act)) {
+        return 0;
+    }
+    ggml_tensor * group[GGML_SYCL_MV_SIBLINGS_MAX];
+    int           count = 0;
+    int           last  = i;
+    bool          bf16  = false;
+    for (int j = i; j < cgraph->n_nodes && count < GGML_SYCL_MV_SIBLINGS_MAX; ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (ggml_sycl_is_view_or_noop(nj) || (nj->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (!ggml_sycl_mv_sibling_eligible(cgraph, j, act)) {
+            break;
+        }
+        // the launch writes every destination at once, and reads the activation and the weights throughout
+        bool indep = !ggml_sycl_tensors_overlap(nj, act) && !ggml_sycl_tensors_overlap(nj, nj->src[0]);
+        for (int k = 0; k < count && indep; ++k) {
+            indep = !ggml_sycl_tensors_overlap(nj, group[k]) && !ggml_sycl_tensors_overlap(nj, group[k]->src[0]);
+        }
+        if (!indep) {
+            break;
+        }
+        bf16 = bf16 || nj->src[0]->type == GGML_TYPE_BF16;
+        group[count++] = nj;
+        last           = j;
+    }
+    if (count < 2 || (count < 3 && !bf16)) {
+        return 0;
+    }
+    ggml_sycl_mv_sibling mats[GGML_SYCL_MV_SIBLINGS_MAX];
+    for (int k = 0; k < count; ++k) {
+        ggml_tensor * w = group[k]->src[0];
+        if (w->type == GGML_TYPE_Q8_0) {
+            if (!can_use_dequantize_mul_mat_vec(w, act, group[k])) {
+                return 0;
+            }
+            opt_for_reorder(&ctx, w, act, group[k], mul_mat_algo::DMMV);
+            const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(w->extra);
+            if (!extra || !extra->optimized_feature.is_reordered()) {
+                return 0;
+            }
+        }
+        mats[k] = { w->data, (float *) group[k]->data, w->ne[1], w->type };
+    }
+    scope_op_debug_print scope_dbg_print(__func__, group[0], /*num_src=*/2, " : mixed-type mat-vec siblings");
+    if (!ggml_sycl_mv_siblings_esimd(mats, count, (const float *) act->data, act->ne[0], ctx.stream())) {
+        return 0;
+    }
+    ggml_sycl_mv_fuse_trace("mv_siblings", group, count, last - i + 1);
+    return last - i;
+}
+
 static ggml_tensor * ggml_sycl_q8_sibling_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i) {
     static const int mode = ggml_sycl_get_env("GGML_SYCL_Q8_0_SIBLINGS", 1);
     if ((mode != 1 && mode != 2) || !g_ggml_sycl_enable_fusion || !g_ggml_sycl_enable_esimd ||
@@ -9774,6 +9868,12 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 
+        if (node->op == GGML_OP_MUL_MAT) {
+            if (const int skip = ggml_sycl_mv_siblings_fused(*sycl_ctx, cgraph, i)) {
+                i += skip;
+                continue;
+            }
+        }
         if (node->op == GGML_OP_MUL_MAT && ggml_sycl_q8_f32_rows_fused(*sycl_ctx, cgraph, i)) {
             i++;
             continue;
@@ -10472,6 +10572,41 @@ static void ggml_sycl_hoist_q8_siblings(ggml_cgraph * cgraph) {
     }
 }
 
+// Move the later mat-vec siblings ggml_sycl_mv_siblings_fused takes right behind the first one. Done for every batch
+// size, so the node order (which ggml-alloc matches by index) does not depend on it; only the order changes, and a
+// moved node reads only the activation, computed before the first sibling, and a weight.
+static void ggml_sycl_hoist_mv_siblings(ggml_cgraph * cgraph) {
+    if (!ggml_sycl_mv_siblings_on()) {
+        return;
+    }
+    for (int i = 0; i < cgraph->n_nodes - 1; ++i) {
+        const ggml_tensor * a = cgraph->nodes[i];
+        if (a->op != GGML_OP_MUL_MAT || !ggml_sycl_mv_sibling_eligible(cgraph, i, a->src[1])) {
+            continue;
+        }
+        const ggml_tensor * act = a->src[1];
+        int  cand[GGML_SYCL_MV_SIBLINGS_MAX];
+        int  n_cand = 0;
+        bool bf16   = a->src[0]->type == GGML_TYPE_BF16;
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 96 && n_cand < GGML_SYCL_MV_SIBLINGS_MAX - 1; ++j) {
+            if (ggml_sycl_mv_sibling_eligible(cgraph, j, act) && ggml_sycl_can_hoist(cgraph, i, j)) {
+                cand[n_cand++] = j;
+                bf16 = bf16 || cgraph->nodes[j]->src[0]->type == GGML_TYPE_BF16;
+            }
+        }
+        if (n_cand < 1 || (n_cand < 2 && !bf16)) {
+            continue;  // what the fused launch would not take; the q8_0 pair hoist handles pairs
+        }
+        int last = i;
+        for (int c = 0; c < n_cand; ++c) {
+            const int j = cand[c];  // positions after last are not shifted by rotating earlier ones up
+            std::rotate(cgraph->nodes + last + 1, cgraph->nodes + j, cgraph->nodes + j + 1);
+            ++last;
+        }
+        i = last;
+    }
+}
+
 // Move a small f32 mat-vec (at most 8 rows) right behind the Q8_0 mat-vec with K >= 4096 that reads the same
 // activation, so both run in one launch (ggml_sycl_q8_f32_rows_fused). Only the order changes.
 static void ggml_sycl_hoist_q8_f32_rows(ggml_cgraph * cgraph) {
@@ -10564,6 +10699,7 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
     ggml_sycl_hoist_q8_siblings(cgraph);
     ggml_sycl_hoist_q8_f32_rows(cgraph);
     ggml_sycl_hoist_f32_siblings(cgraph);
+    ggml_sycl_hoist_mv_siblings(cgraph);
     // the norm + rope fusion that continues through the rotation (and the cache write) reads the norm's input
     // at the norm and writes the span's last node, which ggml-alloc must not place over that input
     for (int i = 0; i < cgraph->n_nodes; ++i) {
