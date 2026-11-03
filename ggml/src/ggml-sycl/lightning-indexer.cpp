@@ -7,6 +7,33 @@
 namespace mx = sycl::ext::oneapi::experimental::matrix;
 
 // mask value of pool i in a row: dense f16, or the packed form of kq-mask-bits.hpp (bit set = keep)
+const ggml_tensor * ggml_sycl_li_k_gather(const ggml_tensor * k) {
+    if (!k || k->type != GGML_TYPE_F32 || k->ne[0] != 128 || k->ne[1] != 1 || k->ne[3] != 1) {
+        return nullptr;
+    }
+    // through views and reshapes that start at the gathered tensor's first row and keep its row stride
+    const ggml_tensor * t = k;
+    while (t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE) {
+        if (t->view_offs != 0) {
+            return nullptr;
+        }
+        t = t->src[0];
+    }
+    const ggml_tensor * gr = t;
+    if (gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 || !ggml_is_contiguous(gr) || gr->ne[0] != 128 ||
+        gr->ne[2] != 1 || gr->ne[3] != 1 || k->nb[2] != gr->nb[1] || k->ne[2] > gr->ne[1]) {
+        return nullptr;
+    }
+    const ggml_tensor * rows = gr->src[0];
+    const ggml_tensor * idx  = gr->src[1];
+    if (rows->type != GGML_TYPE_Q8_0 || rows->ne[0] != 128 || rows->nb[0] != sizeof(block_q8_0) || rows->ne[2] != 1 ||
+        rows->ne[3] != 1 || rows->nb[1] % 2 != 0 || idx->type != GGML_TYPE_I32 || !ggml_is_contiguous(idx) ||
+        idx->ne[0] != gr->ne[1] || idx->ne[1] != 1 || idx->ne[2] != 1 || idx->ne[3] != 1) {
+        return nullptr;
+    }
+    return gr;
+}
+
 static inline float li_mask_val(const char * row, int64_t i, bool bits) {
     if (bits) {
         const uint32_t w = ((const uint32_t *) row)[i >> 5];
@@ -188,12 +215,42 @@ static inline void li_load8(const k_t * src, float * out) {
     }
 }
 
-template <typename k_t, typename Weight>
+// How a kernel reaches key i_kv of stream s: rows of a plain K tensor, or the rows of a q8_0 cache picked by
+// an index (ggml_sycl_li_k_gather), dequantized as GET_ROWS would, so the gathered f32 copy is never written.
+template <typename k_t> struct li_k_plain {
+    const char * k;
+    size_t       nbk2;
+    size_t       nbk3;
+
+    const char * row(int i_kv, int s) const { return k + (size_t) i_kv*nbk2 + (size_t) s*nbk3; }
+    void load8(const char * row, int e, float * out) const { li_load8((const k_t *) row + e, out); }
+};
+
+struct li_k_gather_q8_0 {
+    const char *    base;  // the q8_0 rows
+    const int32_t * idx;   // key i_kv is row idx[i_kv]
+    size_t          nb1;   // bytes between rows
+
+    const char * row(int i_kv, int s) const {
+        (void) s;
+        return base + (size_t) idx[i_kv]*nb1;
+    }
+    void load8(const char * row, int e, float * out) const {
+        const block_q8_0 * b = (const block_q8_0 *) row + e / QK8_0;
+        const float        d = (float) b->d;
+        const int8_t *     q = b->qs + e % QK8_0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            out[j] = q[j]*d;
+        }
+    }
+};
+
+template <typename KA, typename Weight>
 static void lightning_indexer_vec_sycl(
-        const char * q, const char * k, Weight w, const char * m, char * dst,
+        const char * q, KA ka, Weight w, const char * m, char * dst,
         int n_head, int n_batch, int n_stream, int n_kv, int nem3,
         size_t nbq1, size_t nbq2, size_t nbq3,
-        size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw3,
         size_t nbm1, size_t nbm3, bool mbits,
         size_t nb1, size_t nb3,
@@ -217,8 +274,7 @@ static void lightning_indexer_vec_sycl(
 #pragma unroll
             for (int j = 0; j < LI_VEC_KEYS; ++j) {
                 if (kv0 + j < n_kv) {
-                    const k_t * k_row = (const k_t *) (k + (size_t) (kv0 + j)*nbk2 + (size_t) i_stream*nbk3);
-                    li_load8(k_row + lane*LI_VEC_LANE_E, k_reg[j]);
+                    ka.load8(ka.row(kv0 + j, i_stream), lane*LI_VEC_LANE_E, k_reg[j]);
                 } else {
 #pragma unroll
                     for (int e = 0; e < LI_VEC_LANE_E; ++e) {
@@ -302,13 +358,12 @@ static bool li_xmx_supported(queue_ptr stream) {
     return false;
 }
 
-template <typename k_t, typename Weight>
+template <typename KA, typename Weight>
 static void lightning_indexer_xmx_sycl(
         ggml_backend_sycl_context & ctx,
-        const char * q, const char * k, Weight w, const char * m, char * dst,
+        const char * q, KA ka, Weight w, const char * m, char * dst,
         int n_head, int n_batch, int n_stream, int n_kv, int nem3,
         size_t nbq1, size_t nbq2, size_t nbq3,
-        size_t nbk2, size_t nbk3,
         size_t nbw1, size_t nbw3,
         size_t nbm1, size_t nbm3, bool mbits,
         size_t nb1, size_t nb3,
@@ -357,11 +412,11 @@ static void lightning_indexer_xmx_sycl(
                     const int i_kv = kv0 + key;
                     sycl::half2 * kt = (sycl::half2 *) &k_tile[0];
                     if (i_kv < n_kv) {
-                        const k_t * k_row = (const k_t *) (k + (size_t) i_kv*nbk2 + (size_t) i_stream*nbk3);
+                        const char * k_row = ka.row(i_kv, i_stream);
 #pragma unroll
                         for (int e = 0; e < LI_EMBD; e += 8) {
                             float kf[8];
-                            li_load8(k_row + e, kf);
+                            ka.load8(k_row, e, kf);
 #pragma unroll
                             for (int j = 0; j < 8; j += 2) {
                                 kt[((e + j)/2)*LI_XMX_KEYS + key] = sycl::half2((sycl::half) kf[j], (sycl::half) kf[j + 1]);
@@ -449,8 +504,8 @@ static void lightning_indexer_xmx_sycl(
     });
 }
 
-template <typename k_t, typename Weight>
-static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, bool use_xmx,
+template <typename KA, typename Weight>
+static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, KA ka, bool use_xmx,
                                         size_t nbm1, size_t nbm3, bool mbits, Weight weight) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -464,16 +519,16 @@ static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_te
     const int nem3     = m->ne[3];
 
     if (use_xmx) {
-        lightning_indexer_xmx_sycl<k_t>(ctx,
-            (const char *) q->data, (const char *) k->data, weight, (const char *) m->data, (char *) dst->data,
+        lightning_indexer_xmx_sycl(ctx,
+            (const char *) q->data, ka, weight, (const char *) m->data, (char *) dst->data,
             n_head, n_batch, n_stream, n_kv, nem3,
-            q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], nbm1, nbm3, mbits, dst->nb[1], dst->nb[3],
+            q->nb[1], q->nb[2], q->nb[3], w->nb[1], w->nb[3], nbm1, nbm3, mbits, dst->nb[1], dst->nb[3],
             ctx.stream());
     } else {
-        lightning_indexer_vec_sycl<k_t>(
-            (const char *) q->data, (const char *) k->data, weight, (const char *) m->data, (char *) dst->data,
+        lightning_indexer_vec_sycl(
+            (const char *) q->data, ka, weight, (const char *) m->data, (char *) dst->data,
             n_head, n_batch, n_stream, n_kv, nem3,
-            q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], nbm1, nbm3, mbits, dst->nb[1], dst->nb[3],
+            q->nb[1], q->nb[2], q->nb[3], w->nb[1], w->nb[3], nbm1, nbm3, mbits, dst->nb[1], dst->nb[3],
             ctx.stream());
     }
 }
@@ -530,10 +585,22 @@ static void lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 
     if (g_ggml_sycl_lightning_indexer > 0) {
         const bool use_xmx = g_ggml_sycl_lightning_indexer >= 2 && n_batch >= 8 && li_xmx_supported(ctx.stream());
+        // a gathered K may be absorbed (no data of its own): read the q8_0 rows it was gathered from
+        if (const ggml_tensor * gr = ggml_sycl_li_k_gather(k)) {
+            const li_k_gather_q8_0 ka = { (const char *) gr->src[0]->data, (const int32_t *) gr->src[1]->data, gr->src[0]->nb[1] };
+            lightning_indexer_fast_sycl(ctx, dst, ka, use_xmx, sm1, sm3, mbits, weight);
+            return;
+        }
         switch (k->type) {
-            case GGML_TYPE_F32:  lightning_indexer_fast_sycl<float>(ctx, dst, use_xmx, sm1, sm3, mbits, weight); return;
-            case GGML_TYPE_F16:  lightning_indexer_fast_sycl<sycl::half>(ctx, dst, use_xmx, sm1, sm3, mbits, weight); return;
-            case GGML_TYPE_BF16: lightning_indexer_fast_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst, use_xmx, sm1, sm3, mbits, weight); return;
+            case GGML_TYPE_F32:
+                lightning_indexer_fast_sycl(ctx, dst, li_k_plain<float>{ (const char *) k->data, nbk2, nbk3 }, use_xmx, sm1, sm3, mbits, weight);
+                return;
+            case GGML_TYPE_F16:
+                lightning_indexer_fast_sycl(ctx, dst, li_k_plain<sycl::half>{ (const char *) k->data, nbk2, nbk3 }, use_xmx, sm1, sm3, mbits, weight);
+                return;
+            case GGML_TYPE_BF16:
+                lightning_indexer_fast_sycl(ctx, dst, li_k_plain<sycl::ext::oneapi::bfloat16>{ (const char *) k->data, nbk2, nbk3 }, use_xmx, sm1, sm3, mbits, weight);
+                return;
             default: break;
         }
     }

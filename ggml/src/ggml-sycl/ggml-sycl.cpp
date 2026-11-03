@@ -9262,6 +9262,7 @@ static int ggml_sycl_mmid_tiled_moe_fused(ggml_backend_sycl_context & ctx, ggml_
 }
 
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx);
+static int ggml_sycl_li_gather_absorbs(const ggml_cgraph * cgraph, int node_idx);
 
 // GGML_SYCL_F32_SIBLINGS: two one-token f32 mat-vecs that read the same activation, each with the epilogue it
 // fuses (sigmoid, softplus * scale) or none, back to back in node order, in one launch (qwen4exp: the router
@@ -9602,6 +9603,10 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        // the pooled-key gather the lightning indexer reads through its index (same test as fusion_absorbs)
+        if (node->op == GGML_OP_GET_ROWS && ggml_sycl_li_gather_absorbs(cgraph, i)) {
+            continue;
+        }
         // recurrent-state gather read only by a gated delta net: hand the cache rows to it instead
         if (node->op == GGML_OP_GET_ROWS && !gdn_gathers.empty()) {
             const auto it = gdn_gathers.find(node);
@@ -10457,8 +10462,45 @@ static void ggml_backend_sycl_event_wait(ggml_backend_t backend, ggml_backend_ev
 
 // report the copies that a fusion reads through, so ggml-alloc never reserves their dst.
 // every predicate here is purely structural, so it holds for every later execution
+// GET_ROWS of q8_0 rows read only as the K of a lightning indexer (the qwen4exp pooled keys, [128, n_pool] f32,
+// 48 MiB per card at -np 3 -c 393216): the indexer reads the rows through the index, so the GET_ROWS is never
+// computed and gets no buffer. Its rows and index must stay unwritten until the indexer reads them.
+static int ggml_sycl_li_gather_absorbs(const ggml_cgraph * cgraph, int node_idx) {
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_LI_GATHER", 1) != 0;
+    const ggml_tensor * gr = cgraph->nodes[node_idx];
+    if (!on || !g_ggml_sycl_enable_fusion || g_ggml_sycl_lightning_indexer <= 0 || gr->op != GGML_OP_GET_ROWS ||
+        gr->src[0]->type != GGML_TYPE_Q8_0 || (gr->flags & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT))) {
+        return 0;
+    }
+    int li = -1;
+    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        // views of the gathered tensor are fine; any other reader of it means it has to exist
+        const bool chain = (n->op == GGML_OP_VIEW || n->op == GGML_OP_RESHAPE) && n->view_src == gr;
+        for (int s = 0; s < GGML_MAX_SRC && !chain; ++s) {
+            const ggml_tensor * src = n->src[s];
+            if (!src || (src != gr && src->view_src != gr)) {
+                continue;
+            }
+            if (n->op != GGML_OP_LIGHTNING_INDEXER || s != 1 || li >= 0 || ggml_sycl_li_k_gather(src) != gr) {
+                return 0;
+            }
+            li = j;
+        }
+    }
+    if (li < 0 || ggml_sycl_written_between(cgraph, gr->src[0], node_idx, li) ||
+        ggml_sycl_written_between(cgraph, gr->src[1], node_idx, li)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
+    // the pooled-key gather, which the lightning indexer reads through its index instead
+    if (ggml_sycl_li_gather_absorbs(cgraph, node_idx)) {
+        return 1;
+    }
     if (ggml_sycl_fill_absorbs(cgraph, node_idx, true)) {
         return 1;
     }
@@ -10491,6 +10533,10 @@ static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_c
     // the QSA indexer key cache writes, each chain computed at its SET_ROWS
     if (const int n = ggml_sycl_qsa_kpool_absorbs(cgraph, node_idx)) {
         return n;
+    }
+    // the conv window: concat, tail conts, ssm_conv and bias add, which the window kernel never writes
+    if (ggml_sycl_conv_window_absorbs(cgraph, node_idx)) {
+        return 1;
     }
     // the MoE reduction and shared-expert add that the hc_post + norm fusion computes itself
     if (const int n = ggml_sycl_hc_ffn_tail_absorbs(cgraph, node_idx)) {
