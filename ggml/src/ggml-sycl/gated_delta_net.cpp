@@ -5,6 +5,7 @@
 #include "common.hpp"
 #include "ggml.h"
 #include "gated_delta_net.hpp"
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <cmath>
 #include <type_traits>
 
@@ -453,6 +454,559 @@ static void launch_gated_delta_net(const float *   q_d,
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Chunked prefill (scalar gate only)
+//
+// The recurrence S_t = g_t S_{t-1} + k_t d_t^T, d_t = b_t (v_t - g_t S_{t-1}^T k_t), o_t = scale S_t^T q_t
+// over a chunk of C tokens, with G_r the gate's log summed over the chunk up to row r and S0 the
+// state before it, is (the WY form of the delta rule)
+//   (I + A) D = diag(b) V - diag(b e^G) K S0,  A[r][s] = b_r e^(G_r - G_s) k_r.k_s  (s < r)
+//   D = U - W S0,  U = (I + A)^-1 diag(b) V,  W = (I + A)^-1 diag(b e^G) K
+//   O = scale (diag(e^G) Q S0 + P D),         P[r][s] = e^(G_r - G_s) q_r.k_s      (s <= r)
+//   S_C = e^(G_C) S0 + sum_s e^(G_C - G_s) k_s d_s^T
+// U, W and P depend on the chunk alone, so they are built for every chunk at once; only the last
+// pass walks the chunks in order, one sub-group per state column as the recurrent kernel does.
+// Rows past n_tokens are zero (b = 0, gate 0), so they change nothing.
+//
+// Stages, all on the stream's queue:
+//   1. per chunk: the q/k L2 norm factors (1 when the rows come normed), b, and G
+//   2. per chunk: A (local memory), P, then U and W by forward substitution
+//   3. per state column: the chunks in order
+// Scratch (pool): KF, QF, BE, GC [bh][TP], U, W [bh][TP][S_v], P [bh][NC][C][C], bh = n_seqs * H.
+//
+// With XMX (GGML_SYCL_GDN_CHUNKED_XMX, on by default where f16 8x16x16 tiles exist) stage 3 is a work-group
+// per 16 state columns doing the products as f16 tiles with f32 accumulation:
+//   D = U + (-W) S0,  O = Qe S0 + P D,  S_C = e^(G_C) S0 + Kd D
+// with Qe = diag(e^G qf) Q and Kd[i][s] = e^(G_C - G_s) kf_s k_s[i]; stage 2 also writes -W, Qe, P and
+// Kd as f16 for it. The state stays f32 between chunks; only the operands of each product are f16.
+// ---------------------------------------------------------------------------------------------
+
+static constexpr int GDN_CHUNK = 64;
+
+struct gdn_chunk_args {
+    const float * q;
+    const float * k;
+    const float * v;
+    const float * g;
+    const float * beta;
+    int64_t       sq1, sq2, sq3;  // q and k share strides
+    int64_t       sv1, sv2, sv3;
+    int64_t       sb1, sb2, sb3;  // g (scalar) and beta
+    int64_t       neqk1;
+    int64_t       rq3;
+    int64_t       H;
+    int64_t       n_tokens;
+    int64_t       TP;  // n_tokens padded to whole chunks
+    int64_t       NC;
+    float         qk_eps;
+    float         qk_scale;
+    float *       KF;
+    float *       QF;
+    float *       BE;
+    float *       GC;
+    float *       U;
+    float *       W;
+    float *       P;
+    sycl::half *  Wh;   // -W, [bh][TP][S_v]          (XMX only)
+    sycl::half *  Qh;   // Qe, [bh][TP][S_v]
+    sycl::half *  Ph;   // P,  [bh][NC][C][C]
+    sycl::half *  KTh;  // Kd, [bh][NC][S_v][C]
+
+    const float * qrow(int64_t seq, int64_t h, int64_t t) const {
+        return q + (seq / rq3) * sq3 + t * sq2 + (h % neqk1) * sq1;
+    }
+    const float * krow(int64_t seq, int64_t h, int64_t t) const {
+        return k + (seq / rq3) * sq3 + t * sq2 + (h % neqk1) * sq1;
+    }
+    const float * vrow(int64_t seq, int64_t h, int64_t t) const { return v + seq * sv3 + t * sv2 + h * sv1; }
+    int64_t       gb(int64_t seq, int64_t h, int64_t t) const { return seq * sb3 + t * sb2 + h * sb1; }
+};
+
+// stage 1: one sub-group per (chunk, head, sequence)
+template <int S_v, int warp_size>
+static void gdn_chunk_scalars(const gdn_chunk_args a, const sycl::nd_item<3> & it) {
+    const int64_t seq  = it.get_group(0);
+    const int64_t h    = it.get_group(1);
+    const int64_t c    = it.get_group(2);
+    const int     lane = it.get_local_id(2);
+    const int64_t base = (seq * a.H + h) * a.TP + c * GDN_CHUNK;
+
+    float acc = 0.0f;
+    for (int r = 0; r < GDN_CHUNK; ++r) {
+        const int64_t t  = c * GDN_CHUNK + r;
+        float         kf = 0.0f, qf = 0.0f, be = 0.0f, gg = 0.0f;
+        if (t < a.n_tokens) {
+            kf = 1.0f;
+            qf = 1.0f;
+            if (a.qk_scale != 0.0f) {
+                const float * kr  = a.krow(seq, h, t);
+                const float * qr  = a.qrow(seq, h, t);
+                float         ssk = 0.0f, ssq = 0.0f;
+#pragma unroll
+                for (int i = lane; i < S_v; i += warp_size) {
+                    ssk += kr[i] * kr[i];
+                    ssq += qr[i] * qr[i];
+                }
+                kf = gdn_qk_norm_factor<S_v, warp_size>(ssk, a.qk_eps, a.qk_scale);
+                qf = gdn_qk_norm_factor<S_v, warp_size>(ssq, a.qk_eps, a.qk_scale);
+            }
+            const int64_t o = a.gb(seq, h, t);
+            be              = a.beta[o];
+            gg              = a.g[o];
+        }
+        acc += gg;
+        if (lane == 0) {
+            a.KF[base + r] = kf;
+            a.QF[base + r] = qf;
+            a.BE[base + r] = be;
+            a.GC[base + r] = acc;
+        }
+    }
+}
+
+// stage 2: one work-group of S_v items per (chunk, head, sequence)
+template <int S_v>
+static void gdn_chunk_wy(const gdn_chunk_args a, const sycl::nd_item<3> & it, float * A, float * X, float * sc) {
+    constexpr int C    = GDN_CHUNK;
+    const int64_t seq  = it.get_group(0);
+    const int64_t h    = it.get_group(1);
+    const int64_t c    = it.get_group(2);
+    const int     lid  = it.get_local_id(2);
+    const int64_t bh   = seq * a.H + h;
+    const int64_t base = bh * a.TP + c * C;
+    float *       G    = sc;          // [C]
+    float *       BE   = sc + C;      // [C]
+    float *       KF   = sc + 2 * C;  // [C]
+    float *       QF   = sc + 3 * C;  // [C]
+
+    for (int r = lid; r < C; r += S_v) {
+        G[r]  = a.GC[base + r];
+        BE[r] = a.BE[base + r];
+        KF[r] = a.KF[base + r];
+        QF[r] = a.QF[base + r];
+    }
+    sycl::group_barrier(it.get_group());
+
+    float * Pc = a.P + (bh * a.NC + c) * C * C;
+    for (int idx = lid; idx < C * C; idx += S_v) {
+        const int     r  = idx / C;
+        const int     s  = idx - r * C;
+        const int64_t tr = c * C + r;
+        const int64_t ts = c * C + s;
+        float         av = 0.0f, pv = 0.0f;
+        if (s <= r && tr < a.n_tokens) {
+            const float * kr = a.krow(seq, h, tr);
+            const float * ks = a.krow(seq, h, ts);
+            const float * qr = a.qrow(seq, h, tr);
+            float         kk = 0.0f, qk = 0.0f;
+#pragma unroll 8
+            for (int i = 0; i < S_v; ++i) {
+                kk += kr[i] * ks[i];
+                qk += qr[i] * ks[i];
+            }
+            const float dec = sycl::exp(G[r] - G[s]);
+            if (s < r) {
+                av = BE[r] * dec * KF[r] * KF[s] * kk;
+            }
+            pv = dec * QF[r] * KF[s] * qk;
+        }
+        A[idx]  = av;
+        Pc[idx] = pv;
+        if (a.Ph) {
+            a.Ph[(bh * a.NC + c) * C * C + idx] = (sycl::half) pv;
+        }
+    }
+    sycl::group_barrier(it.get_group());
+
+    // item lid owns column lid of U, then of W; X[r * S_v + lid] is only ever touched by it
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int r = 0; r < C; ++r) {
+            const int64_t t   = c * C + r;
+            float         acc = 0.0f;
+            if (t < a.n_tokens) {
+                acc = pass == 0 ? BE[r] * a.vrow(seq, h, t)[lid] : BE[r] * sycl::exp(G[r]) * KF[r] * a.krow(seq, h, t)[lid];
+            }
+            for (int s = 0; s < r; ++s) {
+                acc -= A[r * C + s] * X[s * S_v + lid];
+            }
+            X[r * S_v + lid] = acc;
+        }
+        float * out = (pass == 0 ? a.U : a.W) + base * S_v;
+        for (int r = 0; r < C; ++r) {
+            out[r * S_v + lid] = X[r * S_v + lid];
+            if (pass == 1 && a.Wh) {
+                a.Wh[(base + r) * S_v + lid] = (sycl::half) -X[r * S_v + lid];
+            }
+        }
+    }
+
+    if (a.Qh) {
+        // the operands of the XMX pass: Qe rows, and the decayed keys transposed (row lid of Kd)
+        sycl::half * kd = a.KTh + ((bh * a.NC + c) * S_v + lid) * C;
+        for (int r = 0; r < C; ++r) {
+            const int64_t t  = c * C + r;
+            float         qe = 0.0f, kv = 0.0f;
+            if (t < a.n_tokens) {
+                qe = sycl::exp(G[r]) * QF[r] * a.qrow(seq, h, t)[lid];
+                kv = sycl::exp(G[C - 1] - G[r]) * KF[r] * a.krow(seq, h, t)[lid];
+            }
+            a.Qh[(base + r) * S_v + lid] = (sycl::half) qe;
+            kd[r]                        = (sycl::half) kv;
+        }
+    }
+}
+
+namespace gdn_mx = sycl::ext::oneapi::experimental::matrix;
+
+static constexpr int GDN_XMX_TM = 8;
+static constexpr int GDN_XMX_TN = 16;
+static constexpr int GDN_XMX_TK = 16;
+static constexpr int GDN_XMX_SG = 4;
+
+static bool gdn_xmx_supported(dpct::queue_ptr stream) {
+    static const int on = ggml_sycl_get_env("GGML_SYCL_GDN_CHUNKED_XMX", 1);
+    if (!on || WARP_SIZE != GDN_XMX_TN) {
+        return false;
+    }
+    try {
+        const auto combinations = stream->get_device().get_info<
+            sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
+        for (const auto & cb : combinations) {
+            if (cb.atype == gdn_mx::matrix_type::fp16 && cb.btype == gdn_mx::matrix_type::fp16 &&
+                cb.ctype == gdn_mx::matrix_type::fp32 && cb.dtype == gdn_mx::matrix_type::fp32 &&
+                (cb.max_msize >= GDN_XMX_TM || cb.msize == GDN_XMX_TM) &&
+                (cb.max_nsize >= GDN_XMX_TN || cb.nsize == GDN_XMX_TN) &&
+                (cb.max_ksize >= GDN_XMX_TK || cb.ksize == GDN_XMX_TK)) {
+                return true;
+            }
+        }
+    } catch (const sycl::exception &) {
+    }
+    return false;
+}
+
+// stage 3 on XMX: a work-group of GDN_XMX_SG sub-groups per (sequence, head, 16 state columns)
+template <int S_v>
+static void gdn_chunk_pass_xmx_launch(dpct::queue_ptr stream, const gdn_chunk_args a, int64_t n_seqs, const float * curr_state,
+                                      float * dst, float * state, const int32_t * s_ids, int64_t s_row_stride, float scale) {
+    constexpr int C  = GDN_CHUNK;
+    constexpr int TN = GDN_XMX_TN;
+    constexpr int TM = GDN_XMX_TM;
+    constexpr int TK = GDN_XMX_TK;
+    constexpr int NI = GDN_XMX_SG * WARP_SIZE;
+    static_assert(S_v % TK == 0 && C % TK == 0 && C % TM == 0 && S_v % TM == 0, "whole tiles");
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1>      Sf(S_v * TN, cgh);  // the state columns, f32, [S_v][16]
+        sycl::local_accessor<sycl::half, 1> Sh(S_v * TN, cgh);  // the same, f16 packed B operand
+        sycl::local_accessor<float, 1>      Df(C * TN, cgh);    // d of the chunk, [C][16]
+        sycl::local_accessor<sycl::half, 1> Dh(C * TN, cgh);    // the same, f16 packed B operand
+        sycl::local_accessor<float, 1>      Of(C * TN, cgh);    // outputs of the chunk, [C][16]
+        cgh.parallel_for(
+            sycl::nd_range<3>(sycl::range<3>(n_seqs, a.H, (size_t) (S_v / TN) * NI), sycl::range<3>(1, 1, NI)),
+            [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                const auto    sg    = it.get_sub_group();
+                const int     sg_id = sg.get_group_linear_id();
+                const int     lid   = it.get_local_linear_id();
+                const int64_t seq   = it.get_group(0);
+                const int64_t h     = it.get_group(1);
+                const int     j0    = it.get_group(2) * TN;
+                const int64_t bh    = seq * a.H + h;
+                const auto    wg    = it.get_group();
+
+                const auto sf_p = Sf.get_multi_ptr<sycl::access::decorated::no>();
+                const auto sh_p = Sh.get_multi_ptr<sycl::access::decorated::no>();
+                const auto df_p = Df.get_multi_ptr<sycl::access::decorated::no>();
+                const auto dh_p = Dh.get_multi_ptr<sycl::access::decorated::no>();
+                const auto of_p = Of.get_multi_ptr<sycl::access::decorated::no>();
+
+                // state column j of s0 is S0[:, j]: element i at col * S_v + i
+                const int64_t in_base = (s_ids ? s_ids[seq] * s_row_stride : seq * a.H * S_v * S_v) + h * S_v * S_v;
+                for (int idx = lid; idx < S_v * TN; idx += NI) {
+                    const int i = idx / TN;
+                    const int n = idx % TN;
+                    Sf[idx]     = curr_state[in_base + (int64_t) (j0 + n) * S_v + i];
+                }
+                sycl::group_barrier(wg);
+
+                for (int64_t c = 0; c < a.NC; ++c) {
+                    const int64_t base = bh * a.TP + c * C;
+
+                    // B operand layout (ext_intel_packed): element (k, n) at ((k / 2) * 16 + n) * 2 + k % 2
+                    for (int idx = lid; idx < S_v * TN; idx += NI) {
+                        const int i                        = idx / TN;
+                        const int n                        = idx % TN;
+                        Sh[((i >> 1) * TN + n) * 2 + (i & 1)] = (sycl::half) Sf[idx];
+                    }
+                    sycl::group_barrier(wg);
+
+                    // D = U + (-W) S0
+                    for (int mt = sg_id; mt < C / TM; mt += GDN_XMX_SG) {
+                        gdn_mx::joint_matrix<sycl::sub_group, float, gdn_mx::use::accumulator, TM, TN> acc;
+                        gdn_mx::joint_matrix_load(
+                            sg, acc,
+                            sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                a.U + (base + mt * TM) * S_v + j0),
+                            S_v, gdn_mx::layout::row_major);
+#pragma unroll
+                        for (int kk = 0; kk < S_v / TK; ++kk) {
+                            gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::a, TM, TK, gdn_mx::layout::row_major> ma;
+                            gdn_mx::joint_matrix_load(
+                                sg, ma,
+                                sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                    a.Wh + (base + mt * TM) * S_v + kk * TK),
+                                S_v);
+                            gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::b, TK, TN, gdn_mx::layout::ext_intel_packed> mb;
+                            gdn_mx::joint_matrix_load(sg, mb, sh_p + kk * TK * TN, TN * 2);
+                            gdn_mx::joint_matrix_mad(sg, acc, ma, mb, acc);
+                        }
+                        gdn_mx::joint_matrix_store(sg, acc, df_p + mt * TM * TN, TN, gdn_mx::layout::row_major);
+                    }
+                    sycl::group_barrier(wg);
+
+                    for (int idx = lid; idx < C * TN; idx += NI) {
+                        const int r                        = idx / TN;
+                        const int n                        = idx % TN;
+                        Dh[((r >> 1) * TN + n) * 2 + (r & 1)] = (sycl::half) Df[idx];
+                    }
+                    sycl::group_barrier(wg);
+
+                    // O = Qe S0 + P D
+                    for (int mt = sg_id; mt < C / TM; mt += GDN_XMX_SG) {
+                        gdn_mx::joint_matrix<sycl::sub_group, float, gdn_mx::use::accumulator, TM, TN> acc;
+                        gdn_mx::joint_matrix_fill(sg, acc, 0.0f);
+#pragma unroll
+                        for (int kk = 0; kk < S_v / TK; ++kk) {
+                            gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::a, TM, TK, gdn_mx::layout::row_major> ma;
+                            gdn_mx::joint_matrix_load(
+                                sg, ma,
+                                sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                    a.Qh + (base + mt * TM) * S_v + kk * TK),
+                                S_v);
+                            gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::b, TK, TN, gdn_mx::layout::ext_intel_packed> mb;
+                            gdn_mx::joint_matrix_load(sg, mb, sh_p + kk * TK * TN, TN * 2);
+                            gdn_mx::joint_matrix_mad(sg, acc, ma, mb, acc);
+                        }
+#pragma unroll
+                        for (int kk = 0; kk < C / TK; ++kk) {
+                            gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::a, TM, TK, gdn_mx::layout::row_major> ma;
+                            gdn_mx::joint_matrix_load(
+                                sg, ma,
+                                sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                    a.Ph + (bh * a.NC + c) * C * C + mt * TM * C + kk * TK),
+                                C);
+                            gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::b, TK, TN, gdn_mx::layout::ext_intel_packed> mb;
+                            gdn_mx::joint_matrix_load(sg, mb, dh_p + kk * TK * TN, TN * 2);
+                            gdn_mx::joint_matrix_mad(sg, acc, ma, mb, acc);
+                        }
+                        gdn_mx::joint_matrix_store(sg, acc, of_p + mt * TM * TN, TN, gdn_mx::layout::row_major);
+                    }
+                    sycl::group_barrier(wg);
+
+                    const float eg = sycl::exp(a.GC[base + C - 1]);
+                    for (int idx = lid; idx < C * TN; idx += NI) {
+                        const int     r = idx / TN;
+                        const int     n = idx % TN;
+                        const int64_t t = c * C + r;
+                        if (t < a.n_tokens) {
+                            dst[((seq * a.n_tokens + t) * a.H + h) * S_v + j0 + n] = Of[idx] * scale;
+                        }
+                    }
+                    for (int idx = lid; idx < S_v * TN; idx += NI) {
+                        Sf[idx] *= eg;
+                    }
+                    sycl::group_barrier(wg);
+
+                    // S_C = e^(G_C) S0 + Kd D
+                    for (int mt = sg_id; mt < S_v / TM; mt += GDN_XMX_SG) {
+                        gdn_mx::joint_matrix<sycl::sub_group, float, gdn_mx::use::accumulator, TM, TN> acc;
+                        gdn_mx::joint_matrix_load(sg, acc, sf_p + mt * TM * TN, TN, gdn_mx::layout::row_major);
+#pragma unroll
+                        for (int kk = 0; kk < C / TK; ++kk) {
+                            gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::a, TM, TK, gdn_mx::layout::row_major> ma;
+                            gdn_mx::joint_matrix_load(
+                                sg, ma,
+                                sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                                    a.KTh + ((bh * a.NC + c) * S_v + mt * TM) * C + kk * TK),
+                                C);
+                            gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::b, TK, TN, gdn_mx::layout::ext_intel_packed> mb;
+                            gdn_mx::joint_matrix_load(sg, mb, dh_p + kk * TK * TN, TN * 2);
+                            gdn_mx::joint_matrix_mad(sg, acc, ma, mb, acc);
+                        }
+                        gdn_mx::joint_matrix_store(sg, acc, sf_p + mt * TM * TN, TN, gdn_mx::layout::row_major);
+                    }
+                    sycl::group_barrier(wg);
+                }
+
+                for (int idx = lid; idx < S_v * TN; idx += NI) {
+                    const int i = idx / TN;
+                    const int n = idx % TN;
+                    state[bh * S_v * S_v + (int64_t) (j0 + n) * S_v + i] = Sf[idx];
+                }
+            });
+    });
+}
+
+// stage 3: one sub-group per state column, the chunks in order
+template <int S_v, int warp_size, bool UNCACHED>
+static void gdn_chunk_pass(const gdn_chunk_args a, const sycl::nd_item<3> & it, const float * curr_state, float * dst,
+                           float * state, const int32_t * s_ids, int64_t s_row_stride, float scale, float * sm) {
+    constexpr int C             = GDN_CHUNK;
+    constexpr int rows_per_lane = S_v / warp_size;
+    const auto    sg            = it.get_sub_group();
+    const int64_t seq           = it.get_group(0);
+    const int64_t h             = it.get_group(1);
+    const int     sgid          = it.get_local_id(2) / warp_size;
+    const int     lane          = it.get_local_id(2) % warp_size;
+    const int     n_sg          = it.get_local_range(2) / warp_size;
+    const int     col           = it.get_group(2) * n_sg + sgid;
+    const int64_t bh            = seq * a.H + h;
+    float *       sd            = sm + sgid * 2 * C;  // d of this column, [C]
+    float *       sq            = sd + C;              // q_r . S0[:, col] * qf_r, [C]
+
+    const int64_t in_off = (s_ids ? s_ids[seq] * s_row_stride : seq * a.H * S_v * S_v) + h * S_v * S_v + col * S_v;
+    float         s_shard[rows_per_lane];
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; ++r) {
+        s_shard[r] = curr_state[in_off + r * warp_size + lane];
+    }
+
+    for (int64_t c = 0; c < a.NC; ++c) {
+        const int64_t base = bh * a.TP + c * C;
+        const float * Wc   = a.W + base * S_v;
+        const float * Uc   = a.U + base * S_v;
+        for (int r = 0; r < C; ++r) {
+            const int64_t t  = c * C + r;
+            float         pd = 0.0f, pq = 0.0f;
+#pragma unroll
+            for (int rr = 0; rr < rows_per_lane; ++rr) {
+                pd += Wc[r * S_v + rr * warp_size + lane] * s_shard[rr];
+            }
+            if (t < a.n_tokens) {
+                const float * qr = a.qrow(seq, h, t);
+#pragma unroll
+                for (int rr = 0; rr < rows_per_lane; ++rr) {
+                    pq += qr[rr * warp_size + lane] * s_shard[rr];
+                }
+            }
+            const float dr = warp_reduce_sum<warp_size>(pd);
+            const float qr = warp_reduce_sum<warp_size>(pq);
+            if (lane == 0) {
+                sd[r] = Uc[r * S_v + col] - dr;
+                sq[r] = qr * a.QF[base + r];
+            }
+        }
+        sycl::group_barrier(sg);
+
+        const float * Pc = a.P + (bh * a.NC + c) * C * C;
+        for (int r = lane; r < C; r += warp_size) {
+            const int64_t t = c * C + r;
+            if (t >= a.n_tokens) {
+                continue;
+            }
+            float o = sycl::exp(a.GC[base + r]) * sq[r];
+            for (int s = 0; s <= r; ++s) {
+                o += Pc[r * C + s] * sd[s];
+            }
+            dst[((seq * a.n_tokens + t) * a.H + h) * S_v + col] = o * scale;
+        }
+
+        const float gl = a.GC[base + C - 1];
+        const float eg = sycl::exp(gl);
+#pragma unroll
+        for (int rr = 0; rr < rows_per_lane; ++rr) {
+            s_shard[rr] *= eg;
+        }
+        for (int s = 0; s < C; ++s) {
+            const int64_t t = c * C + s;
+            if (t >= a.n_tokens) {
+                break;
+            }
+            const float   coef = sycl::exp(gl - a.GC[base + s]) * a.KF[base + s] * sd[s];
+            const float * ks   = a.krow(seq, h, t);
+#pragma unroll
+            for (int rr = 0; rr < rows_per_lane; ++rr) {
+                s_shard[rr] += coef * ks[rr * warp_size + lane];
+            }
+        }
+        // the next chunk overwrites sd and sq
+        sycl::group_barrier(sg);
+    }
+
+    gdn_store_state<rows_per_lane, warp_size, UNCACHED>(state + (seq * a.H + h) * S_v * S_v + col * S_v, s_shard, lane);
+}
+
+template <int S_v, bool UNCACHED>
+static void gdn_chunked_launch(ggml_backend_sycl_context & ctx, gdn_chunk_args a, int64_t n_seqs, const float * s_d,
+                               float * dst_d, float * state_d, const int32_t * s_ids, int64_t s_row_stride, float scale) {
+    constexpr int ws   = WARP_SIZE;
+    constexpr int C    = GDN_CHUNK;
+    constexpr int n_sg = 4;
+    static_assert(S_v % ws == 0 && S_v % n_sg == 0, "a state column is whole lanes");
+    dpct::queue_ptr stream = ctx.stream();
+
+    const int64_t bh = n_seqs * a.H;
+    ggml_sycl_pool_alloc<float> scal(ctx.pool(), (size_t) 4 * bh * a.TP);
+    ggml_sycl_pool_alloc<float> uw(ctx.pool(), (size_t) 2 * bh * a.TP * S_v);
+    ggml_sycl_pool_alloc<float> pm(ctx.pool(), (size_t) bh * a.NC * C * C);
+    a.KF = scal.get();
+    a.QF = a.KF + bh * a.TP;
+    a.BE = a.QF + bh * a.TP;
+    a.GC = a.BE + bh * a.TP;
+    a.U  = uw.get();
+    a.W  = a.U + bh * a.TP * S_v;
+    a.P  = pm.get();
+
+    const bool xmx = gdn_xmx_supported(stream);
+    ggml_sycl_pool_alloc<sycl::half> hs(ctx.pool());
+    if (xmx) {
+        // -W, Qe and Kd ([S_v][C] per chunk is TP * S_v per head as well), then P
+        sycl::half * p = hs.alloc((size_t) bh * (3 * a.TP * S_v + a.NC * C * C));
+        a.Wh  = p;
+        a.Qh  = a.Wh + bh * a.TP * S_v;
+        a.KTh = a.Qh + bh * a.TP * S_v;
+        a.Ph  = a.KTh + bh * a.TP * S_v;
+    }
+
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(n_seqs, a.H, a.NC * ws), sycl::range<3>(1, 1, ws)),
+                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             gdn_chunk_scalars<S_v, ws>(a, it);
+                         });
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> A(C * C, cgh);
+        sycl::local_accessor<float, 1> X(C * S_v, cgh);
+        sycl::local_accessor<float, 1> sc(4 * C, cgh);
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(n_seqs, a.H, a.NC * S_v), sycl::range<3>(1, 1, S_v)),
+                         [=](sycl::nd_item<3> it) {
+                             gdn_chunk_wy<S_v>(a, it, A.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                               X.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                               sc.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
+    });
+
+    if (xmx) {
+        // the f16 state and d round to 11 bits per product; the state itself stays f32 between chunks
+        gdn_chunk_pass_xmx_launch<S_v>(stream, a, n_seqs, s_d, dst_d, state_d, s_ids, s_row_stride, scale);
+        return;
+    }
+
+    stream->submit([&](sycl::handler & cgh) {
+        sycl::local_accessor<float, 1> sm(n_sg * 2 * C, cgh);
+        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(n_seqs, a.H, (int64_t) S_v * ws), sycl::range<3>(1, 1, n_sg * ws)),
+                         [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             gdn_chunk_pass<S_v, ws, UNCACHED>(a, it, s_d, dst_d, state_d, s_ids, s_row_stride, scale,
+                                                               sm.get_multi_ptr<sycl::access::decorated::no>().get());
+                         });
+    });
+}
+
+// GGML_SYCL_GDN_CHUNKED=N runs prefill of at least N tokens through the chunked path; 0 (default) never
+static int gdn_chunked_min_tokens() {
+    static const int n = ggml_sycl_get_env("GGML_SYCL_GDN_CHUNKED", 0);
+    return n;
+}
+
 static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, ggml_tensor * dst,
                                               const ggml_sycl_gated_delta_net_fused_cache * cache) {
     ggml_tensor * src_q     = dst->src[0];
@@ -554,6 +1108,54 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
     const bool wide      = (g_ggml_sycl_wide_loads & GGML_SYCL_WIDE_GDN) && S_v >= warp_size &&
                       ((uintptr_t) q_d | (uintptr_t) k_d | (sq1 | sq2 | sq3) * sizeof(float)) % 16 == 0 &&
                       (!kda || ((uintptr_t) g_d | S_v * sizeof(float) | nbb1 * S_v | nbb2 * S_v | nbb3 * S_v) % 16 == 0);
+
+    // prefill: the chunked path when asked for. It writes the final state only (slot 0), which is all
+    // the op promises when n_tokens > K
+    const int chunk_min = gdn_chunked_min_tokens();
+    if (chunk_min > 0 && !kda && n_tokens >= chunk_min && n_tokens > K && S_v % WARP_SIZE == 0 &&
+        (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
+        gdn_chunk_args a = {};
+        a.q        = q_d;
+        a.k        = k_d;
+        a.v        = v_d;
+        a.g        = g_d;
+        a.beta     = b_d;
+        a.sq1      = sq1;
+        a.sq2      = sq2;
+        a.sq3      = sq3;
+        a.sv1      = sv1;
+        a.sv2      = sv2;
+        a.sv3      = sv3;
+        a.sb1      = sb1;
+        a.sb2      = sb2;
+        a.sb3      = sb3;
+        a.neqk1    = neqk1;
+        a.rq3      = rq3;
+        a.H        = H;
+        a.n_tokens = n_tokens;
+        a.NC       = (n_tokens + GDN_CHUNK - 1) / GDN_CHUNK;
+        a.TP       = a.NC * GDN_CHUNK;
+        a.qk_eps   = qk_eps;
+        a.qk_scale = qk_scale;
+        const bool uncached = g_ggml_sycl_gdn_state_store && cache != nullptr;
+        auto run = [&](auto sv_c) {
+            constexpr int sv = decltype(sv_c)::value;
+            if constexpr (sv % WARP_SIZE == 0) {
+                if (uncached) {
+                    gdn_chunked_launch<sv, true>(ctx, a, n_seqs, s_d, dst_d, state_d, s_ids, s_row_stride, scale);
+                } else {
+                    gdn_chunked_launch<sv, false>(ctx, a, n_seqs, s_d, dst_d, state_d, s_ids, s_row_stride, scale);
+                }
+            }
+        };
+        switch (S_v) {
+            case 16:  run(std::integral_constant<int, 16>{});  break;
+            case 32:  run(std::integral_constant<int, 32>{});  break;
+            case 64:  run(std::integral_constant<int, 64>{});  break;
+            default:  run(std::integral_constant<int, 128>{}); break;
+        }
+        return;
+    }
 
     const auto launch = [&](auto kda_c, auto keep_c, auto wide_c, auto store_c) {
         launch_gated_delta_net<decltype(kda_c)::value, decltype(keep_c)::value, decltype(wide_c)::value,
