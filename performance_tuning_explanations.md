@@ -158,6 +158,7 @@ Committed on request as a checkpoint; strip before the PR split.
 
 ## Measured negatives - do not re-attempt without new evidence
 
+- **Explicit expert-weight prefetch (2026-10-31): closed, no useful gain in the tested B60 persistent kernels.** Next-block group, next-task head and next-task full-row hints made IQ3_S gate/up about 2.7-3.9x slower. Active IQ4_NL next-task modes increased latency by about 12-68%; IQ4 next-block was a no-op because the kernel reads the whole row in one stripe. The active paths had following blocks/tasks within each standalone launch. Correctness passed: 1,928 CPU-reference cases plus 192 persistent bitwise comparisons. Full-model host-resident PLE performance was not measured. Keep disabled; implementation remains uncommitted on `feat/sycl-expert-prefetch`. See [experiment and results](PERSISTENT-EXPERT-PREFETCH.md).
 - **SYCL graph capture never engages.** Three blockers were cleared in sequence (a stale
   CONCAT guard; a library-GEMM predicate our own kernels made stale; a MUL_MAT_ID guard
   asking the wrong reorder list). After all three, decode splits had nothing rejecting

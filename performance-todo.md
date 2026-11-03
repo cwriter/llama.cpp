@@ -2128,3 +2128,8 @@ Server decodes ~26% slower than llama-bench on the same build (24.8 vs 33.5 tg) 
   greedy tg +21% (indicative, box load 16-20); pp -14..17% (draft catch-up). Needs quiet rerun.
 - Async L0 d2d copy: null on this config (dev2dev_memcpy never called; cpy_tensor_async carries
   all 3300 cross-device copies). Closed.
+
+
+## Expert-weight prefetch (2026-10-31) - CLOSED, negative result
+
+Next-block group, next-task head and next-task full-row prefetch are archived as unsuccessful for the tested B60 persistent IQ3_S/IQ4_NL kernels. IQ3_S latency increased about 2.7-3.9x; active IQ4_NL next-task modes increased latency about 12-68%. IQ4 next-block issues no hint for the tested whole-row stripe, so its neutral timing is a no-op control. This does not settle full-model host-resident PLE behavior, which was not measured. No further work queued; keep disabled. The generic all-15-format implementation is uncommitted on `feat/sycl-expert-prefetch`, based on `performance_uplift_mega_branch`; production source and defaults were not changed by this experiment. Correctness passed: 1,928 CPU-reference cases and 192 persistent bitwise comparisons. See [the archived experiment and detailed results](PERSISTENT-EXPERT-PREFETCH.md).
