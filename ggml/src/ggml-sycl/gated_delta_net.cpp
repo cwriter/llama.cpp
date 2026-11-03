@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "gated_delta_net.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
+#include <atomic>
 #include <cmath>
 #include <type_traits>
 
@@ -585,6 +586,14 @@ static void gdn_chunk_wy(const gdn_chunk_args a, const sycl::nd_item<3> & it, fl
         KF[r] = a.KF[base + r];
         QF[r] = a.QF[base + r];
     }
+    // the chunk's k rows, read once: row s at s * (S_v + 1), so items reading different rows at the
+    // same i hit different banks. X holds them until the forward substitution below
+    constexpr int KS = S_v + 1;
+    float *       Ks = X;
+    for (int r = 0; r < C; ++r) {
+        const int64_t t = c * C + r;
+        Ks[r * KS + lid] = t < a.n_tokens ? a.krow(seq, h, t)[lid] : 0.0f;
+    }
     sycl::group_barrier(it.get_group());
 
     float * Pc = a.P + (bh * a.NC + c) * C * C;
@@ -595,8 +604,9 @@ static void gdn_chunk_wy(const gdn_chunk_args a, const sycl::nd_item<3> & it, fl
         const int64_t ts = c * C + s;
         float         av = 0.0f, pv = 0.0f;
         if (s <= r && tr < a.n_tokens) {
-            const float * kr = a.krow(seq, h, tr);
-            const float * ks = a.krow(seq, h, ts);
+            // neighbouring items share r: the q row is one broadcast read, the k rows come from local memory
+            const float * kr = Ks + r * KS;
+            const float * ks = Ks + s * KS;
             const float * qr = a.qrow(seq, h, tr);
             float         kk = 0.0f, qk = 0.0f;
 #pragma unroll 8
@@ -616,6 +626,7 @@ static void gdn_chunk_wy(const gdn_chunk_args a, const sycl::nd_item<3> & it, fl
             a.Ph[(bh * a.NC + c) * C * C + idx] = (sycl::half) pv;
         }
     }
+    // every item is done with Ks before X is reused
     sycl::group_barrier(it.get_group());
 
     // item lid owns column lid of U, then of W; X[r * S_v + lid] is only ever touched by it
@@ -663,11 +674,7 @@ static constexpr int GDN_XMX_TN = 16;
 static constexpr int GDN_XMX_TK = 16;
 static constexpr int GDN_XMX_SG = 4;
 
-static bool gdn_xmx_supported(dpct::queue_ptr stream) {
-    static const int on = ggml_sycl_get_env("GGML_SYCL_GDN_CHUNKED_XMX", 1);
-    if (!on || WARP_SIZE != GDN_XMX_TN) {
-        return false;
-    }
+static bool gdn_xmx_supported_query(dpct::queue_ptr stream) {
     try {
         const auto combinations = stream->get_device().get_info<
             sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
@@ -683,6 +690,21 @@ static bool gdn_xmx_supported(dpct::queue_ptr stream) {
     } catch (const sycl::exception &) {
     }
     return false;
+}
+
+// asked once per device: the matrix combinations query is not cheap and the answer cannot change
+static bool gdn_xmx_supported(int device, dpct::queue_ptr stream) {
+    static const int on = ggml_sycl_get_env("GGML_SYCL_GDN_CHUNKED_XMX", 1);
+    if (!on || WARP_SIZE != GDN_XMX_TN || device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return false;
+    }
+    static std::atomic<int> cached[GGML_SYCL_MAX_DEVICES] = {};  // 0 unknown, 1 no, 2 yes
+    int v = cached[device].load(std::memory_order_relaxed);
+    if (v == 0) {
+        v = gdn_xmx_supported_query(stream) ? 2 : 1;
+        cached[device].store(v, std::memory_order_relaxed);
+    }
+    return v == 2;
 }
 
 // stage 3 on XMX: a work-group of GDN_XMX_SG sub-groups per (sequence, head, 16 state columns)
@@ -957,7 +979,7 @@ static void gdn_chunked_launch(ggml_backend_sycl_context & ctx, gdn_chunk_args a
     a.W  = a.U + bh * a.TP * S_v;
     a.P  = pm.get();
 
-    const bool xmx = gdn_xmx_supported(stream);
+    const bool xmx = gdn_xmx_supported(ctx.device, stream);
     ggml_sycl_pool_alloc<sycl::half> hs(ctx.pool());
     if (xmx) {
         // -W, Qe and Kd ([S_v][C] per chunk is TP * S_v per head as well), then P
@@ -975,7 +997,7 @@ static void gdn_chunked_launch(ggml_backend_sycl_context & ctx, gdn_chunk_args a
 
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> A(C * C, cgh);
-        sycl::local_accessor<float, 1> X(C * S_v, cgh);
+        sycl::local_accessor<float, 1> X(C * (S_v + 1), cgh);  // the chunk's k rows first, then U and W
         sycl::local_accessor<float, 1> sc(4 * C, cgh);
         cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(n_seqs, a.H, a.NC * S_v), sycl::range<3>(1, 1, S_v)),
                          [=](sycl::nd_item<3> it) {
@@ -1109,10 +1131,10 @@ static void ggml_sycl_op_gated_delta_net_impl(ggml_backend_sycl_context & ctx, g
                       ((uintptr_t) q_d | (uintptr_t) k_d | (sq1 | sq2 | sq3) * sizeof(float)) % 16 == 0 &&
                       (!kda || ((uintptr_t) g_d | S_v * sizeof(float) | nbb1 * S_v | nbb2 * S_v | nbb3 * S_v) % 16 == 0);
 
-    // prefill: the chunked path when asked for. It writes the final state only (slot 0), which is all
-    // the op promises when n_tokens > K
+    // prefill: the chunked path when asked for. It writes the final state only, so not with rollback
+    // snapshots (K > 1): delta-net-base.cpp copies min(n_tokens, K) slots into the cache whatever the batch
     const int chunk_min = gdn_chunked_min_tokens();
-    if (chunk_min > 0 && !kda && n_tokens >= chunk_min && n_tokens > K && S_v % WARP_SIZE == 0 &&
+    if (chunk_min > 0 && !kda && n_tokens >= chunk_min && K == 1 && S_v % WARP_SIZE == 0 &&
         (S_v == 16 || S_v == 32 || S_v == 64 || S_v == 128)) {
         gdn_chunk_args a = {};
         a.q        = q_d;
