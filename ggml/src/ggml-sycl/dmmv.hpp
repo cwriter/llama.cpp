@@ -40,6 +40,18 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
     size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
     ggml_glu_op glu_op, dpct::queue_ptr stream);
 
+// up to GGML_SYCL_MV_SIBLINGS_MAX mat-vecs of one f32 activation, one token, one launch (GGML_SYCL_MV_SIBLINGS);
+// weights q8_0 (reordered) or bf16, k % 32 == 0. False if not taken; nothing is launched then.
+#define GGML_SYCL_MV_SIBLINGS_MAX 8
+struct ggml_sycl_mv_sibling {
+    const void * w;
+    float *      dst;
+    int64_t      nrows;
+    ggml_type    type;
+};
+bool ggml_sycl_mv_siblings_esimd(const ggml_sycl_mv_sibling * mats, int n, const float * y, int64_t k,
+                                 dpct::queue_ptr stream);
+
 bool ggml_sycl_q8_0_siblings_esimd(const void * va, const void * vb, const float * y, float * oa, float * ob,
                                    int64_t k, int64_t ma, int64_t mb, int mode, dpct::queue_ptr stream);
 

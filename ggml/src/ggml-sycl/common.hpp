@@ -843,6 +843,8 @@ struct ggml_backend_sycl_context {
     std::unique_ptr<ggml_sycl_pool>  kq_mask_tail;
     ggml_sycl_pool *                 pool_override = nullptr;
     std::vector<const ggml_tensor *> kq_mask_taught;
+    // top-k nodes whose picks' scores the tiled indexer wrote, [n_top, n_tokens] (ggml_sycl_indexer_picked)
+    std::vector<std::pair<const ggml_tensor *, const float *>> indexer_picked;
 
     ggml_sycl_pool & pool(int device) {
         if (pools[device] == nullptr) {

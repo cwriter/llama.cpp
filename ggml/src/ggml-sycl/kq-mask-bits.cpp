@@ -508,6 +508,10 @@ static bool kq_mask_reader_taught(const ggml_tensor * n, int j, const ggml_tenso
         case GGML_OP_CPY:
             // a cast or copy of the whole mask
             return j == 0 && kq_mask_cpy_dst(n->src[0], n->src[1] ? n->src[1] : n, owner) == owner;
+        case GGML_OP_TOP_K_MASK:
+            // top-k-mask.cpp reads the bits, from the whole mask only; flash attention reading
+            // the picks itself (qsa-mask.cpp) reads the same mask
+            return j == 0 && kq_mask_whole(n->src[0], owner);
         case GGML_OP_LIGHTNING_INDEXER:
             // lightning-indexer.cpp reads the bits, from the whole mask only
             return j == 3 && kq_mask_whole(n->src[3], owner);
@@ -531,6 +535,11 @@ static const char * kq_mask_untaught_reader(const ggml_cgraph * cgraph, const gg
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         if (kq_mask_is_noop(n) || (n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        // a FILL seeded from the mask (the DSA top-k chain) takes only its shape and writes its own
+        // tensor; an in-place one would write the mask, so that one stays a reader
+        if (n->op == GGML_OP_FILL && !n->view_src) {
             continue;
         }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {

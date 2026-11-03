@@ -3,6 +3,6 @@
 
 #include "common.hpp"
 
-void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
+void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const float * value = nullptr);
 
 #endif // GGML_SYCL_LIGHTNING_INDEXER_HPP

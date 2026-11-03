@@ -1,5 +1,6 @@
 #include "lightning-indexer.hpp"
 #include "dequantize.hpp"
+#include "fill.hpp"
 #include "kq-mask-bits.hpp"
 #include <sycl/ext/oneapi/matrix/matrix.hpp>
 
@@ -14,8 +15,9 @@ static inline float li_mask_val(const char * row, int64_t i, bool bits) {
     return static_cast<float>(((const sycl::half *) row)[i]);
 }
 
+template <typename Weight>
 static void lightning_indexer_f32_sycl(
-        const char * q, const char * k, const char * w, const char * m, float * dst,
+        const char * q, const char * k, Weight w, const char * m, float * dst,
         int64_t n_embd, int64_t n_head, int64_t n_batch, int64_t n_stream, int64_t n_kv,
         int64_t nem3,
         int64_t nbq1, int64_t nbq2, int64_t nbq3,
@@ -128,7 +130,7 @@ static void lightning_indexer_f32_sycl(
             }
 
             const char  * q_base = q + i_batch*nbq2 + i_stream*nbq3;
-            const float * w_base = (const float *) (w + i_batch*nbw1 + i_stream*nbw3);
+            const size_t w_offset = i_batch*nbw1 + i_stream*nbw3;
 
             float score = 0.0f;
             for (int64_t h = 0; h < n_head; ++h) {
@@ -143,7 +145,7 @@ static void lightning_indexer_f32_sycl(
                 }
                 dot = sycl::reduce_over_group(item.get_sub_group(), dot, sycl::plus<float>());
                 if (lane == 0) {
-                    score += sycl::max(dot, 0.0f) * w_base[h];
+                    score += sycl::max(dot, 0.0f) * w(w_offset + h*sizeof(float));
                 }
             }
 
@@ -186,9 +188,9 @@ static inline void li_load8(const k_t * src, float * out) {
     }
 }
 
-template <typename k_t>
+template <typename k_t, typename Weight>
 static void lightning_indexer_vec_sycl(
-        const char * q, const char * k, const char * w, const char * m, char * dst,
+        const char * q, const char * k, Weight w, const char * m, char * dst,
         int n_head, int n_batch, int n_stream, int n_kv, int nem3,
         size_t nbq1, size_t nbq2, size_t nbq3,
         size_t nbk2, size_t nbk3,
@@ -226,7 +228,7 @@ static void lightning_indexer_vec_sycl(
             }
 
             const char  * q_base = q + (size_t) i_batch*nbq2 + (size_t) i_stream*nbq3;
-            const float * w_base = (const float *) (w + (size_t) i_batch*nbw1 + (size_t) i_stream*nbw3);
+            const size_t w_offset = (size_t) i_batch*nbw1 + (size_t) i_stream*nbw3;
 
             // after the reduction lanes 2j and 2j+1 hold the dot product of key j
             float score = 0.0f;
@@ -257,7 +259,7 @@ static void lightning_indexer_vec_sycl(
                 }
                 const float sum = dot[0] + sycl::permute_group_by_xor(sg, dot[0], 1);
 
-                score += sycl::max(sum, 0.0f) * w_base[h];
+                score += sycl::max(sum, 0.0f) * w(w_offset + h*sizeof(float));
             }
 
             const int i_kv = kv0 + lane/2;
@@ -300,10 +302,10 @@ static bool li_xmx_supported(queue_ptr stream) {
     return false;
 }
 
-template <typename k_t>
+template <typename k_t, typename Weight>
 static void lightning_indexer_xmx_sycl(
         ggml_backend_sycl_context & ctx,
-        const char * q, const char * k, const char * w, const char * m, char * dst,
+        const char * q, const char * k, Weight w, const char * m, char * dst,
         int n_head, int n_batch, int n_stream, int n_kv, int nem3,
         size_t nbq1, size_t nbq2, size_t nbq3,
         size_t nbk2, size_t nbk3,
@@ -381,7 +383,7 @@ static void lightning_indexer_xmx_sycl(
                 const float * c_sg = &c_tile[sg_id * LI_XMX_TOK * LI_XMX_TN];
 
                 const int    i_kv  = kv0 + sg_id * LI_XMX_TN + lane;
-                const char * w_s   = w + (size_t) i_stream*nbw3;
+                const size_t w_offset = (size_t) i_stream*nbw3;
                 const int    t_end = sycl::min(t_wg + LI_XMX_WG_TOK, n_batch);
 
                 for (int t0 = t_wg; t0 < t_end; t0 += LI_XMX_TOK) {
@@ -424,7 +426,7 @@ static void lightning_indexer_xmx_sycl(
 #pragma unroll
                         for (int t = 0; t < LI_XMX_TOK; ++t) {
                             const int   i_batch = sycl::min(t0 + t, n_batch - 1);
-                            const float w_val   = ((const float *) (w_s + (size_t) i_batch*nbw1))[h];
+                            const float w_val   = w(w_offset + (size_t) i_batch*nbw1 + h*sizeof(float));
                             score[t] += sycl::max(c_sg[t * LI_XMX_TN + lane], 0.0f) * w_val;
                         }
                         sycl::group_barrier(sg);
@@ -447,9 +449,9 @@ static void lightning_indexer_xmx_sycl(
     });
 }
 
-template <typename k_t>
+template <typename k_t, typename Weight>
 static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_tensor * dst, bool use_xmx,
-                                        size_t nbm1, size_t nbm3, bool mbits) {
+                                        size_t nbm1, size_t nbm3, bool mbits, Weight weight) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * w = dst->src[2];
@@ -463,20 +465,21 @@ static void lightning_indexer_fast_sycl(ggml_backend_sycl_context & ctx, ggml_te
 
     if (use_xmx) {
         lightning_indexer_xmx_sycl<k_t>(ctx,
-            (const char *) q->data, (const char *) k->data, (const char *) w->data, (const char *) m->data, (char *) dst->data,
+            (const char *) q->data, (const char *) k->data, weight, (const char *) m->data, (char *) dst->data,
             n_head, n_batch, n_stream, n_kv, nem3,
             q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], nbm1, nbm3, mbits, dst->nb[1], dst->nb[3],
             ctx.stream());
     } else {
         lightning_indexer_vec_sycl<k_t>(
-            (const char *) q->data, (const char *) k->data, (const char *) w->data, (const char *) m->data, (char *) dst->data,
+            (const char *) q->data, (const char *) k->data, weight, (const char *) m->data, (char *) dst->data,
             n_head, n_batch, n_stream, n_kv, nem3,
             q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3], w->nb[1], w->nb[3], nbm1, nbm3, mbits, dst->nb[1], dst->nb[3],
             ctx.stream());
     }
 }
 
-void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+template <typename Weight>
+static void lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst, Weight weight) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/4);
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -528,16 +531,16 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
     if (g_ggml_sycl_lightning_indexer > 0) {
         const bool use_xmx = g_ggml_sycl_lightning_indexer >= 2 && n_batch >= 8 && li_xmx_supported(ctx.stream());
         switch (k->type) {
-            case GGML_TYPE_F32:  lightning_indexer_fast_sycl<float>(ctx, dst, use_xmx, sm1, sm3, mbits); return;
-            case GGML_TYPE_F16:  lightning_indexer_fast_sycl<sycl::half>(ctx, dst, use_xmx, sm1, sm3, mbits); return;
-            case GGML_TYPE_BF16: lightning_indexer_fast_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst, use_xmx, sm1, sm3, mbits); return;
+            case GGML_TYPE_F32:  lightning_indexer_fast_sycl<float>(ctx, dst, use_xmx, sm1, sm3, mbits, weight); return;
+            case GGML_TYPE_F16:  lightning_indexer_fast_sycl<sycl::half>(ctx, dst, use_xmx, sm1, sm3, mbits, weight); return;
+            case GGML_TYPE_BF16: lightning_indexer_fast_sycl<sycl::ext::oneapi::bfloat16>(ctx, dst, use_xmx, sm1, sm3, mbits, weight); return;
             default: break;
         }
     }
 
     lightning_indexer_f32_sycl(
             (const char *) q->data, (const char *) k->data,
-            (const char *) w->data, (const char *) m->data, (float *) dst->data,
+            weight, (const char *) m->data, (float *) dst->data,
             n_embd, n_head, n_batch, n_stream, n_kv, nem3,
             nbq1, nbq2, nbq3,
             nbk2, nbk3,
@@ -546,4 +549,12 @@ void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor
             nb1, nb3,
             k->type,
             ctx.stream());
+}
+
+void ggml_sycl_op_lightning_indexer(ggml_backend_sycl_context & ctx, ggml_tensor * dst, const float * value) {
+    if (value) {
+        lightning_indexer(ctx, dst, ggml_sycl_value_reader<float, true>{nullptr, *value});
+    } else {
+        lightning_indexer(ctx, dst, ggml_sycl_value_reader<float, false>{static_cast<const char *>(dst->src[2]->data), 0.0f});
+    }
 }
