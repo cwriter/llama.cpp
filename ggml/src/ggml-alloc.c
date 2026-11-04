@@ -479,6 +479,7 @@ struct hash_node {
     struct buffer_address addr;
     bool allocated;
     bool absorbed; // the backend fuses this node away, so it gets no buffer
+    size_t floor;  // the size the previous plan gave this graph position, see ggml_gallocr_seed_floors
 };
 
 struct tensor_alloc {
@@ -514,6 +515,8 @@ struct ggml_gallocr {
 
     bool * fusion_absorbed; // [fusion_n_nodes], NULL if no plan
     int fusion_n_nodes;
+
+    bool floors; // the plan being made keeps every size of the previous one (GGML_ALLOC_KEEP_PLAN)
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -638,9 +641,15 @@ static bool ggml_gallocr_inplace_views(ggml_gallocr_t galloc) {
 }
 
 // a tensor gets the most space its backend may need for it in any later graph of the same topology,
-// so such a graph still fits the plan; size_max records exactly this planned size
-static size_t ggml_gallocr_plan_size(ggml_gallocr_t galloc, int buffer_id, const struct ggml_tensor * t) {
-    return ggml_backend_buft_get_max_alloc_size(galloc->bufts[buffer_id], t);
+// so such a graph still fits the plan; size_max records exactly this planned size. While a plan is
+// made with floors, it is also never less than what the previous plan gave the same position
+static size_t ggml_gallocr_plan_size(ggml_gallocr_t galloc, int buffer_id, struct ggml_tensor * t) {
+    size_t size = ggml_backend_buft_get_max_alloc_size(galloc->bufts[buffer_id], t);
+    if (galloc->floors) {
+        const size_t floor = ggml_gallocr_hash_get(galloc, t)->floor;
+        size = floor > size ? floor : size;
+    }
+    return size;
 }
 
 static bool ggml_gallocr_is_own(ggml_gallocr_t galloc, struct ggml_tensor * t) {
@@ -721,6 +730,13 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
 
                 if (!ggml_are_same_layout(node, parent)) {
                     AT_PRINTF("not reusing parent %s for %s as layouts are different\n", parent->name, node->name);
+                    continue;
+                }
+
+                // a kept plan can give the node more room than the parent it would take over
+                if (galloc->floors &&
+                    ggml_gallocr_plan_size(galloc, buffer_id, node) >
+                    ggml_gallocr_plan_size(galloc, ggml_gallocr_hash_get(galloc, p_owner)->buffer_id, p_owner)) {
                     continue;
                 }
 
@@ -847,10 +863,48 @@ static void ggml_gallocr_release_parent(ggml_gallocr_t galloc, struct ggml_tenso
     }
 }
 
+// Every graph position keeps at least the size the previous plan gave it. A plan used to be made
+// from the graph at hand alone, so two batch shapes whose tensors each outgrow the other's (a KQ mask
+// scaling with n_kv, an input scaling with the token or sequence count) re-planned on every switch,
+// each time draining the device. Only for a graph of the same node and leaf counts, which is what
+// needs_realloc compares positions of; a different topology plans from scratch.
+static void ggml_gallocr_seed_floors(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    if (!galloc->floors || galloc->node_allocs == NULL || galloc->n_nodes != graph->n_nodes ||
+        galloc->n_leafs != graph->n_leafs) {
+        galloc->floors = false;
+        return;
+    }
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor *     node       = graph->nodes[i];
+        const struct node_alloc * node_alloc = &galloc->node_allocs[i];
+        if (!node->view_src && !node->data && node_alloc->dst.size_max > 0) {
+            struct hash_node * hn = ggml_gallocr_hash_get(galloc, node);
+            hn->floor = hn->floor > node_alloc->dst.size_max ? hn->floor : node_alloc->dst.size_max;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            struct ggml_tensor * src = node->src[j];
+            if (src && !src->view_src && !src->data && node_alloc->src[j].size_max > 0) {
+                struct hash_node * hn = ggml_gallocr_hash_get(galloc, src);
+                hn->floor = hn->floor > node_alloc->src[j].size_max ? hn->floor : node_alloc->src[j].size_max;
+            }
+        }
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        struct ggml_tensor * leaf = graph->leafs[i];
+        const size_t         prev = galloc->leaf_allocs[i].leaf.size_max;
+        if (!leaf->view_src && !leaf->data && prev > 0) {
+            struct hash_node * hn = ggml_gallocr_hash_get(galloc, leaf);
+            hn->floor = hn->floor > prev ? hn->floor : prev;
+        }
+    }
+}
+
 static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids) {
     // clear hash tables
     ggml_hash_set_reset(&galloc->hash_set);
     memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+
+    ggml_gallocr_seed_floors(galloc, graph);
 
     // allocate leafs
     // these may be tensors that the application is not using in the graph, but may still want to allocate for other purposes
@@ -968,6 +1022,14 @@ static bool ggml_gallocr_reserve_n_impl(
         ggml_dyn_tallocr_reset(galloc->buf_tallocs[i]);
     }
 
+    // a size estimate (no_alloc) plans the graph alone; a real reservation keeps the previous plan's sizes
+    static int keep_plan = -1;
+    if (keep_plan < 0) {
+        const char * e = getenv("GGML_ALLOC_KEEP_PLAN");
+        keep_plan = e ? atoi(e) : 1;
+    }
+    galloc->floors = keep_plan != 0 && !no_alloc;
+
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
@@ -1027,6 +1089,9 @@ static bool ggml_gallocr_reserve_n_impl(
             galloc->leaf_allocs[i].leaf.size_max = ggml_gallocr_plan_size(galloc, hn->buffer_id, leaf);
         }
     }
+
+    // the plan is made; later size queries see the graph alone
+    galloc->floors = false;
 
     // reallocate buffers if needed
     for (int i = 0; i < galloc->n_buffers; i++) {
