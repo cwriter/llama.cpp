@@ -5385,6 +5385,9 @@ struct test_gated_delta_net : public test_case {
     // a backend may skip the gather or the norms and do them inside the gated delta net
     bool run_whole_graph() override { return gather > 0 || rms_l2 || out_norm; }
 
+    // a prefill batch may run chunked, with the products on f16 matrix tiles (f32 accumulation)
+    double max_nmse_err() override { return n_seq_tokens >= 64 ? 1e-6 : 1e-7; }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q;
         ggml_tensor * k;
@@ -14729,6 +14732,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, n_tokens, 1, 1, false, false, 1, 3));
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, 2, 1, 1, false, false, 2, 3));
+    // prefill lengths: whole and partial chunks of 64 (SYCL: GGML_SYCL_GDN_CHUNKED=N takes these chunked)
+    for (int64_t n_tokens : {64, 130, 512}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, false, false, 1, 3, true));
+    }
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 100, 2, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 70, 1, 1, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 64, 1, 2, 1, false, false, 1, 3));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1, 1, true, true));
@@ -15238,6 +15248,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // qwen4exp (Qwen3.8-Flash-Next): 48 recurrent heads of 128, 4 hyper-connection streams of 2560
     for (int n : {1, 1024}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, n, 1));
+        // as the model runs it: 16 q/k heads for 48 v heads, the state gathered, the q/k norms fused
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3, false, false, 1, 3, true));
         test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n, true));
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true));
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true, true, true));
