@@ -14,6 +14,8 @@
 // llama_memory_hybrid plus a third cache with one indexer key per token, for block-sparse attention (qwen4exp QSA)
 // the indexer is a side buffer over the attention cells: same size, padding, streams and slots, so cell j is one token in both
 
+struct llama_kpool_state;
+
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
     llama_memory_hybrid_idx(
@@ -98,6 +100,10 @@ public:
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
 
+    // One k-pool state shared by the batches in turn, so its per-cell marks are not rebuilt for every batch.
+    // A context gets a fresh one while another context holds it. LLAMA_KPOOL_RECYCLE=0 turns this off.
+    std::shared_ptr<llama_kpool_state> kpool_state_get();
+
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
     using stale_pos_t = std::array<llama_pos, LLAMA_MAX_SEQ>;
@@ -126,6 +132,8 @@ private:
 
     // unique_ptr because kpool_layout is incomplete here
     std::unique_ptr<kpool_layout> kpool_lay;
+
+    std::shared_ptr<llama_kpool_state> kpool_spare;
 
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
@@ -227,13 +235,12 @@ private:
     size_t i_cur = 0;
 
     // Which pools of the layout this ubatch must re-pool. The layout itself belongs to the memory.
-    struct kpool_state;
+    using kpool_state = llama_kpool_state;
     kpool_state kpool_build_sizes() const;
     void kpool_build_state(const llama_ubatch & ubatch);
     const kpool_state & kpool_cur() const;
 
-    // unique_ptr because kpool_state is incomplete here.
-    std::unique_ptr<kpool_state> kpool_st;
+    std::shared_ptr<kpool_state> kpool_st;
 
     // The ubatch kpool_st was built for, guards against reads before apply.
     size_t i_kpool = SIZE_MAX;
