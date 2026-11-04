@@ -15248,6 +15248,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // qwen4exp (Qwen3.8-Flash-Next): 48 recurrent heads of 128, 4 hyper-connection streams of 2560
     for (int n : {1, 1024}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 48, 128, n, 1));
+        // as the model runs it: 16 q/k heads for 48 v heads, the state gathered, the q/k norms fused
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3, false, false, 1, 3, true));
         test_cases.emplace_back(new test_dsv4_hc_pre(2560, 4, n, true));
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true));
         test_cases.emplace_back(new test_dsv4_hc_post(2560, n, true, true, true));

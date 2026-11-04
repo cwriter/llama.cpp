@@ -480,6 +480,9 @@ static void launch_gated_delta_net(const float *   q_d,
 //   D = U + (-W) S0,  O = Qe S0 + P D,  S_C = e^(G_C) S0 + Kd D
 // with Qe = diag(e^G qf) Q and Kd[i][s] = e^(G_C - G_s) kf_s k_s[i]; stage 2 also writes -W, Qe, P and
 // Kd as f16 for it. The state stays f32 between chunks; only the operands of each product are f16.
+// With XMX stage 2 also runs on tiles, with GDN_WY_PARTS items per state column: k.k and q.k, then
+// T = (I + A)^-1 by 16 x 16 blocks, then U = T diag(b) V and W = T diag(b e^G kf) K. The scalar forward
+// substitution has 63 steps in a row per chunk; the block solve has 15.
 // ---------------------------------------------------------------------------------------------
 
 static constexpr int GDN_CHUNK = 64;
@@ -565,14 +568,29 @@ static void gdn_chunk_scalars(const gdn_chunk_args a, const sycl::nd_item<3> & i
     }
 }
 
+namespace gdn_mx = sycl::ext::oneapi::experimental::matrix;
+
+static constexpr int GDN_XMX_TM = 8;
+static constexpr int GDN_XMX_TN = 16;
+static constexpr int GDN_XMX_TK = 16;
+static constexpr int GDN_XMX_SG = 4;
+static constexpr int GDN_LD     = 8;  // rows whose global loads stage 2 issues together
+static constexpr int GDN_WY_PARTS = 4;  // XMX stage 2: items per state column
+
 // stage 2: one work-group of S_v items per (chunk, head, sequence)
-template <int S_v>
+// XMX: k.k and q.k of the chunk as f16 tiles with f32 sums, the decay and norm factors applied after in f32
+template <int S_v, bool XMX>
 static void gdn_chunk_wy(const gdn_chunk_args a, const sycl::nd_item<3> & it, float * A, float * X, float * sc) {
     constexpr int C    = GDN_CHUNK;
     const int64_t seq  = it.get_group(0);
     const int64_t h    = it.get_group(1);
     const int64_t c    = it.get_group(2);
     const int     lid  = it.get_local_id(2);
+    // XMX: GDN_WY_PARTS items per state column, each taking its share of the chunk's rows in the row loops
+    constexpr int NI   = XMX ? GDN_WY_PARTS * S_v : S_v;
+    const int     col  = lid % S_v;
+    const int     r_lo = (lid / S_v) * (C * S_v / NI);
+    const int     r_hi = r_lo + C * S_v / NI;
     const int64_t bh   = seq * a.H + h;
     const int64_t base = bh * a.TP + c * C;
     float *       G    = sc;          // [C]
@@ -580,99 +598,309 @@ static void gdn_chunk_wy(const gdn_chunk_args a, const sycl::nd_item<3> & it, fl
     float *       KF   = sc + 2 * C;  // [C]
     float *       QF   = sc + 3 * C;  // [C]
 
-    for (int r = lid; r < C; r += S_v) {
+    for (int r = lid; r < C; r += NI) {
         G[r]  = a.GC[base + r];
         BE[r] = a.BE[base + r];
         KF[r] = a.KF[base + r];
         QF[r] = a.QF[base + r];
     }
-    // the chunk's k rows, read once: row s at s * (S_v + 1), so items reading different rows at the
-    // same i hit different banks. X holds them until the forward substitution below
-    constexpr int KS = S_v + 1;
-    float *       Ks = X;
-    for (int r = 0; r < C; ++r) {
-        const int64_t t = c * C + r;
-        Ks[r * KS + lid] = t < a.n_tokens ? a.krow(seq, h, t)[lid] : 0.0f;
-    }
-    sycl::group_barrier(it.get_group());
-
     float * Pc = a.P + (bh * a.NC + c) * C * C;
-    for (int idx = lid; idx < C * C; idx += S_v) {
-        const int     r  = idx / C;
-        const int     s  = idx - r * C;
-        const int64_t tr = c * C + r;
-        const int64_t ts = c * C + s;
-        float         av = 0.0f, pv = 0.0f;
-        if (s <= r && tr < a.n_tokens) {
-            // neighbouring items share r: the q row is one broadcast read, the k rows come from local memory
-            const float * kr = Ks + r * KS;
-            const float * ks = Ks + s * KS;
-            const float * qr = a.qrow(seq, h, tr);
-            float         kk = 0.0f, qk = 0.0f;
-#pragma unroll 8
-            for (int i = 0; i < S_v; ++i) {
-                kk += kr[i] * ks[i];
-                qk += qr[i] * ks[i];
+    if constexpr (XMX) {
+        constexpr int TM = GDN_XMX_TM;
+        constexpr int TN = GDN_XMX_TN;
+        constexpr int TK = GDN_XMX_TK;
+        constexpr int NT = (C / TM) * (C / TN);
+        static_assert(S_v % TK == 0 && S_v % WARP_SIZE == 0 && C % TN == 0, "whole tiles");
+        const auto sg    = it.get_sub_group();
+        const int  sg_id = sg.get_group_linear_id();
+        const int  n_sg  = NI / WARP_SIZE;
+        auto lp = [](auto * p) { return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p); };
+        auto gp = [](auto * p) { return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p); };
+        // X holds the operands until the forward substitution: rows [C][S_v] (A operand), then k^T packed as the
+        // B operand, [C / TN][S_v / 2][TN][2]
+        sycl::half * Rh = (sycl::half *) X;
+        sycl::half * Kb = Rh + C * S_v;
+        // rows in groups of GDN_LD, so their global loads are in flight together
+        for (int r0 = r_lo; r0 < r_hi; r0 += GDN_LD) {
+            float kv[GDN_LD];
+#pragma unroll
+            for (int j = 0; j < GDN_LD; ++j) {
+                const int64_t t = c * C + r0 + j;
+                kv[j]           = t < a.n_tokens ? a.krow(seq, h, t)[col] : 0.0f;
             }
-            const float dec = sycl::exp(G[r] - G[s]);
-            if (s < r) {
-                av = BE[r] * dec * KF[r] * KF[s] * kk;
+#pragma unroll
+            for (int j = 0; j < GDN_LD; ++j) {
+                const int r = r0 + j;
+                Rh[r * S_v + col] = (sycl::half) kv[j];
+                Kb[(r / TN) * S_v * TN + ((col >> 1) * TN + r % TN) * 2 + (col & 1)] = (sycl::half) kv[j];
             }
-            pv = dec * QF[r] * KF[s] * qk;
         }
-        A[idx]  = av;
-        Pc[idx] = pv;
-        if (a.Ph) {
+        sycl::group_barrier(it.get_group());
+        // rows . k^T -> A (pass 0, local) and Pc (pass 1, global); pass 1 reads the q rows
+        for (int pass = 0; pass < 2; ++pass) {
+            if (pass == 1) {
+                sycl::group_barrier(it.get_group());
+                for (int r0 = r_lo; r0 < r_hi; r0 += GDN_LD) {
+                    float qv[GDN_LD];
+#pragma unroll
+                    for (int j = 0; j < GDN_LD; ++j) {
+                        const int64_t t = c * C + r0 + j;
+                        qv[j]           = t < a.n_tokens ? a.qrow(seq, h, t)[col] : 0.0f;
+                    }
+#pragma unroll
+                    for (int j = 0; j < GDN_LD; ++j) {
+                        Rh[(r0 + j) * S_v + col] = (sycl::half) qv[j];
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+            }
+            for (int tile = sg_id; tile < NT; tile += n_sg) {
+                const int mt = tile / (C / TN);
+                const int nt = tile % (C / TN);
+                gdn_mx::joint_matrix<sycl::sub_group, float, gdn_mx::use::accumulator, TM, TN> acc;
+                gdn_mx::joint_matrix_fill(sg, acc, 0.0f);
+#pragma unroll
+                for (int kk = 0; kk < S_v / TK; ++kk) {
+                    gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::a, TM, TK, gdn_mx::layout::row_major> ma;
+                    gdn_mx::joint_matrix_load(sg, ma, lp(Rh + mt * TM * S_v + kk * TK), S_v);
+                    gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::b, TK, TN, gdn_mx::layout::ext_intel_packed> mb;
+                    gdn_mx::joint_matrix_load(sg, mb, lp(Kb + nt * S_v * TN + kk * TK * TN), TN * 2);
+                    gdn_mx::joint_matrix_mad(sg, acc, ma, mb, acc);
+                }
+                if (pass == 0) {
+                    gdn_mx::joint_matrix_store(sg, acc, lp(A + mt * TM * C + nt * TN), C, gdn_mx::layout::row_major);
+                } else {
+                    gdn_mx::joint_matrix_store(sg, acc, gp(Pc + mt * TM * C + nt * TN), C, gdn_mx::layout::row_major);
+                }
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        for (int idx = lid; idx < C * C; idx += NI) {
+            const int     r  = idx / C;
+            const int     s  = idx - r * C;
+            const int64_t tr = c * C + r;
+            float         av = 0.0f, pv = 0.0f;
+            if (s <= r && tr < a.n_tokens) {
+                const float dec = sycl::exp(G[r] - G[s]);
+                if (s < r) {
+                    av = BE[r] * dec * KF[r] * KF[s] * A[idx];
+                }
+                pv = dec * QF[r] * KF[s] * Pc[idx];
+            }
+            A[idx]  = av;
+            Pc[idx] = pv;
             a.Ph[(bh * a.NC + c) * C * C + idx] = (sycl::half) pv;
         }
-    }
-    // every item is done with Ks before X is reused
-    sycl::group_barrier(it.get_group());
-
-    // item lid owns column lid of U, then of W; X[r * S_v + lid] is only ever touched by it
-    for (int pass = 0; pass < 2; ++pass) {
+        sycl::group_barrier(it.get_group());
+    } else {
+        // the chunk's k rows, read once: row s at s * (S_v + 1), so items reading different rows at the
+        // same i hit different banks. X holds them until the forward substitution below
+        constexpr int KS = S_v + 1;
+        float *       Ks = X;
         for (int r = 0; r < C; ++r) {
-            const int64_t t   = c * C + r;
-            float         acc = 0.0f;
-            if (t < a.n_tokens) {
-                acc = pass == 0 ? BE[r] * a.vrow(seq, h, t)[lid] : BE[r] * sycl::exp(G[r]) * KF[r] * a.krow(seq, h, t)[lid];
-            }
-            for (int s = 0; s < r; ++s) {
-                acc -= A[r * C + s] * X[s * S_v + lid];
-            }
-            X[r * S_v + lid] = acc;
+            const int64_t t = c * C + r;
+            Ks[r * KS + lid] = t < a.n_tokens ? a.krow(seq, h, t)[lid] : 0.0f;
         }
-        float * out = (pass == 0 ? a.U : a.W) + base * S_v;
-        for (int r = 0; r < C; ++r) {
-            out[r * S_v + lid] = X[r * S_v + lid];
-            if (pass == 1 && a.Wh) {
-                a.Wh[(base + r) * S_v + lid] = (sycl::half) -X[r * S_v + lid];
+        sycl::group_barrier(it.get_group());
+
+        for (int idx = lid; idx < C * C; idx += S_v) {
+            const int     r  = idx / C;
+            const int     s  = idx - r * C;
+            const int64_t tr = c * C + r;
+            const int64_t ts = c * C + s;
+            float         av = 0.0f, pv = 0.0f;
+            if (s <= r && tr < a.n_tokens) {
+                // neighbouring items share r: the q row is one broadcast read, the k rows come from local memory
+                const float * kr = Ks + r * KS;
+                const float * ks = Ks + s * KS;
+                const float * qr = a.qrow(seq, h, tr);
+                float         kk = 0.0f, qk = 0.0f;
+#pragma unroll 8
+                for (int i = 0; i < S_v; ++i) {
+                    kk += kr[i] * ks[i];
+                    qk += qr[i] * ks[i];
+                }
+                const float dec = sycl::exp(G[r] - G[s]);
+                if (s < r) {
+                    av = BE[r] * dec * KF[r] * KF[s] * kk;
+                }
+                pv = dec * QF[r] * KF[s] * qk;
+            }
+            A[idx]  = av;
+            Pc[idx] = pv;
+            if (a.Ph) {
+                a.Ph[(bh * a.NC + c) * C * C + idx] = (sycl::half) pv;
+            }
+        }
+        // every item is done with Ks before X is reused
+        sycl::group_barrier(it.get_group());
+    }
+
+    if constexpr (!XMX) {
+        // item lid owns column lid of U, then of W; X[r * S_v + lid] is only ever touched by it
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int r = 0; r < C; ++r) {
+                const int64_t t   = c * C + r;
+                float         acc = 0.0f;
+                if (t < a.n_tokens) {
+                    acc = pass == 0 ? BE[r] * a.vrow(seq, h, t)[lid] : BE[r] * sycl::exp(G[r]) * KF[r] * a.krow(seq, h, t)[lid];
+                }
+                for (int s = 0; s < r; ++s) {
+                    acc -= A[r * C + s] * X[s * S_v + lid];
+                }
+                X[r * S_v + lid] = acc;
+            }
+            float * out = (pass == 0 ? a.U : a.W) + base * S_v;
+            for (int r = 0; r < C; ++r) {
+                out[r * S_v + lid] = X[r * S_v + lid];
+                if (pass == 1 && a.Wh) {
+                    a.Wh[(base + r) * S_v + lid] = (sycl::half) -X[r * S_v + lid];
+                }
+            }
+        }
+    } else {
+        // T = (I + A)^-1 by 16 x 16 blocks, then U = T diag(b) V and W = T diag(b e^G kf) K as f16 tiles with f32 sums.
+        // The block solve has 15 steps in a row, where the forward substitution over the chunk had 63.
+        constexpr int TM = GDN_XMX_TM;
+        constexpr int TN = GDN_XMX_TN;
+        constexpr int TK = GDN_XMX_TK;
+        constexpr int B  = WARP_SIZE;
+        constexpr int NB = C / B;
+        constexpr int NR = 2 * S_v / TN;  // column tiles of [U | W]
+        static_assert(C % B == 0 && C % TK == 0, "whole blocks");
+        const auto sg    = it.get_sub_group();
+        const int  sg_id = sg.get_group_linear_id();
+        const int  n_sg  = NI / WARP_SIZE;
+        const int  lane  = sg.get_local_linear_id();
+        auto lp = [](auto * p) { return sycl::address_space_cast<sycl::access::address_space::local_space, sycl::access::decorated::no>(p); };
+        auto gp = [](auto * p) { return sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(p); };
+
+        float * T = X;          // [C][C]
+        float * M = X + C * C;  // [NB - 1][B][B], A_ik T_kj summed over k
+        for (int idx = lid; idx < C * C; idx += NI) {
+            T[idx] = 0.0f;
+        }
+        sycl::group_barrier(it.get_group());
+        // diagonal blocks: lane j owns column j of block b
+        for (int b = sg_id; b < NB; b += n_sg) {
+            const int o = b * B;
+            const int j = lane;
+            for (int r = j; r < B; ++r) {
+                float v = r == j ? 1.0f : 0.0f;
+                for (int q = j; q < r; ++q) {
+                    v -= A[(o + r) * C + o + q] * T[(o + q) * C + o + j];
+                }
+                T[(o + r) * C + o + j] = v;
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        // block (i, j = i - d) = -T_ii sum_{k = j}^{i - 1} A_ik T_kj; it needs only blocks nearer the diagonal
+        for (int d = 1; d < NB; ++d) {
+            const int n_el = (NB - d) * B * B;
+            for (int idx = lid; idx < n_el; idx += NI) {
+                const int bj = idx / (B * B);
+                const int bi = bj + d;
+                const int r  = (idx % (B * B)) / B;
+                const int cc = idx % B;
+                float     m  = 0.0f;
+                for (int q = bj * B; q < bi * B; ++q) {
+                    m += A[(bi * B + r) * C + q] * T[q * C + bj * B + cc];
+                }
+                M[idx] = m;
+            }
+            sycl::group_barrier(it.get_group());
+            for (int idx = lid; idx < n_el; idx += NI) {
+                const int bj = idx / (B * B);
+                const int bi = bj + d;
+                const int r  = (idx % (B * B)) / B;
+                const int cc = idx % B;
+                float     v  = 0.0f;
+                for (int q = 0; q <= r; ++q) {
+                    v -= T[(bi * B + r) * C + bi * B + q] * M[bj * B * B + q * B + cc];
+                }
+                T[(bi * B + r) * C + bj * B + cc] = v;
+            }
+            sycl::group_barrier(it.get_group());
+        }
+        // A is done: T as the f16 A operand there
+        sycl::half * Th = (sycl::half *) A;
+        for (int idx = lid; idx < C * C; idx += NI) {
+            Th[idx] = (sycl::half) T[idx];
+        }
+        sycl::group_barrier(it.get_group());
+        // [b v | b e^G kf k] as the packed B operand, [NR][C / 2][TN][2]
+        sycl::half * Rb = (sycl::half *) X;
+        for (int r0 = r_lo; r0 < r_hi; r0 += GDN_LD) {
+            float bv[GDN_LD], bk[GDN_LD];
+#pragma unroll
+            for (int j = 0; j < GDN_LD; ++j) {
+                const int64_t t = c * C + r0 + j;
+                const bool    in = t < a.n_tokens;
+                bv[j] = in ? a.vrow(seq, h, t)[col] : 0.0f;
+                bk[j] = in ? a.krow(seq, h, t)[col] : 0.0f;
+            }
+#pragma unroll
+            for (int j = 0; j < GDN_LD; ++j) {
+                const int r  = r0 + j;
+                const int n1 = S_v + col;
+                Rb[(col / TN) * C * TN + ((r >> 1) * TN + col % TN) * 2 + (r & 1)] = (sycl::half) (BE[r] * bv[j]);
+                Rb[(n1 / TN) * C * TN + ((r >> 1) * TN + n1 % TN) * 2 + (r & 1)] =
+                    (sycl::half) (BE[r] * sycl::exp(G[r]) * KF[r] * bk[j]);
+            }
+        }
+        sycl::group_barrier(it.get_group());
+        for (int tile = sg_id; tile < (C / TM) * NR; tile += n_sg) {
+            const int mt = tile / NR;
+            const int nt = tile % NR;
+            gdn_mx::joint_matrix<sycl::sub_group, float, gdn_mx::use::accumulator, TM, TN> acc;
+            gdn_mx::joint_matrix_fill(sg, acc, 0.0f);
+#pragma unroll
+            for (int kk = 0; kk < C / TK; ++kk) {
+                gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::a, TM, TK, gdn_mx::layout::row_major> ma;
+                gdn_mx::joint_matrix_load(sg, ma, lp(Th + mt * TM * C + kk * TK), C);
+                gdn_mx::joint_matrix<sycl::sub_group, sycl::half, gdn_mx::use::b, TK, TN, gdn_mx::layout::ext_intel_packed> mb;
+                gdn_mx::joint_matrix_load(sg, mb, lp(Rb + nt * C * TN + kk * TK * TN), TN * 2);
+                gdn_mx::joint_matrix_mad(sg, acc, ma, mb, acc);
+            }
+            float * out = (nt < S_v / TN ? a.U + nt * TN : a.W + (nt - S_v / TN) * TN) + (base + mt * TM) * S_v;
+            gdn_mx::joint_matrix_store(sg, acc, gp(out), S_v, gdn_mx::layout::row_major);
+        }
+        sycl::group_barrier(it.get_group());
+        for (int r0 = r_lo; r0 < r_hi; r0 += GDN_LD) {
+            float w[GDN_LD];
+#pragma unroll
+            for (int j = 0; j < GDN_LD; ++j) {
+                w[j] = a.W[(base + r0 + j) * S_v + col];
+            }
+#pragma unroll
+            for (int j = 0; j < GDN_LD; ++j) {
+                a.Wh[(base + r0 + j) * S_v + col] = (sycl::half) -w[j];
             }
         }
     }
 
     if (a.Qh) {
         // the operands of the XMX pass: Qe rows, and the decayed keys transposed (row lid of Kd)
-        sycl::half * kd = a.KTh + ((bh * a.NC + c) * S_v + lid) * C;
-        for (int r = 0; r < C; ++r) {
-            const int64_t t  = c * C + r;
-            float         qe = 0.0f, kv = 0.0f;
-            if (t < a.n_tokens) {
-                qe = sycl::exp(G[r]) * QF[r] * a.qrow(seq, h, t)[lid];
-                kv = sycl::exp(G[C - 1] - G[r]) * KF[r] * a.krow(seq, h, t)[lid];
+        sycl::half * kd = a.KTh + ((bh * a.NC + c) * S_v + col) * C;
+        for (int r0 = r_lo; r0 < r_hi; r0 += GDN_LD) {
+            float qv[GDN_LD], kv[GDN_LD];
+#pragma unroll
+            for (int j = 0; j < GDN_LD; ++j) {
+                const int64_t t  = c * C + r0 + j;
+                const bool    in = t < a.n_tokens;
+                qv[j] = in ? a.qrow(seq, h, t)[col] : 0.0f;
+                kv[j] = in ? a.krow(seq, h, t)[col] : 0.0f;
             }
-            a.Qh[(base + r) * S_v + lid] = (sycl::half) qe;
-            kd[r]                        = (sycl::half) kv;
+#pragma unroll
+            for (int j = 0; j < GDN_LD; ++j) {
+                const int r = r0 + j;
+                a.Qh[(base + r) * S_v + col] = (sycl::half) (sycl::exp(G[r]) * QF[r] * qv[j]);
+                kd[r]                        = (sycl::half) (sycl::exp(G[C - 1] - G[r]) * KF[r] * kv[j]);
+            }
         }
     }
 }
 
-namespace gdn_mx = sycl::ext::oneapi::experimental::matrix;
-
-static constexpr int GDN_XMX_TM = 8;
-static constexpr int GDN_XMX_TN = 16;
-static constexpr int GDN_XMX_TK = 16;
-static constexpr int GDN_XMX_SG = 4;
 
 static bool gdn_xmx_supported_query(dpct::queue_ptr stream) {
     try {
@@ -995,16 +1223,30 @@ static void gdn_chunked_launch(ggml_backend_sycl_context & ctx, gdn_chunk_args a
                              gdn_chunk_scalars<S_v, ws>(a, it);
                          });
 
+    // GGML_SYCL_GDN_CHUNKED_XMX=2: stage 2 stays scalar (A and P in f32)
+    static const int xmx_mode = ggml_sycl_get_env("GGML_SYCL_GDN_CHUNKED_XMX", 1);
+    const bool xmx_wy = xmx && xmx_mode != 2 && S_v % GDN_XMX_TK == 0;
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<float, 1> A(C * C, cgh);
-        sycl::local_accessor<float, 1> X(C * (S_v + 1), cgh);  // the chunk's k rows first, then U and W
+        // the chunk's k rows first, then U and W; XMX: the operands, then T and its block sums, then [U | W] as f16
+        sycl::local_accessor<float, 1> X(std::max(C * (S_v + 1), xmx_wy ? C * C + C * C / 4 : 0), cgh);
         sycl::local_accessor<float, 1> sc(4 * C, cgh);
-        cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(n_seqs, a.H, a.NC * S_v), sycl::range<3>(1, 1, S_v)),
-                         [=](sycl::nd_item<3> it) {
-                             gdn_chunk_wy<S_v>(a, it, A.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                               X.get_multi_ptr<sycl::access::decorated::no>().get(),
-                                               sc.get_multi_ptr<sycl::access::decorated::no>().get());
-                         });
+        const sycl::nd_range<3> range(sycl::range<3>(n_seqs, a.H, a.NC * S_v), sycl::range<3>(1, 1, S_v));
+        const sycl::nd_range<3> range2(sycl::range<3>(n_seqs, a.H, a.NC * GDN_WY_PARTS * S_v),
+                                       sycl::range<3>(1, 1, GDN_WY_PARTS * S_v));
+        if (xmx_wy) {
+            cgh.parallel_for(range2, [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                gdn_chunk_wy<S_v, true>(a, it, A.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                        X.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                        sc.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+        } else {
+            cgh.parallel_for(range, [=](sycl::nd_item<3> it) {
+                gdn_chunk_wy<S_v, false>(a, it, A.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         X.get_multi_ptr<sycl::access::decorated::no>().get(),
+                                         sc.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+        }
     });
 
     if (xmx) {
@@ -1023,9 +1265,9 @@ static void gdn_chunked_launch(ggml_backend_sycl_context & ctx, gdn_chunk_args a
     });
 }
 
-// GGML_SYCL_GDN_CHUNKED=N runs prefill of at least N tokens through the chunked path; 0 (default) never
+// GGML_SYCL_GDN_CHUNKED=N runs prefill of at least N tokens (default 64) through the chunked path; 0 never
 static int gdn_chunked_min_tokens() {
-    static const int n = ggml_sycl_get_env("GGML_SYCL_GDN_CHUNKED", 0);
+    static const int n = ggml_sycl_get_env("GGML_SYCL_GDN_CHUNKED", 64);
     return n;
 }
 
