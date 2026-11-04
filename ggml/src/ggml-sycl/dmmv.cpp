@@ -4247,14 +4247,33 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     GGML_UNUSED(ctx);
 }
 
+// a bf16 weight, read as its 16 bits: widened to f32 by a shift, so no bf16 arithmetic is needed
+struct mv_bf16 {
+    uint16_t bits;
+};
+
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+
+// N weights of type TA as f32
+template <typename TA, int N> ESIMD_INLINE sycl::ext::intel::esimd::simd<float, N> mv_load(const TA * p) {
+    namespace es = sycl::ext::intel::esimd;
+    if constexpr (std::is_same_v<TA, mv_bf16>) {
+        es::simd<uint32_t, N> u = es::block_load<uint16_t, N>((const uint16_t *) p);
+        u <<= 16;
+        return u.template bit_cast_view<float>().read();
+    } else {
+        return es::block_load<TA, N>(p);
+    }
+}
+
 // f32 mat-vec for one token (the qwen4exp MoE router: 512 x 2560 f32, 48 per token). KS threads share a row; each
 // takes CH chunks of 128 floats, issues all their weight and activation loads before the FMAs, and the KS partial
 // sums meet in SLM. The split-K sub-group kernel runs 512 such rows as 32 work-groups of float4 loads in a 40-step
 // loop and streams the 5.2 MiB at ~67% of the VRAM bandwidth.
 // EPI 0: dst = a.b; 1: sigmoid(a.b); 2: softplus(a.b + bias[m]) * scale[m] (the qwen4exp alpha gate)
-template <int KS, int RG, int CH, int EPI = 0>
-static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * dst, const int M, const int K,
+// TA = sycl::half or mv_bf16 reads a 16-bit copy of the weights (half the bytes); the sums stay f32
+template <int KS, int RG, int CH, int EPI = 0, typename TA = float>
+static void f32_mat_vec_esimd_launch(const TA * a, const float * b, float * dst, const int M, const int K,
                                      const int lda, dpct::queue_ptr stream, const float * bias = nullptr,
                                      const float * scale = nullptr) {
     constexpr int WG = KS * RG;
@@ -4272,10 +4291,10 @@ static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * d
 
             simd<float, 128> acc = 0.0f;
             if (m < M) {
-                const float * arow = a + (size_t) m * lda;
+                const TA * arow = a + (size_t) m * lda;
                 int c = ks * CH;
                 for (; c + CH <= nch; c += KS * CH) {
-                    simd<float, 128 * CH> av = block_load<float, 128 * CH>(arow + c * 128);
+                    simd<float, 128 * CH> av = mv_load<TA, 128 * CH>(arow + c * 128);
                     simd<float, 128 * CH> bv = block_load<float, 128 * CH>(b + c * 128);
 #pragma unroll
                     for (int i = 0; i < CH; ++i) {
@@ -4284,7 +4303,7 @@ static void f32_mat_vec_esimd_launch(const float * a, const float * b, float * d
                 }
                 // a K that is not a multiple of KS * CH chunks: the rest one chunk at a time
                 for (int i = 0; i < CH && c + i < nch; ++i) {
-                    acc += block_load<float, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
+                    acc += mv_load<TA, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
                 }
             }
             slm_scalar_store<float>(tid * sizeof(float), reduce<float>(acc, std::plus<>{}));
@@ -4318,7 +4337,8 @@ struct f32_mv_seg {
     int           epi;
 };
 
-template <int KS, int RG, int CH>
+// TA = sycl::half or mv_bf16: the segments' a point to 16-bit copies of the weights
+template <int KS, int RG, int CH, typename TA = float>
 static void f32_mat_vec2_esimd_launch(f32_mv_seg s0, f32_mv_seg s1, const float * b, const int K,
                                       dpct::queue_ptr stream) {
     constexpr int WG = KS * RG;
@@ -4339,10 +4359,10 @@ static void f32_mat_vec2_esimd_launch(f32_mv_seg s0, f32_mv_seg s1, const float 
 
             simd<float, 128> acc = 0.0f;
             if (m < M) {
-                const float * arow = (in1 ? s1.a : s0.a) + (size_t) m * (in1 ? s1.lda : s0.lda);
+                const TA * arow = (const TA *) (in1 ? s1.a : s0.a) + (size_t) m * (in1 ? s1.lda : s0.lda);
                 int c = ks * CH;
                 for (; c + CH <= nch; c += KS * CH) {
-                    simd<float, 128 * CH> av = block_load<float, 128 * CH>(arow + c * 128);
+                    simd<float, 128 * CH> av = mv_load<TA, 128 * CH>(arow + c * 128);
                     simd<float, 128 * CH> bv = block_load<float, 128 * CH>(b + c * 128);
 #pragma unroll
                     for (int i = 0; i < CH; ++i) {
@@ -4350,7 +4370,7 @@ static void f32_mat_vec2_esimd_launch(f32_mv_seg s0, f32_mv_seg s1, const float 
                     }
                 }
                 for (int i = 0; i < CH && c + i < nch; ++i) {
-                    acc += block_load<float, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
+                    acc += mv_load<TA, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
                 }
             }
             slm_scalar_store<float>(tid * sizeof(float), reduce<float>(acc, std::plus<>{}));
@@ -4488,24 +4508,25 @@ bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y,
 #endif
 }
 
-bool ggml_sycl_f32_mat_vec2_epi_esimd(const float * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
+template <typename TA>
+static bool f32_mat_vec2_epi_impl(const TA * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
                                       const float * bias0, const float * scale0,
-                                      const float * a1, float * dst1, int64_t M1, int64_t lda1, int epi1,
+                                      const TA * a1, float * dst1, int64_t M1, int64_t lda1, int epi1,
                                       const float * bias1, const float * scale1,
                                       const float * b, int64_t K, dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    if (!g_ggml_sycl_enable_esimd || K % 128 != 0 || lda0 % 4 != 0 || lda1 % 4 != 0 || M0 <= 0 || M1 <= 0 ||
+    if (!g_ggml_sycl_enable_esimd || K % 128 != 0 || lda0 % (16 / sizeof(TA)) != 0 || lda1 % (16 / sizeof(TA)) != 0 || M0 <= 0 || M1 <= 0 ||
         M0 + M1 > INT32_MAX || K > INT32_MAX || ((uintptr_t) a0 | (uintptr_t) a1 | (uintptr_t) b) % 16 != 0 ||
         epi0 < 0 || epi0 > 2 || epi1 < 0 || epi1 > 2) {
         return false;
     }
-    const f32_mv_seg s0 = { a0, dst0, bias0, scale0, (int) M0, (int) lda0, epi0 };
-    const f32_mv_seg s1 = { a1, dst1, bias1, scale1, (int) M1, (int) lda1, epi1 };
+    const f32_mv_seg s0 = { (const float *) a0, dst0, bias0, scale0, (int) M0, (int) lda0, epi0 };
+    const f32_mv_seg s1 = { (const float *) a1, dst1, bias1, scale1, (int) M1, (int) lda1, epi1 };
     // the shapes of the single launches: few rows spread a row over more threads
     if (M0 + M1 < 128) {
-        f32_mat_vec2_esimd_launch<10, 4, 2>(s0, s1, b, (int) K, stream);
+        f32_mat_vec2_esimd_launch<10, 4, 2, TA>(s0, s1, b, (int) K, stream);
     } else {
-        f32_mat_vec2_esimd_launch<2, 16, 5>(s0, s1, b, (int) K, stream);
+        f32_mat_vec2_esimd_launch<2, 16, 5, TA>(s0, s1, b, (int) K, stream);
     }
     return true;
 #else
@@ -4514,18 +4535,19 @@ bool ggml_sycl_f32_mat_vec2_epi_esimd(const float * a0, float * dst0, int64_t M0
 #endif
 }
 
-bool ggml_sycl_f32_mat_vec_epi_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+template <typename TA>
+static bool f32_mat_vec_epi_impl(const TA * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
                                      int epi, const float * bias, const float * scale, dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    if (!g_ggml_sycl_enable_esimd || K % 128 != 0 || lda % 4 != 0 || ((uintptr_t) a | (uintptr_t) b) % 16 != 0 ||
+    if (!g_ggml_sycl_enable_esimd || K % 128 != 0 || lda % (16 / sizeof(TA)) != 0 || ((uintptr_t) a | (uintptr_t) b) % 16 != 0 ||
         M > INT32_MAX || K > INT32_MAX || (epi != 1 && epi != 2)) {
         return false;
     }
     // few rows: more threads per row, so the row loads are spread over enough threads
     const bool small = M < 128;
 #define F32_EPI_LAUNCH(E_) \
-    if (small) { f32_mat_vec_esimd_launch<10, 4, 2, E_>(a, b, dst, (int) M, (int) K, (int) lda, stream, bias, scale); } \
-    else       { f32_mat_vec_esimd_launch<2, 16, 5, E_>(a, b, dst, (int) M, (int) K, (int) lda, stream, bias, scale); }
+    if (small) { f32_mat_vec_esimd_launch<10, 4, 2, E_, TA>(a, b, dst, (int) M, (int) K, (int) lda, stream, bias, scale); } \
+    else       { f32_mat_vec_esimd_launch<2, 16, 5, E_, TA>(a, b, dst, (int) M, (int) K, (int) lda, stream, bias, scale); }
     if (epi == 1) {
         F32_EPI_LAUNCH(1)
     } else {
@@ -4535,6 +4557,66 @@ bool ggml_sycl_f32_mat_vec_epi_esimd(const float * a, const float * b, float * d
     return true;
 #else
     GGML_UNUSED_VARS(a, b, dst, M, K, lda, epi, bias, scale, stream);
+    return false;
+#endif
+}
+
+bool ggml_sycl_f32_mat_vec2_epi_esimd(const float * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
+                                      const float * bias0, const float * scale0, const float * a1, float * dst1,
+                                      int64_t M1, int64_t lda1, int epi1, const float * bias1, const float * scale1,
+                                      const float * b, int64_t K, dpct::queue_ptr stream) {
+    return f32_mat_vec2_epi_impl(a0, dst0, M0, lda0, epi0, bias0, scale0, a1, dst1, M1, lda1, epi1, bias1, scale1, b, K, stream);
+}
+
+// calls f with a null pointer of the weight copy's element type; false for any other type
+template <typename F> static bool mv16_visit(ggml_type wtype, F && f) {
+    if (wtype == GGML_TYPE_F16) {
+        return f((const sycl::half *) nullptr);
+    }
+    if (wtype == GGML_TYPE_BF16) {
+        return f((const mv_bf16 *) nullptr);
+    }
+    return false;
+}
+
+bool ggml_sycl_mv16_mat_vec2_epi_esimd(const void * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
+                                       const float * bias0, const float * scale0, const void * a1, float * dst1,
+                                       int64_t M1, int64_t lda1, int epi1, const float * bias1, const float * scale1,
+                                       ggml_type wtype, const float * b, int64_t K, dpct::queue_ptr stream) {
+    return mv16_visit(wtype, [&](auto tag) {
+        using TA = std::remove_const_t<std::remove_pointer_t<decltype(tag)>>;
+        return f32_mat_vec2_epi_impl((const TA *) a0, dst0, M0, lda0, epi0, bias0, scale0, (const TA *) a1, dst1, M1, lda1,
+                                     epi1, bias1, scale1, b, K, stream);
+    });
+}
+
+bool ggml_sycl_f32_mat_vec_epi_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                     int epi, const float * bias, const float * scale, dpct::queue_ptr stream) {
+    return f32_mat_vec_epi_impl(a, b, dst, M, K, lda, epi, bias, scale, stream);
+}
+
+bool ggml_sycl_mv16_mat_vec_epi_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
+                                      int64_t lda, int epi, const float * bias, const float * scale, dpct::queue_ptr stream) {
+    return mv16_visit(wtype, [&](auto tag) {
+        using TA = std::remove_const_t<std::remove_pointer_t<decltype(tag)>>;
+        return f32_mat_vec_epi_impl((const TA *) a, b, dst, M, K, lda, epi, bias, scale, stream);
+    });
+}
+
+bool ggml_sycl_mv16_mat_vec_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
+                                  int64_t lda, dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (!g_ggml_sycl_enable_esimd || M < 128 || K % 128 != 0 || lda % 8 != 0 || ((uintptr_t) a | (uintptr_t) b) % 16 != 0 ||
+        M > INT32_MAX || K > INT32_MAX) {
+        return false;
+    }
+    return mv16_visit(wtype, [&](auto tag) {
+        using TA = std::remove_const_t<std::remove_pointer_t<decltype(tag)>>;
+        f32_mat_vec_esimd_launch<2, 16, 5, 0, TA>((const TA *) a, b, dst, (int) M, (int) K, (int) lda, stream);
+        return true;
+    });
+#else
+    GGML_UNUSED_VARS(a, wtype, b, dst, M, K, lda, stream);
     return false;
 #endif
 }
