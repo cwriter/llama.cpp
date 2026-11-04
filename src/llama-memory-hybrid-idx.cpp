@@ -361,10 +361,15 @@ struct llama_memory_hybrid_idx::kpool_layout {
 };
 
 // Which pools of the layout the current ubatch must re-pool, in the layout's pool order.
-struct llama_memory_hybrid_idx_context::kpool_state {
+struct llama_kpool_state {
     std::vector<uint32_t> is_new;
     std::vector<uint32_t> rep_gen; // per global cell, the generation that last marked a pool with that rep
     uint32_t generation = 0;
+
+    // a recycled state marks every rep with stamp in set_input_kpool, so the padding can skip them without a sort
+    bool recycled = false;
+    mutable std::vector<uint32_t> rep_stamp;
+    mutable uint32_t stamp = 0;
 
     uint32_t n_pool_real = 0;
     uint32_t n_pool_seq  = 0; // graph size of a list of one sequence's pools, see kpool_pad_seq
@@ -399,6 +404,21 @@ int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, ll
 }
 
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
+
+std::shared_ptr<llama_kpool_state> llama_memory_hybrid_idx::kpool_state_get() {
+    static const bool recycle = [] {
+        const char * env = getenv("LLAMA_KPOOL_RECYCLE");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    if (!recycle) {
+        return std::make_shared<llama_kpool_state>();
+    }
+    if (!kpool_spare) {
+        kpool_spare = std::make_shared<llama_kpool_state>();
+        kpool_spare->recycled = true;
+    }
+    return kpool_spare.use_count() == 1 ? kpool_spare : std::make_shared<llama_kpool_state>();
+}
 
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_get() const {
     GGML_ASSERT(kpool_lay != nullptr);
@@ -525,7 +545,7 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         st.n_pool_seq  = std::max(kpool_pad_seq(mem->kpool_layout_get()), kpool_pad(idx->get_size() / mem->get_kpool()));
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
-        kpool_st = std::make_unique<kpool_state>(std::move(st));
+        kpool_st = std::make_shared<kpool_state>(std::move(st));
         i_kpool  = 0;
     }
 }
@@ -584,7 +604,7 @@ bool llama_memory_hybrid_idx_context::apply() {
     if (res && kpool_track()) {
         mem->kpool_layout_update();
         if (!kpool_st) {
-            kpool_st = std::make_unique<kpool_state>();
+            kpool_st = mem->kpool_state_get();
         }
         kpool_build_state(get_ubatch());
         i_kpool  = i_cur;
@@ -895,7 +915,15 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     uint32_t i_new = 0;
     uint32_t gip   = 0; // the pool's index in the layout, which is_new follows
     std::vector<int64_t> reps; // the rep cells of every pool, listed or not
-    reps.reserve(st.n_pool_real);
+    if (st.recycled) {
+        if (++st.stamp == 0) {
+            std::fill(st.rep_stamp.begin(), st.rep_stamp.end(), 0);
+            st.stamp = 1;
+        }
+        st.rep_stamp.resize((size_t) kv_size*n_stream_kv, 0);
+    } else {
+        reps.reserve(st.n_pool_real);
+    }
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         const auto & sq = lay.seqs[s];
         seq_pool_start[s] = (uint32_t) pool_end.size();
@@ -914,7 +942,11 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
             // The pooled key lives in the last member's row.
             const uint32_t rep = sq.cells[j + kpool - 1].second;
-            reps.push_back(gcell(sq, rep));
+            if (st.recycled) {
+                st.rep_stamp[gcell(sq, rep)] = st.stamp;
+            } else {
+                reps.push_back(gcell(sq, rep));
+            }
             if (listed) {
                 pcell[ip] = (int32_t) gcell(sq, rep);
 
@@ -952,11 +984,16 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
     if (n_new_g > n_new) {
-        std::sort(reps.begin(), reps.end());
+        if (!st.recycled) {
+            std::sort(reps.begin(), reps.end());
+        }
+        auto is_rep = [&](int64_t cell) {
+            return st.recycled ? st.rep_stamp[cell] == st.stamp : std::binary_search(reps.begin(), reps.end(), cell);
+        };
 
         int64_t pad_cell = 0;
         for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
-            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
+            while (pad_cell < (int64_t) kv_size*n_stream_kv && is_rep(pad_cell)) {
                 ++pad_cell;
             }
             GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);
