@@ -951,6 +951,8 @@ struct ggml_backend_sycl_buffer_context {
     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
     host_staging staging;
     bool is_usm_system;
+    // 16-bit copies of f32 weights for the one-token mat-vecs (GGML_SYCL_F32_MV_TYPES)
+    std::unordered_map<const ggml_tensor *, void *> mv16_copies;
 
     ggml_backend_sycl_buffer_context(int device, void * dev_ptr, queue_ptr stream, bool is_usm_system) :
         device(device), dev_ptr(dev_ptr), stream(stream), is_usm_system(is_usm_system) {
@@ -974,6 +976,9 @@ struct ggml_backend_sycl_buffer_context {
 
     ~ggml_backend_sycl_buffer_context() {
         drop_host_staging();
+        for (auto & c : mv16_copies) {
+            SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(c.second, *stream)));
+        }
         if (dev_ptr != nullptr) {
             ggml_sycl_set_device(device);
             if (is_usm_system)
@@ -3987,6 +3992,77 @@ catch (sycl::exception const &exc) {
 static constexpr int64_t SYCL_F32_DNNL_MIN_GEMM_FLOPS = 256 * 256 * 256;
 #endif
 
+// GGML_SYCL_F32_MV_TYPES: the 16-bit types the one-token mat-vecs of f32 weights (the MoE router) may read a copy in,
+// bit 0 BF16, bit 1 F16 (default 3). The first set type the device supports wins; none keeps f32. Only the ESIMD
+// mat-vecs read the copy. BF16 needs the compiler's bfloat16 extension only: the kernels widen it by a shift.
+static ggml_type ggml_sycl_mv16_type(const queue_ptr & stream) {
+    static const int mask = ggml_sycl_get_env("GGML_SYCL_F32_MV_TYPES", 3);
+    if (!g_ggml_sycl_enable_esimd) {
+        return GGML_TYPE_F32;
+    }
+    const sycl::device dev = stream->get_device();
+#ifdef GGML_SYCL_HAS_BF16
+    if (mask & 1) {
+        return GGML_TYPE_BF16;
+    }
+#endif
+    if ((mask & 2) && dev.has(sycl::aspect::fp16)) {
+        return GGML_TYPE_F16;
+    }
+    return GGML_TYPE_F32;
+}
+
+struct ggml_sycl_mv16_weight {
+    const void * data = nullptr;
+    ggml_type    type = GGML_TYPE_F32;
+};
+
+// the 16-bit copy of weight w, made on first use and kept as long as its buffer; empty when off, w is not an f32
+// weight, or the queue is recording a graph
+static ggml_sycl_mv16_weight ggml_sycl_mv16_copy(const ggml_tensor * w, const queue_ptr & stream) {
+    if (w->type != GGML_TYPE_F32 || w->view_src || !w->buffer || !ggml_backend_buffer_is_sycl(w->buffer) ||
+        ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_is_contiguous(w)) {
+        return {};
+    }
+    auto * bctx = (ggml_backend_sycl_buffer_context *) w->buffer->context;
+    static ggml_type types[GGML_SYCL_MAX_DEVICES] = {};
+    static bool      known[GGML_SYCL_MAX_DEVICES] = {};
+    if (!known[bctx->device]) {
+        types[bctx->device] = ggml_sycl_mv16_type(stream);
+        known[bctx->device] = true;
+    }
+    const ggml_type type = types[bctx->device];
+    if (type == GGML_TYPE_F32) {
+        return {};
+    }
+    auto it = bctx->mv16_copies.find(w);
+    if (it != bctx->mv16_copies.end()) {
+        return { it->second, type };
+    }
+    if (stream->ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) {
+        return {};
+    }
+    const int64_t n = ggml_nelements(w);
+    auto * h = (uint16_t *) ggml_sycl_malloc_device(n * sizeof(uint16_t), *stream);
+    if (!h) {
+        return {};
+    }
+    const float * src = (const float *) w->data;
+    if (type == GGML_TYPE_BF16) {
+        // round to nearest even; the qwen4exp router weights are bf16 values, so this is exact there
+        stream->parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+            const uint32_t u = sycl::bit_cast<uint32_t>(src[i]);
+            h[i] = (uint16_t) ((u + 0x7FFF + ((u >> 16) & 1)) >> 16);
+        });
+    } else {
+        stream->parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { h[i] = sycl::bit_cast<uint16_t>((sycl::half) src[i]); });
+    }
+    bctx->mv16_copies[w] = h;
+    GGML_LOG_DEBUG("%s: %s copy of %s [%lld x %lld]\n", __func__, ggml_type_name(type), w->name, (long long) w->ne[0],
+                   (long long) w->ne[1]);
+    return { h, type };
+}
+
 inline void ggml_sycl_op_mul_mat_sycl(
     ggml_backend_sycl_context & ctx,
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
@@ -4013,6 +4089,14 @@ inline void ggml_sycl_op_mul_mat_sycl(
     // the main device has a larger memory buffer to hold the results from all GPUs
     // ldc == nrows of the matrix that cuBLAS writes into
     int ldc = id == ctx.device ? ne0 : row_diff; // used by MKL only
+
+    if (src1_ncols == 1 && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && row_low == 0 &&
+        row_diff == src0->ne[1] && row_diff >= 128 && (const void *) src0_dd_i == src0->data) {
+        const ggml_sycl_mv16_weight w16 = ggml_sycl_mv16_copy(src0, stream);
+        if (w16.data && ggml_sycl_mv16_mat_vec_esimd(w16.data, w16.type, src1_ddf_i, dst_dd_i, row_diff, ne10, ne00, stream)) {
+            return;
+        }
+    }
 
 #ifdef GGML_SYCL_F16
     bool use_fp16 = true;  // TODO(Yu) SYCL capability check
@@ -9842,6 +9926,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 scope_op_debug_print scope_dbg_print("ggml_sycl_f32_siblings_fused", r1.out, /*num_src=*/0);
                 const ggml_tensor * a0 = r0.mm->src[0];
                 const ggml_tensor * a1 = r1.mm->src[0];
+                const ggml_sycl_mv16_weight h0 = ggml_sycl_mv16_copy(a0, sycl_ctx->stream());
+                const ggml_sycl_mv16_weight h1 = h0.data ? ggml_sycl_mv16_copy(a1, sycl_ctx->stream()) : ggml_sycl_mv16_weight{};
+                if (h1.data && h1.type == h0.type && ggml_sycl_mv16_mat_vec2_epi_esimd(
+                        h0.data, (float *) r0.out->data, a0->ne[1], a0->ne[0], r0.epi,
+                        r0.bias ? (const float *) r0.bias->data : nullptr, r0.scale ? (const float *) r0.scale->data : nullptr,
+                        h1.data, (float *) r1.out->data, a1->ne[1], a1->ne[0], r1.epi,
+                        r1.bias ? (const float *) r1.bias->data : nullptr, r1.scale ? (const float *) r1.scale->data : nullptr,
+                        h0.type, (const float *) r0.mm->src[1]->data, a0->ne[0], sycl_ctx->stream())) {
+                    i = r1.last;
+                    continue;
+                }
                 if (ggml_sycl_f32_mat_vec2_epi_esimd(
                         (const float *) a0->data, (float *) r0.out->data, a0->ne[1], a0->ne[0], r0.epi,
                         r0.bias ? (const float *) r0.bias->data : nullptr, r0.scale ? (const float *) r0.scale->data : nullptr,
@@ -9858,6 +9953,15 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             if (ggml_sycl_match_matvec_epilogue(cgraph, i, em, /*any_tokens=*/false)) {
                 scope_op_debug_print scope_dbg_print("ggml_sycl_matvec_epi_fused", em.last, /*num_src=*/0);
                 const ggml_tensor * a = em.mm->src[0];
+                const ggml_sycl_mv16_weight h = ggml_sycl_mv16_copy(a, sycl_ctx->stream());
+                if (h.data && ggml_sycl_mv16_mat_vec_epi_esimd(h.data, h.type, (const float *) em.mm->src[1]->data,
+                                                               (float *) em.last->data, a->ne[1], a->ne[0], a->ne[0], em.epi,
+                                                               em.bias ? (const float *) em.bias->data : nullptr,
+                                                               em.scale ? (const float *) em.scale->data : nullptr,
+                                                               sycl_ctx->stream())) {
+                    i = em.last_idx;
+                    continue;
+                }
                 if (ggml_sycl_f32_mat_vec_epi_esimd((const float *) a->data, (const float *) em.mm->src[1]->data,
                                                     (float *) em.last->data, a->ne[1], a->ne[0], a->ne[0], em.epi,
                                                     em.bias ? (const float *) em.bias->data : nullptr,

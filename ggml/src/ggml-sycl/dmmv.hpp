@@ -78,6 +78,15 @@ bool ggml_sycl_f32_mat_vec_epi_esimd(const float * a, const float * b, float * d
 // f32 mat-vec dst[m] = sum_k a[m * lda + k] * b[k] on ESIMD (GGML_SYCL_F32_MMV_ESIMD); false if the shape is not taken
 bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
                                  dpct::queue_ptr stream);
+// the same reading a 16-bit copy of the weights, wtype GGML_TYPE_F16 or GGML_TYPE_BF16; false for other types
+bool ggml_sycl_mv16_mat_vec2_epi_esimd(const void * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
+                                       const float * bias0, const float * scale0, const void * a1, float * dst1,
+                                       int64_t M1, int64_t lda1, int epi1, const float * bias1, const float * scale1,
+                                       ggml_type wtype, const float * b, int64_t K, dpct::queue_ptr stream);
+bool ggml_sycl_mv16_mat_vec_epi_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
+                                      int64_t lda, int epi, const float * bias, const float * scale, dpct::queue_ptr stream);
+bool ggml_sycl_mv16_mat_vec_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
+                                  int64_t lda, dpct::queue_ptr stream);
 
 // Fused dense-FFN mat-vec: writes glu(gate . y, up . y) for same-type reordered
 // weights (Q2_K..Q6_K, Q8_0) and a single F32 activation column, using the ESIMD DMMV kernels.
