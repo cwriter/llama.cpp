@@ -119,10 +119,10 @@ enum ggml_sycl_reorder_type {
     GGML_SYCL_REORDER_IQ2_S   = 1 << 6,
 };
 
-// Every type but the newest, which stay off until measured. Q8_0 was left out after an early A/B
-// measured flat, but the reordered q8_0 MoE mat-vec is 5.1x faster and an interleaved llama-bench A/B
-// on qwen4exp measured tg128 +2.5% and pp2048 +1.0%.
-static constexpr int GGML_SYCL_REORDER_DEFAULT = ~(GGML_SYCL_REORDER_Q5_0 | GGML_SYCL_REORDER_IQ2_S);
+// Every type. Q8_0 was left out after an early A/B measured flat, but the reordered q8_0 MoE mat-vec
+// is 5.1x faster and an interleaved llama-bench A/B on qwen4exp measured tg128 +2.5% and pp2048 +1.0%.
+// Q5_0 and IQ2_S: Flash-Next UD-IQ4_XS d9620119 (33 Q5_0 down, 6 IQ2_S gate/up) tg128 39.2 -> 47.4.
+static constexpr int GGML_SYCL_REORDER_DEFAULT = -1;
 
 extern int g_ggml_sycl_reorder_types;
 
