@@ -4621,6 +4621,34 @@ bool ggml_sycl_mv16_mat_vec_esimd(const void * a, ggml_type wtype, const float *
 #endif
 }
 
+bool ggml_sycl_bf16_mat_vec_esimd(const void * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                  dpct::queue_ptr stream) {
+#ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (!g_ggml_sycl_enable_esimd || M <= 0 || K <= 0 || K % 32 != 0 || M > INT32_MAX / 2 || K > INT32_MAX / 2 ||
+        ((uintptr_t) a | (uintptr_t) b) % 16 != 0) {
+        return false;
+    }
+    if (K % 128 == 0 && lda % 8 == 0 && lda <= INT32_MAX) {
+        // few rows (the hc injects, the shared-expert gate): more threads per row
+        if (M < 128) {
+            f32_mat_vec_esimd_launch<10, 4, 2, 0, mv_bf16>((const mv_bf16 *) a, b, dst, (int) M, (int) K, (int) lda, stream);
+        } else {
+            f32_mat_vec_esimd_launch<2, 16, 5, 0, mv_bf16>((const mv_bf16 *) a, b, dst, (int) M, (int) K, (int) lda, stream);
+        }
+        return true;
+    }
+    // K a multiple of 32 only (the qwen4exp hc up projections, K = 320): the siblings kernel's bf16 slot, rows packed
+    if (lda != K) {
+        return false;
+    }
+    const ggml_sycl_mv_sibling mat = { a, dst, M, GGML_TYPE_BF16 };
+    return ggml_sycl_mv_siblings_esimd(&mat, 1, b, K, stream);
+#else
+    GGML_UNUSED_VARS(a, b, dst, M, K, lda, stream);
+    return false;
+#endif
+}
+
 bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
                                  dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD

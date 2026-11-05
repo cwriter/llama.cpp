@@ -863,6 +863,24 @@ static void reorder_mul_mat_vec_iq4_nl_q8_1_sycl(const void * vx, const void * v
     });
 }
 
+// the reordered MoE expert slices of q5_0 and iq2_s, when the per-expert MUL_MAT_ID loop runs them as dense mat-vecs
+template <ggml_type type>
+static void reorder_mul_mat_vec_q_generic_sycl(const void * vx, const void * vy, float * dst, const int ncols,
+                                               const int nrows, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % ggml_sycl_reordered::block_q_t<type>::traits::qk == 0);
+    constexpr size_t num_subgroups = WARP_SIZE;
+    const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y * (int) num_subgroups);
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                         [=](sycl::nd_item<3> nd_item) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                             mul_mat_vec_q_reorder<reorder_vec_dot_q_sycl<type>>(vx, vy, dst, ncols, nrows, nd_item);
+                         });
+    });
+}
+
 static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy, float * dst, const int ncols,
                                                     const int nrows, dpct::queue_ptr stream) {
     GGML_ASSERT(ncols % QK4_0 == 0);
@@ -2289,6 +2307,12 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 }
                 break;
             case GGML_TYPE_Q5_0:
+                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
+                    reorder_mul_mat_vec_q_generic_sycl<GGML_TYPE_Q5_0>(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff,
+                                                                       stream);
+                    break;
+                }
                 if (i == 0 && src1_ncols > 1 && src1_ncols <= 8) {
                     const int stride_col_y   = src1_padded_col_size / QK8_1;
                     const int stride_col_dst = dst->ne[0];
@@ -2523,7 +2547,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 mul_mat_vec_iq2_xs_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 break;
             case GGML_TYPE_IQ2_S:
-                mul_mat_vec_iq2_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
+                    ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
+                    reorder_mul_mat_vec_q_generic_sycl<GGML_TYPE_IQ2_S>(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff,
+                                                                        stream);
+                } else {
+                    mul_mat_vec_iq2_s_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
+                }
                 break;
             case GGML_TYPE_IQ3_XXS:
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
@@ -3471,6 +3501,8 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_supports_type(enum ggml_type src0_type) 
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_IQ2_S:
             return true;
         default:
             return false;
@@ -4028,6 +4060,18 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_glu(
                 expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
                 dst_token_stride, src1_token_stride, glu_op, stream);
             return true;
+        case GGML_TYPE_Q5_0:
+            launch_mul_mat_vec_q_moe_reorder_glu<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_0>>(
+                vx_gate_base, vx_up_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                dst_token_stride, src1_token_stride, glu_op, stream);
+            return true;
+        case GGML_TYPE_IQ2_S:
+            launch_mul_mat_vec_q_moe_reorder_glu<reorder_vec_dot_q_sycl<GGML_TYPE_IQ2_S>>(
+                vx_gate_base, vx_up_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                dst_token_stride, src1_token_stride, glu_op, stream);
+            return true;
         case GGML_TYPE_Q4_K:
             launch_mul_mat_vec_q_moe_reorder_glu<reorder_vec_dot_q_sycl<GGML_TYPE_Q4_K>>(
                 vx_gate_base, vx_up_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
@@ -4138,6 +4182,18 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder(
             return true;
         case GGML_TYPE_IQ3_XXS:
             launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ3_XXS>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                dst_token_stride, src1_token_stride, route_order, stream);
+            return true;
+        case GGML_TYPE_Q5_0:
+            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_Q5_0>>(
+                vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
+                expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
+                dst_token_stride, src1_token_stride, route_order, stream);
+            return true;
+        case GGML_TYPE_IQ2_S:
+            launch_mul_mat_vec_q_moe_reorder<reorder_vec_dot_q_sycl<GGML_TYPE_IQ2_S>>(
                 vx_base, vy, ids_dev, dst_base, ncols, nrows, n_experts_used, n_tokens,
                 expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride,
                 dst_token_stride, src1_token_stride, route_order, stream);

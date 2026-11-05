@@ -88,6 +88,12 @@ bool ggml_sycl_mv16_mat_vec_epi_esimd(const void * a, ggml_type wtype, const flo
 bool ggml_sycl_mv16_mat_vec_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
                                   int64_t lda, dpct::queue_ptr stream);
 
+// a bf16 weight [K, M] (row stride lda elements) times one f32 activation column, summed in f32 (GGML_SYCL_BF16_MV):
+// the dmmv path converts the activation to f16 and sums in half2 in a GGML_SYCL_F16 build. K % 32 == 0. False if not
+// taken; nothing is launched then.
+bool ggml_sycl_bf16_mat_vec_esimd(const void * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                  dpct::queue_ptr stream);
+
 // Fused dense-FFN mat-vec: writes glu(gate . y, up . y) for same-type reordered
 // weights (Q2_K..Q6_K, Q8_0) and a single F32 activation column, using the ESIMD DMMV kernels.
 // vx is the up weight, vgate the gate weight. Only defined when GGML_SYCL_DMMV_HAS_ESIMD;

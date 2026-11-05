@@ -13179,6 +13179,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, { 128, 512, 12288, 512, 512 }));
     test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, { 12288, 512, 512 }));
     test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_BF16 }, { 128, 512 }));
+    // bf16 qwen4exp quants (GSQ-RCO): router + shared-expert gate, ssm alpha + beta, ple value + key
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_BF16 }, { 512, 1 }));
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_BF16 }, { 48, 48 }));
+    test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_BF16 }, { 2560, 10240 }));
     for (int64_t k : { 2048, 2080, 2560, 3072, 4064 }) {
         test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 321, 257 }, k));
         test_cases.emplace_back(new test_mv_siblings({ GGML_TYPE_Q8_0, GGML_TYPE_BF16, GGML_TYPE_Q8_0 }, { 1, 3, 7 }, k));
@@ -13364,12 +13368,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 1, 3, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, 256, {2, 3}, {1, 1}, {0, 3, 2, 1}));
 
+    // qwen4exp bf16 one-token projections (GSQ-RCO): router, shared-expert gate, hc down/up/inject, ssm gates, ple
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {512, 2560}, {1, 2560}, {320, 10240}, {4, 10240}, {10240, 320},
+                                                       {48, 2560}, {10240, 2560}, {2560, 2560}, {7, 96} }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, mk[0], 1, mk[1], {1, 1}, {1, 1}));
+    }
+
     // BF16 in src1, as ggml_conv_1d_dw emits it for a BF16 kernel
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 8, 256, {1, 1}, {1, 1}));
 
-    for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
+    for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0}) {
         for (int64_t k : {256, 512, 768}) {
             for (int n : {1, 2, 8, 9, 64, 256}) {
                 for (int n_used : {1, 2}) {
@@ -13379,6 +13389,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             for (int n_used : {1, 2}) {
                 test_cases.emplace_back(new test_mul_mat_id_reused_weight(type, k, 64, n_used));
             }
+        }
+    }
+
+    // qwen4exp UD v3.1 MoE shapes: IQ2_S gate/up (2560 -> 640) with the GLU, Q5_0 down (640 -> 2560), 10 of 64 experts
+    for (int n : {1, 3, 64, 256}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 64, 10, false, 640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_0, GGML_TYPE_F32, 64, 10, false, 2560, n, 640));
+        // GSQ-RCO: Q2_0 down (640 -> 2560)
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 64, 10, false, 2560, n, 640));
+    }
+    // qwen4exp shared experts of a mixed-type quant (GSQ-RCO): one-token dense gate/up + GLU, 2560 -> 640
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 1, 640, 2560,
+            false, 1, 1, false, false, true, false, {1, 1}));
+    }
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_Q5_0}) {
+        for (int n : {1, 3}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n, 640, 2560,
+                true, 64, 10, false, false, true, false, {1, 1}));
         }
     }
 

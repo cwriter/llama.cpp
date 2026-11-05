@@ -115,12 +115,14 @@ enum ggml_sycl_reorder_type {
     // These bits control MoE reorder. Dense IQ3_XXS still uses the IQ3_S bit.
     GGML_SYCL_REORDER_IQ3_XXS = 1 << 3,
     GGML_SYCL_REORDER_IQ4_XS  = 1 << 4,
+    GGML_SYCL_REORDER_Q5_0    = 1 << 5,
+    GGML_SYCL_REORDER_IQ2_S   = 1 << 6,
 };
 
-// Every type; a new bit is on by default. Q8_0 was left out after an early A/B measured flat, but
-// the reordered q8_0 MoE mat-vec is 5.1x faster and an interleaved llama-bench A/B on qwen4exp
-// measured tg128 +2.5% and pp2048 +1.0%.
-static constexpr int GGML_SYCL_REORDER_DEFAULT = -1;
+// Every type but the newest, which stay off until measured. Q8_0 was left out after an early A/B
+// measured flat, but the reordered q8_0 MoE mat-vec is 5.1x faster and an interleaved llama-bench A/B
+// on qwen4exp measured tg128 +2.5% and pp2048 +1.0%.
+static constexpr int GGML_SYCL_REORDER_DEFAULT = ~(GGML_SYCL_REORDER_Q5_0 | GGML_SYCL_REORDER_IQ2_S);
 
 extern int g_ggml_sycl_reorder_types;
 
@@ -142,6 +144,8 @@ enum ggml_sycl_xmx_gather_type {
     GGML_SYCL_XMX_GATHER_Q6_K     = 1 << 12,
     GGML_SYCL_XMX_GATHER_Q2_K     = 1 << 13,
     GGML_SYCL_XMX_GATHER_Q3_K     = 1 << 14,
+    GGML_SYCL_XMX_GATHER_Q5_0     = 1 << 15,
+    GGML_SYCL_XMX_GATHER_Q2_0     = 1 << 16,
 };
 static constexpr int GGML_SYCL_XMX_GATHER_TYPES_DEFAULT = ~0;
 extern int g_ggml_sycl_xmx_gather_types;
