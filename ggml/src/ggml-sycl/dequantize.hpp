@@ -1769,6 +1769,58 @@ static void dequantize_block_iq4_nl_reorder(const void * __restrict__ vx, dst_t 
     }
 }
 
+// q5_0 in the reorder layout [qs 16][qh 4][d 2], one block per work-item; the values of dequantize_q5_0
+template <typename dst_t>
+static void dequantize_block_q5_0_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
+                                          const sycl::nd_item<3> & item_ct1) {
+    const int64_t nb = k / QK5_0;
+    const int64_t ib = (int64_t) item_ct1.get_group(2) * WARP_SIZE + item_ct1.get_local_id(2);
+    if (ib >= nb) {
+        return;
+    }
+    const uint8_t * base = (const uint8_t *) vx;
+    const uint8_t * qs   = base + ib * (QK5_0 / 2);
+    const uint32_t  qh   = *(const uint32_t *) (base + nb * (QK5_0 / 2) + ib * sizeof(uint32_t));
+    const float     d    = *(const sycl::half *) (base + nb * (QK5_0 / 2 + sizeof(uint32_t)) + ib * sizeof(sycl::half));
+    dst_t *         y    = yy + ib * QK5_0;
+#pragma unroll
+    for (int j = 0; j < QK5_0 / 2; ++j) {
+        const int x0 = (qs[j] & 0xf) | (((qh >> j) << 4) & 0x10);
+        const int x1 = (qs[j] >> 4) | ((qh >> (j + 12)) & 0x10);
+        y[j]             = d * (x0 - 16);
+        y[j + QK5_0 / 2] = d * (x1 - 16);
+    }
+}
+
+// iq2_s in the reorder layout [qs 64][qh 8][scales 8][d 2], one 32-value sub-block per work-item
+template <typename dst_t>
+static void dequantize_block_iq2_s_reorder(const void * __restrict__ vx, dst_t * __restrict__ yy, int64_t k,
+                                           const sycl::nd_item<3> & item_ct1) {
+    const int64_t nb = k / QK_K;
+    const int64_t t  = (int64_t) item_ct1.get_group(2) * WARP_SIZE + item_ct1.get_local_id(2);
+    if (t >= nb * (QK_K / 32)) {
+        return;
+    }
+    const int64_t   ib     = t / (QK_K / 32);
+    const int       ib32   = t % (QK_K / 32);
+    const uint8_t * base   = (const uint8_t *) vx;
+    const uint8_t * qs     = base + ib * (QK_K / 4);
+    const uint8_t   qh     = base[nb * (QK_K / 4) + ib * (QK_K / 32) + ib32];
+    const uint8_t   sc     = base[nb * (QK_K / 4 + QK_K / 32) + ib * (QK_K / 32) + ib32];
+    const float     d      = *(const sycl::half *) (base + nb * (QK_K / 4 + QK_K / 16) + ib * sizeof(sycl::half));
+    dst_t *         y      = yy + ib * QK_K + ib32 * 32;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const uint8_t * grid  = (const uint8_t *) (iq2s_grid + (qs[4 * ib32 + l] | ((qh << (8 - 2 * l)) & 0x300)));
+        const float     dl    = d * (0.5f + ((sc >> (4 * (l / 2))) & 0xf)) * 0.25f;
+        const uint8_t   signs = qs[QK_K / 8 + 4 * ib32 + l];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            y[8 * l + j] = dl * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+        }
+    }
+}
+
 static constexpr int IQ4_NL_QS_BYTES_PER_THREAD = 4;
 
 // 8 blocks of QK4_NL per QK_K region, each split into 16/bpt chunks

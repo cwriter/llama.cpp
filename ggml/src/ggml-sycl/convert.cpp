@@ -499,6 +499,22 @@ static void dequantize_row_iq4_nl_sycl_reorder(const void *vx, dst_t *y, const i
 }
 
 template <typename dst_t>
+static void dequantize_row_q5_0_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK5_0 == 0);
+    const int64_t n_wg = ceil_div(k / QK5_0, (int64_t) WARP_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_wg * WARP_SIZE), sycl::range<3>(1, 1, WARP_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) { dequantize_block_q5_0_reorder(vx, y, k, item_ct1); });
+}
+
+template <typename dst_t>
+static void dequantize_row_iq2_s_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
+    GGML_ASSERT(k % QK_K == 0);
+    const int64_t n_wg = ceil_div(k / QK_K * (QK_K / 32), (int64_t) WARP_SIZE);
+    stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, n_wg * WARP_SIZE), sycl::range<3>(1, 1, WARP_SIZE)),
+                         [=](sycl::nd_item<3> item_ct1) { dequantize_block_iq2_s_reorder(vx, y, k, item_ct1); });
+}
+
+template <typename dst_t>
 static void dequantize_row_iq3_s_sycl_reorder(const void * vx, dst_t * y, const int64_t k,
                                               dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
@@ -755,6 +771,9 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
                 return dequantize_block_sycl<QK4_1, QR4_1, dequantize_q4_1, dst_t>;
             }
         case GGML_TYPE_Q5_0:
+            if (is_reordered_src0(dst)) {
+                return dequantize_row_q5_0_sycl_reorder;
+            }
             return dequantize_block_sycl<QK5_0, QR5_0, dequantize_q5_0, dst_t>;
         case GGML_TYPE_Q5_1:
             return dequantize_block_sycl<QK5_1, QR5_1, dequantize_q5_1, dst_t>;
@@ -803,6 +822,9 @@ static to_t_sycl_t<dst_t> ggml_get_dequant_sycl(ggml_type type, ggml_tensor * ds
         case GGML_TYPE_IQ2_XS:
             return dequantize_row_iq2_xs_sycl;
         case GGML_TYPE_IQ2_S:
+            if (is_reordered_src0(dst)) {
+                return dequantize_row_iq2_s_sycl_reorder;
+            }
             return dequantize_row_iq2_s_sycl;
         case GGML_TYPE_IQ3_XXS:
             if (is_reordered_src0(dst)) {
