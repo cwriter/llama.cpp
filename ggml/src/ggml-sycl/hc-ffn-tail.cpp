@@ -125,6 +125,11 @@ bool ggml_sycl_match_hc_ffn_tail(const ggml_cgraph * cgraph, int i, ggml_sycl_hc
             return false;
         }
         tail.x.reduced = rm.dst;
+        // with GGML_SYCL_MOE_TAIL_SCRATCH the down projection leaves the expert rows in scratch and the kernel
+        // sums them here with these weights instead of reading the reduction: graph_optimize must keep them
+        // allocated until the tail as well, or a node in between takes their memory (the kernel ignores them
+        // while it reads reduced)
+        tail.x.weights = rm.weights;
     } else {
         const ggml_tensor * ex = rm.experts;
         if (ex->ne[0] != n_embd || ex->ne[2] * ex->ne[3] != n_tokens || ex->nb[1] % 16 != 0 || ex->nb[2] % 16 != 0) {
