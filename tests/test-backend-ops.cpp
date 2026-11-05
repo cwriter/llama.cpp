@@ -11849,7 +11849,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // src1 precision: same shapes with GGML_PREC_F32, which the backends must not round down to F16 or TF32
-    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         test_cases.emplace_back(new test_mul_mat_prec_src1_f32(type_a,  64,   1, 256));
         test_cases.emplace_back(new test_mul_mat_prec_src1_f32(type_a,  64,   8, 256));
         test_cases.emplace_back(new test_mul_mat_prec_src1_f32(type_a,  64,  32, 256));

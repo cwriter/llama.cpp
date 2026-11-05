@@ -17,6 +17,8 @@
 
 #if GGML_SYCL_DNNL
 
+#include <cstring>
+
 #include "dnnl.hpp"
 #include "dnnl_sycl.hpp"
 
@@ -38,7 +40,7 @@ public:
     static void gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,
         const void * a, dt at, dnnl_dim_t stra0, dnnl_dim_t stra1, dnnl_dim_t stra2,
         const void * b, dt bt, dnnl_dim_t strb0, dnnl_dim_t strb1, dnnl_dim_t strb2,
-        void * c, dt ct, const queue_ptr & q, dnnl_dim_t batches_a, dnnl_dim_t batches_b) {
+        void * c, dt ct, const queue_ptr & q, dnnl_dim_t batches_a, dnnl_dim_t batches_b, bool f16_math = true) {
 
         auto stream = ctx.stream_dnnl(q);
         auto eng = ctx.engine_dnnl(q);
@@ -58,7 +60,15 @@ public:
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
 #ifdef GGML_SYCL_F16
-        primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
+        // lets oneDNN round f32 operands to f16. Callers pass f16_math = false when the op requests F32
+        // [TAG_GGML_PREC]; GGML_SYCL_DNN_FPMATH=strict turns it off for every GEMM.
+        static const bool fpmath_f16 = [] {
+            const char * e = getenv("GGML_SYCL_DNN_FPMATH");
+            return !e || strcmp(e, "strict") != 0;
+        }();
+        if (f16_math && fpmath_f16) {
+            primitive_attr.set_fpmath_mode(dnnl::fpmath_mode::f16);
+        }
 #endif
 
         auto a_mem = dnnl::memory(a_in_md, eng, const_cast<void*>(a));
@@ -84,9 +94,9 @@ public:
     }
 
     static void row_gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,
-        const void * a, dt at, const void * b, dt bt, void * c, dt ct, const queue_ptr & q) {
+        const void * a, dt at, const void * b, dt bt, void * c, dt ct, const queue_ptr & q, bool f16_math = true) {
 
-        gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1);
+        gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1, f16_math);
     }
 };
 

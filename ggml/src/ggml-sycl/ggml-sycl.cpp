@@ -3245,7 +3245,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
     // Fast path for bf16 src0
     if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn &&
         ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) && ggml_is_contiguous(src0) &&
-        row_diff == src0->ne[1]) {
+        row_diff == src0->ne[1] && ggml_sycl_src1_bf16_ok(dst)) {
         using bf16_t = sycl::ext::oneapi::bfloat16;
         ggml_sycl_pool_alloc<bf16_t> src1_as_bf16(ctx.pool(), src1_ncols*ne10);
         if (src1->type != GGML_TYPE_BF16) {
@@ -3361,7 +3361,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
             if (g_ggml_sycl_enable_dnn && !use_mkl_direct && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
                 DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,
                                           DnnlGemmWrapper::to_dt<float>(), src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(),
-                                          dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
+                                          dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream, ggml_sycl_src1_f16_ok(dst));
             }
             else
 #endif
@@ -5218,7 +5218,7 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_contiguous(src0) && !ggml_is_transposed(src1) && src1->ne[1] == 1 && src1->ne[3] == 1) {
         // KQV single-batch
         ggml_sycl_mul_mat_vec_nc(ctx, src0, src1, dst);
-    } else if (!split && src0->type == GGML_TYPE_F16 && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
+    } else if (!split && src0->type == GGML_TYPE_F16 && ggml_sycl_src1_f16_ok(dst) && !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->ne[2] * src1->ne[3] > 1) {
         // KQ + KQV multi-batch
         ggml_sycl_mul_mat_batched_sycl(ctx, src0, src1, dst);
     } else if (use_dequantize_mul_mat_vec) {
@@ -7367,11 +7367,6 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                 }
 
                 if (src0_type == GGML_TYPE_TQ2_0 || src0_type == GGML_TYPE_TQ1_0) {
-                    return false;
-                }
-
-                if (op->op == GGML_OP_MUL_MAT &&
-                    (ggml_prec_get_src(op, 1) == GGML_PREC_BF16 || ggml_prec_get_src(op, 1) == GGML_PREC_F32)) {
                     return false;
                 }
 

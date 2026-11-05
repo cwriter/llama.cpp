@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;
@@ -81,6 +82,20 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+
+    // LLAMA_NARROW_WEIGHTS=1: store a read-only F32 matmul weight of a device buffer as F16 or BF16 (its true type)
+    // when every value converts with a relative error of at most LLAMA_NARROW_WEIGHTS_MAX_ERR (default 0: only
+    // exactly representable weights); LLAMA_NARROW_WEIGHTS_TYPES orders the candidates. The matmuls that read it
+    // then request F32 math (llama_model::build_graph): a backend may widen the weight, not round the activations.
+    bool  narrow_weights = false;
+    float narrow_max_err = 0.0f;
+    std::unordered_map<std::string, ggml_type> narrowed;          // file tensor name -> stored type (F16 or BF16)
+    std::unordered_set<const ggml_tensor *>     narrowed_tensors; // the created tensors
+    size_t narrowed_bytes_saved = 0;
+
+    // the type the weight w of a matmul in buft is stored in: F16 or BF16 if it narrows, else its own type
+    ggml_type narrow_weight_type(const llama_tensor_weight & w, ggml_op op, ggml_backend_buffer_type_t buft,
+                                 const llama_hparams & hparams) const;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand

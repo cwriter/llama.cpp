@@ -1001,3 +1001,11 @@ Please add the `[SYCL]` prefix/tag in issues/PRs titles to help the SYCL contrib
 ## TODO
 
 - Review ZES_ENABLE_SYSMAN: https://github.com/intel/compute-runtime/blob/master/programmers-guide/SYSMAN.md#support-and-limitations
+
+### Experimental weight narrowing
+
+Set `LLAMA_NARROW_WEIGHTS=1` to scan eligible F32 matrix-multiplication weights before device allocation and store them as F16 or BF16 when every value fits. This is disabled by default. `LLAMA_NARROW_WEIGHTS_TYPES` sets the candidate order (default `f16,bf16`); `LLAMA_NARROW_WEIGHTS_MAX_ERR` sets the maximum relative conversion error (default `0`, exact conversion only).
+
+Narrowed weights request F32 activation and accumulation precision. SYCL uses its existing F32 fallback for these operations, which can temporarily widen the weights and reduce peak-memory savings. Runtime correctness and performance must be validated before enabling this by default on any backend.
+
+Set `GGML_SYCL_DNN_FPMATH=strict` to disable oneDNN F16 operand rounding for all GEMMs. F32 activation precision requests disable this rounding independently.

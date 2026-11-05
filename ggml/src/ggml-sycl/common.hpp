@@ -140,6 +140,12 @@ static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
     return g_ggml_sycl_dynamic_precision != GGML_SYCL_DYNAMIC_PRECISION_F32 &&
            (src1_prec == GGML_PREC_UNDEFINED || src1_prec >= GGML_PREC_F16);
 }
+// The BF16 GEMM may only round src1 when its precision request allows it.
+static inline bool ggml_sycl_src1_bf16_ok(const ggml_tensor * dst) {
+    const int32_t src1_prec = ggml_sycl_src1_prec(dst);
+    return src1_prec == GGML_PREC_UNDEFINED || src1_prec >= GGML_PREC_BF16;
+}
+
 extern int g_ggml_sycl_enable_flash_attention;
 extern int g_ggml_sycl_dev2dev_memcpy;
 extern int g_ggml_sycl_fa_onednn;
