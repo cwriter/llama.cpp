@@ -863,7 +863,7 @@ struct llama_model {
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
 
-    // F32 weights the loader stored as F16 or BF16 (LLAMA_NARROW_WEIGHTS): their matmuls request F32 math
+    // F32 weights the loader stored as F16 or BF16 (LLAMA_NARROW_WEIGHTS, on by default): their matmuls request F32 math
     std::unordered_set<const ggml_tensor *> narrowed_weights;
 
     // statically allocated context for assigning
