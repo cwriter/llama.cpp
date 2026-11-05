@@ -194,6 +194,13 @@ static inline bool ggml_sycl_src1_f16_ok(const ggml_tensor * dst) {
            (src1_prec == GGML_PREC_UNDEFINED || src1_prec >= GGML_PREC_F16);
 }
 
+// [TAG_GGML_PREC] the oneDNN bf16 GEMM may convert src1 of the MUL_MAT op dst to bf16. A bf16 weight whose matmul
+// requests F32 (llama stores some F32 weights as BF16 when the values fit) is widened to f32 instead.
+static inline bool ggml_sycl_src1_bf16_ok(const ggml_tensor * dst) {
+    const int32_t src1_prec = ggml_sycl_src1_prec(dst);
+    return src1_prec == GGML_PREC_UNDEFINED || src1_prec >= GGML_PREC_BF16;
+}
+
 // MUL_MAT_ID tile scheduling. The host path reads the routing back and sorts it on the CPU, which
 // costs a full queue drain per node; these bits select a device-built schedule instead and the
 // checks that prove the two agree. Off by default: the host path stays the correctness oracle.

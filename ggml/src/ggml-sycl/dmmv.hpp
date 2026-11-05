@@ -55,9 +55,10 @@ bool ggml_sycl_mv_siblings_esimd(const ggml_sycl_mv_sibling * mats, int n, const
 bool ggml_sycl_q8_0_siblings_esimd(const void * va, const void * vb, const float * y, float * oa, float * ob,
                                    int64_t k, int64_t ma, int64_t mb, int mode, dpct::queue_ptr stream);
 
-// a reordered Q8_0 mat-vec (rows<16, 2>, K >= 4096) plus up to 8 f32 rows of the same activation, one token, one launch
-bool ggml_sycl_q8_0_f32_rows_esimd(const void * vx, const float * wf, const float * y, float * dst, float * dstf,
-                                   int64_t ncols, int64_t nrows, int64_t nrows_f, dpct::queue_ptr stream);
+// a reordered Q8_0 mat-vec (rows<16, 2>, K >= 4096) plus up to 8 rows of f32, f16 or bf16 (wtype) weights of the same
+// activation, summed in f32, one token, one launch
+bool ggml_sycl_q8_0_f32_rows_esimd(const void * vx, const void * wf, ggml_type wtype, const float * y, float * dst,
+                                   float * dstf, int64_t ncols, int64_t nrows, int64_t nrows_f, dpct::queue_ptr stream);
 
 // SWIGLU(gate, up) of two reordered Q8_0 mat-vecs for one token on ESIMD (GGML_SYCL_Q8_0_GLU_ESIMD); false if not taken
 bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y, float * dst, int64_t ncols,
@@ -82,7 +83,8 @@ bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, 
 bool ggml_sycl_mv16_mat_vec2_epi_esimd(const void * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
                                        const float * bias0, const float * scale0, const void * a1, float * dst1,
                                        int64_t M1, int64_t lda1, int epi1, const float * bias1, const float * scale1,
-                                       ggml_type wtype, const float * b, int64_t K, dpct::queue_ptr stream);
+                                       ggml_type wtype0, ggml_type wtype1, const float * b, int64_t K,
+                                       dpct::queue_ptr stream);
 bool ggml_sycl_mv16_mat_vec_epi_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
                                       int64_t lda, int epi, const float * bias, const float * scale, dpct::queue_ptr stream);
 bool ggml_sycl_mv16_mat_vec_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
@@ -93,6 +95,10 @@ bool ggml_sycl_mv16_mat_vec_esimd(const void * a, ggml_type wtype, const float *
 // taken; nothing is launched then.
 bool ggml_sycl_bf16_mat_vec_esimd(const void * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
                                   dpct::queue_ptr stream);
+
+// the same for a bf16 or f16 (wtype) weight, widened in registers; f16 needs K % 128 == 0
+bool ggml_sycl_w16_mat_vec_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
+                                 int64_t lda, dpct::queue_ptr stream);
 
 // Fused dense-FFN mat-vec: writes glu(gate . y, up . y) for same-type reordered
 // weights (Q2_K..Q6_K, Q8_0) and a single F32 activation column, using the ESIMD DMMV kernels.

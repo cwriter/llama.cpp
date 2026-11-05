@@ -1889,6 +1889,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    narrowed_weights = ml.narrowed_tensors;
+
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
 
@@ -3381,7 +3383,22 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     llm->res->set_outputs(params);
 
-    return llm->res->get_gf();
+    ggml_cgraph * gf = llm->res->get_gf();
+
+    // a weight stored as F16 or BF16 only because its values fit holds the f32 values exactly (or within
+    // LLAMA_NARROW_WEIGHTS_MAX_ERR): its matmuls must still compute as F32 ones, so a backend may widen the
+    // weight but not round the activation or the sums to 16 bits
+    if (!narrowed_weights.empty()) {
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && narrowed_weights.count(node->src[0])) {
+                ggml_prec_set_src(node, GGML_PREC_F32, 1);
+                ggml_prec_set_acc(node, GGML_PREC_F32);
+            }
+        }
+    }
+
+    return gf;
 }
 
 

@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
@@ -837,6 +838,13 @@ llama_model_loader::llama_model_loader(
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
+
+    if (const char * e = getenv("LLAMA_NARROW_WEIGHTS")) {
+        this->narrow_weights = atoi(e) != 0;
+    }
+    if (const char * e = getenv("LLAMA_NARROW_WEIGHTS_MAX_ERR")) {
+        this->narrow_max_err = std::max(0.0f, (float) atof(e));
+    }
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1074,6 +1082,93 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
+// the largest relative error of storing the f32 values x[0..n) as type (BF16 or F16, round to nearest even, the
+// conversions the upload uses); 0 when exact. A zero, an infinity or a NaN must come back as itself, and a
+// finite value must stay finite (no F16 overflow), or the error is infinite.
+static float narrow_max_rel_err(ggml_type type, const float * x, size_t n) {
+    float worst = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        const float v = x[i];
+        const float q = type == GGML_TYPE_BF16 ? ggml_bf16_to_fp32(ggml_fp32_to_bf16(v)) :
+                                                 ggml_fp16_to_fp32(ggml_fp32_to_fp16(v));
+        if (q == v || (std::isnan(q) && std::isnan(v))) {
+            continue;
+        }
+        if (v == 0.0f || !std::isfinite(v) || !std::isfinite(q)) {
+            return INFINITY;
+        }
+        worst = std::max(worst, std::fabs(q - v) / std::fabs(v));
+    }
+    return worst;
+}
+
+// LLAMA_NARROW_WEIGHTS_TYPES: the 16-bit types to try, in order of preference (default "f16,bf16": F16 is the
+// more widely supported compute type when both hold the values)
+static std::vector<ggml_type> narrow_candidate_types() {
+    std::vector<ggml_type> types;
+    const char * e = getenv("LLAMA_NARROW_WEIGHTS_TYPES");
+    std::string  list = e ? e : "f16,bf16";
+    size_t pos = 0;
+    while (pos <= list.size()) {
+        const size_t end  = std::min(list.find(',', pos), list.size());
+        const std::string name = list.substr(pos, end - pos);
+        if (name == "f16") {
+            types.push_back(GGML_TYPE_F16);
+        } else if (name == "bf16") {
+            types.push_back(GGML_TYPE_BF16);
+        } else if (!name.empty()) {
+            LLAMA_LOG_WARN("%s: ignoring unknown type '%s' in LLAMA_NARROW_WEIGHTS_TYPES\n", __func__, name.c_str());
+        }
+        pos = end + 1;
+    }
+    return types;
+}
+
+ggml_type llama_model_loader::narrow_weight_type(const llama_tensor_weight & w, ggml_op op,
+                                                  ggml_backend_buffer_type_t buft, const llama_hparams & hparams) const {
+    const ggml_tensor * t = w.tensor;
+    // read-only matmul weights of a device buffer: a host buffer would serve them from the mapping as they are.
+    // MUL_MAT only: the backends' 16-bit expert (MUL_MAT_ID) paths are not checked for the F32 request yet
+    if (!narrow_weights || t->type != GGML_TYPE_F32 || op != GGML_OP_MUL_MAT ||
+        !buft || ggml_backend_buft_is_host(buft) || !ggml_is_contiguous(t)) {
+        return t->type;
+    }
+
+    // the candidates the buffer's device can run this matmul with
+    static const std::vector<ggml_type> preferred = narrow_candidate_types();
+    std::vector<ggml_type> types;
+    for (const ggml_type type : preferred) {
+        ggml_tensor meta = *t;
+        meta.type  = type;
+        meta.nb[0] = ggml_type_size(type);
+        meta.nb[1] = ggml_row_size(type, meta.ne[0]);
+        for (int d = 2; d < GGML_MAX_DIMS; ++d) {
+            meta.nb[d] = meta.nb[d - 1] * meta.ne[d - 1];
+        }
+        if (weight_buft_supported(hparams, &meta, op, buft, ggml_backend_buft_get_device(buft))) {
+            types.push_back(type);
+        }
+    }
+    if (types.empty()) {
+        return t->type;
+    }
+
+    // the mappings do not exist yet: read the file, a few MiB at a time, and drop a type once it misses
+    const auto &       file  = files.at(w.idx);
+    const size_t       n     = ggml_nelements(t);
+    const size_t       chunk = 1 << 20;
+    std::vector<float> buf(std::min(n, chunk));
+    for (size_t i0 = 0; i0 < n && !types.empty(); i0 += chunk) {
+        const size_t m = std::min(chunk, n - i0);
+        file->seek(w.offs + i0 * sizeof(float), SEEK_SET);
+        file->read_raw(buf.data(), m * sizeof(float));
+        types.erase(std::remove_if(types.begin(), types.end(), [&](ggml_type type) {
+            return narrow_max_rel_err(type, buf.data(), m) > narrow_max_err;
+        }), types.end());
+    }
+    return types.empty() ? t->type : types.front();
+}
+
 static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
@@ -1375,6 +1470,24 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return nullptr;
     }
 
+    // a read-only F32 matmul weight that F16 or BF16 holds within narrow_max_err is allocated and uploaded so
+    ggml_type narrow_type = t_meta.type;
+    if (narrow_weights && !is_lazy && !(flags & TENSOR_DUPLICATED) && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
+        narrow_type = narrow_weight_type(require_weight(tn.str().c_str()), llm_tensor_info_for(tn.tensor).op, buft, hparams);
+    }
+    if (narrow_type != t_meta.type) {
+        const size_t nbytes_old = ggml_nbytes(&t_meta);
+        t_meta.type  = narrow_type;
+        t_meta.nb[0] = ggml_type_size(narrow_type);
+        t_meta.nb[1] = ggml_row_size(narrow_type, t_meta.ne[0]);
+        for (int dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+            t_meta.nb[dim] = t_meta.nb[dim - 1] * t_meta.ne[dim - 1];
+        }
+        narrowed[tn.str()]    = narrow_type;
+        narrowed_bytes_saved += nbytes_old - ggml_nbytes(&t_meta);
+        LLAMA_LOG_DEBUG("%s: storing %s as %s\n", __func__, tn.str().c_str(), ggml_type_name(narrow_type));
+    }
+
     ggml_context * ctx = ctx_for_buft(buft);
 
     // if duplicated, check if the original tensor was allocated in the same buffer type context and avoid creating a new one
@@ -1389,6 +1502,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    if (narrowed.count(tn.str())) {
+        narrowed_tensors.insert(tensor);
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1409,6 +1525,14 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
+    }
+    if (!narrowed.empty()) {
+        size_t n_type[GGML_TYPE_COUNT] = {};
+        for (const auto & it : narrowed) {
+            n_type[it.second]++;
+        }
+        LLAMA_LOG_INFO("%s: stored %zu F32 weights as F16 and %zu as BF16 (max relative error %g), %.2f MiB less\n",
+            __func__, n_type[GGML_TYPE_F16], n_type[GGML_TYPE_BF16], narrow_max_err, narrowed_bytes_saved / 1024.0 / 1024.0);
     }
     if (n_tensors_moved > 0) {
         LLAMA_LOG_DEBUG("%s: tensor '%s' (%s) (and %zu others) cannot be used with preferred buffer type %s, using %s instead\n",
@@ -1704,6 +1828,29 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // stored narrower than the file: read the f32 values, convert, upload
+        if (const auto it = narrowed.find(ggml_get_name(cur)); it != narrowed.end()) {
+            if (it->second != cur->type || weight->tensor->type != GGML_TYPE_F32) {
+                GGML_ABORT("%s: narrowed tensor %s: recorded %s, created %s, file %s", __func__, ggml_get_name(cur),
+                           ggml_type_name(it->second), ggml_type_name(cur->type), ggml_type_name(weight->tensor->type));
+            }
+            const size_t n = ggml_nelements(cur);
+            std::vector<float>    f32(use_mmap ? 0 : n);
+            std::vector<uint16_t> h(n);
+            const float * src = (const float *) load_data_range(*weight, 0, n * sizeof(float), f32.data());
+            // the scalar roundings narrow_max_rel_err checked (the vector BF16 row conversion flushes subnormals)
+            if (cur->type == GGML_TYPE_BF16) {
+                ggml_fp32_to_bf16_row_ref(src, (ggml_bf16_t *) h.data(), (int64_t) n);
+            } else {
+                for (size_t i = 0; i < n; ++i) {
+                    h[i] = ggml_fp32_to_fp16(src[i]);
+                }
+            }
+            ggml_backend_tensor_set(cur, h.data(), 0, n_size);
+            size_done += ggml_nbytes(weight->tensor);
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
