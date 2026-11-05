@@ -4067,9 +4067,29 @@ struct ggml_sycl_mv16_weight {
     ggml_type    type = GGML_TYPE_F32;
 };
 
+// the weight types the one-token f32 mat-vec fusions (matvec epilogue, f32 siblings) take: f32, which they read
+// through a 16-bit copy, and f16 / bf16 weights (llama stores F32 weights those hold exactly so), read as they are;
+// the kernels widen the weight in registers and sum in f32 either way
+static bool ggml_sycl_mv16_weight_type_ok(ggml_type type) {
+#ifdef GGML_SYCL_HAS_BF16
+    if (type == GGML_TYPE_BF16) {
+        return g_ggml_sycl_enable_esimd;
+    }
+#endif
+    if (type == GGML_TYPE_F16) {
+        return g_ggml_sycl_enable_esimd;
+    }
+    return type == GGML_TYPE_F32;
+}
+
 // the 16-bit copy of weight w, made on first use and kept as long as its buffer; empty when off, w is not an f32
 // weight, or the queue is recording a graph
 static ggml_sycl_mv16_weight ggml_sycl_mv16_copy(const ggml_tensor * w, const queue_ptr & stream) {
+    // already 16-bit: the kernels widen it and sum in f32, as for the copy
+    if ((w->type == GGML_TYPE_BF16 || w->type == GGML_TYPE_F16) && ggml_sycl_mv16_weight_type_ok(w->type) &&
+        ggml_is_contiguous(w)) {
+        return { w->data, w->type };
+    }
     if (w->type != GGML_TYPE_F32 || w->view_src || !w->buffer || !ggml_backend_buffer_is_sycl(w->buffer) ||
         ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_is_contiguous(w)) {
         return {};
@@ -4111,6 +4131,15 @@ static ggml_sycl_mv16_weight ggml_sycl_mv16_copy(const ggml_tensor * w, const qu
     GGML_LOG_DEBUG("%s: %s copy of %s [%lld x %lld]\n", __func__, ggml_type_name(type), w->name, (long long) w->ne[0],
                    (long long) w->ne[1]);
     return { h, type };
+}
+
+// GGML_SYCL_BF16X3_MIN_ROWS (default 128): the fewest weight rows for which a bf16 weight with an F32 request runs
+// as one bf16 GEMM over the exactly split activation. The split writes and rereads the activation three times; with
+// few rows (the qwen4exp hc injects, [10240, 4]) widening the small weight to f32 costs far less, and the f32 GEMM
+// is cheap there. With many rows (the router, 512) the f32 GEMM's compute is the larger cost.
+static int64_t ggml_sycl_bf16x3_min_rows() {
+    static const int64_t rows = ggml_sycl_get_env("GGML_SYCL_BF16X3_MIN_ROWS", 128);
+    return rows;
 }
 
 inline void ggml_sycl_op_mul_mat_sycl(
@@ -4158,8 +4187,41 @@ inline void ggml_sycl_op_mul_mat_sycl(
     // Fast path for bf16 src0
     if (src0->type == GGML_TYPE_BF16 && g_ggml_sycl_enable_dnn &&
         ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device()) && ggml_is_contiguous(src0) &&
-        row_diff == src0->ne[1]) {
+        row_diff == src0->ne[1] &&
+        (ggml_sycl_src1_bf16_ok(dst) || (src1->type == GGML_TYPE_F32 && row_diff >= ggml_sycl_bf16x3_min_rows()))) {
         using bf16_t = sycl::ext::oneapi::bfloat16;
+        if (!ggml_sycl_src1_bf16_ok(dst)) {
+            // F32 requested [TAG_GGML_PREC] (llama stores F32 weights bf16 holds exactly as bf16): split each f32
+            // activation exactly into three bf16 parts (8 significand bits each, 24 in all) and run one bf16 GEMM
+            // over the 3N columns. A bf16 x bf16 product is exact in f32 and the GEMM accumulates in f32, so the
+            // sum of the three slices is the f32 GEMM up to summation order, and the weight is read as it is.
+            const int64_t n   = src1_ncols * ne10;
+            const int64_t m   = src1_ncols * row_diff;
+            ggml_sycl_pool_alloc<bf16_t> parts(ctx.pool(), 3 * n);
+            ggml_sycl_pool_alloc<float>  slices(ctx.pool(), 3 * m);
+            bf16_t *      p   = parts.get();
+            const float * x   = src1_ddf_i;
+            stream->parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+                const float  v   = x[i];
+                const bf16_t hi  = bf16_t(v);
+                const float  r1  = v - (float) hi;  // exact: the bits rounding dropped
+                const bf16_t mid = bf16_t(r1);
+                const bf16_t lo  = bf16_t(r1 - (float) mid);
+                p[i]         = hi;
+                p[n + i]     = mid;
+                p[2 * n + i] = lo;
+            });
+            DnnlGemmWrapper::row_gemm(ctx, row_diff, 3 * src1_ncols, ne10,
+                                      src0_dd_i, DnnlGemmWrapper::to_dt<bf16_t>(),
+                                      p, DnnlGemmWrapper::to_dt<bf16_t>(),
+                                      slices.get(), DnnlGemmWrapper::to_dt<float>(), stream, /*f16_math=*/false);
+            const float * c = slices.get();
+            float *       d = dst_dd_i;
+            stream->parallel_for(sycl::range<1>(m), [=](sycl::id<1> i) { d[i] = (c[2 * m + i] + c[m + i]) + c[i]; });
+            GGML_UNUSED(src1_ddq_i);
+            GGML_UNUSED(src1_padded_row_size);
+            return;
+        }
         ggml_sycl_pool_alloc<bf16_t> src1_as_bf16(ctx.pool(), src1_ncols*ne10);
         if (src1->type != GGML_TYPE_BF16) {
             const to_bf16_sycl_t to_bf16_sycl = ggml_get_to_bf16_sycl(src1->type, dst);
@@ -4272,9 +4334,10 @@ inline void ggml_sycl_op_mul_mat_sycl(
             const int64_t gemm_flops = (int64_t)row_diff * src1_ncols * ne10;
             const bool use_mkl_direct = gemm_flops < SYCL_F32_DNNL_MIN_GEMM_FLOPS;
             if (g_ggml_sycl_enable_dnn && !use_mkl_direct && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
+                // f16 math only where the op allows f16 operands [TAG_GGML_PREC]
                 DnnlGemmWrapper::row_gemm(ctx, row_diff, src1_ncols, ne10, src0_ddf_i,
                                           DnnlGemmWrapper::to_dt<float>(), src1_ddf1_i, DnnlGemmWrapper::to_dt<float>(),
-                                          dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
+                                          dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream, ggml_sycl_src1_f16_ok(dst));
             }
             else
 #endif
@@ -6451,13 +6514,16 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
     // GGML_SYCL_BF16_MV (default 1): a bf16 weight against one f32 token, summed in f32. The dmmv route would convert
     // the activation to f16 and sum in half2 here, which the qwen4exp hyper-connection streams (bf16 hc, router, ssm
     // and ple weights in some quants) do not survive: the output is garbage within a few layers.
+    // An f16 weight takes it when its matmul requests F32 [TAG_GGML_PREC] (llama stores F32 weights that f16 holds
+    // exactly so): dmmv may not convert the activation then, and the library route would widen the weight first.
     static const bool bf16_mv = ggml_sycl_get_env("GGML_SYCL_BF16_MV", 1) != 0;
-    if (bf16_mv && !split && dst->op == GGML_OP_MUL_MAT && src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 &&
+    const bool w16_mv = (src0->type == GGML_TYPE_BF16 && bf16_mv) || (src0->type == GGML_TYPE_F16 && !ggml_sycl_src1_f16_ok(dst));
+    if (w16_mv && !split && dst->op == GGML_OP_MUL_MAT && src1->type == GGML_TYPE_F32 &&
         dst->type == GGML_TYPE_F32 && src1->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 &&
         src1->ne[3] == 1 && src0->nb[0] == ggml_type_size(src0->type) && src0->nb[1] % src0->nb[0] == 0 &&
         ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
-        ggml_sycl_bf16_mat_vec_esimd(src0->data, (const float *) src1->data, (float *) dst->data, src0->ne[1], src0->ne[0],
-                                     src0->nb[1] / src0->nb[0], ctx.stream())) {
+        ggml_sycl_w16_mat_vec_esimd(src0->data, src0->type, (const float *) src1->data, (float *) dst->data, src0->ne[1],
+                                    src0->ne[0], src0->nb[1] / src0->nb[0], ctx.stream())) {
         return;
     }
 
@@ -6583,7 +6649,7 @@ static bool ggml_sycl_match_matvec_epilogue(const ggml_cgraph * cgraph, int i, g
     ggml_tensor *       mm   = cgraph->nodes[i];
     const ggml_tensor * src0 = mm->src[0];
     const ggml_tensor * src1 = mm->src[1];
-    if (mm->op != GGML_OP_MUL_MAT || src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
+    if (mm->op != GGML_OP_MUL_MAT || !ggml_sycl_mv16_weight_type_ok(src0->type) || src1->type != GGML_TYPE_F32 ||
         mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
         src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
         (!any_tokens && src1->ne[1] != 1) || src0->ne[1] > 512 || src0->ne[0] % 128 != 0 ||
@@ -8958,8 +9024,9 @@ static void ggml_sycl_mv_fuse_trace_miss(const ggml_cgraph * cgraph, int node_id
     }
 }
 
-// a reordered Q8_0 mat-vec with K >= 4096 and the f32 mat-vec of at most 8 rows right behind it that reads the same
-// activation (qwen4exp: hc_*_down and hc_*_inject, see ggml_sycl_hoist_q8_f32_rows), one token, in one launch
+// a reordered Q8_0 mat-vec with K >= 4096 and the f32 (or f16 / bf16, summed in f32) mat-vec of at most 8 rows right
+// behind it that reads the same activation (qwen4exp: hc_*_down and hc_*_inject, see ggml_sycl_hoist_q8_f32_rows), one
+// token, in one launch
 static bool ggml_sycl_q8_f32_rows_fused(ggml_backend_sycl_context & ctx, ggml_cgraph * graph, int i) {
     static const int on = ggml_sycl_get_env("GGML_SYCL_Q8_0_F32_ROWS", 1);
     if (!on || !g_ggml_sycl_enable_fusion || !g_ggml_sycl_enable_esimd || !g_ggml_sycl_q8_0_mmv_shapes ||
@@ -8977,7 +9044,7 @@ static bool ggml_sycl_q8_f32_rows_fused(ggml_backend_sycl_context & ctx, ggml_cg
     const ggml_tensor * wb = b->src[0];
     if (wa->type != GGML_TYPE_Q8_0 || ggml_backend_buffer_is_sycl_split(wa->buffer) || !ggml_is_contiguous(wa) ||
         wa->ne[2] != 1 || wa->ne[3] != 1 || wa->ne[0] != act->ne[0] || !can_use_dequantize_mul_mat_vec(wa, act, a) ||
-        wb->type != GGML_TYPE_F32 || ggml_backend_buffer_is_sycl_split(wb->buffer) || !ggml_is_contiguous(wb) ||
+        !ggml_sycl_mv16_weight_type_ok(wb->type) || ggml_backend_buffer_is_sycl_split(wb->buffer) || !ggml_is_contiguous(wb) ||
         wb->ne[0] != act->ne[0] || wb->ne[1] > 8 || wb->ne[2] != 1 || wb->ne[3] != 1 ||
         a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || !ggml_is_contiguous(b) ||
         ggml_sycl_tensors_overlap(a, b) || ggml_sycl_tensors_overlap(b, act) || ggml_sycl_tensors_overlap(a, act)) {
@@ -8989,7 +9056,7 @@ static bool ggml_sycl_q8_f32_rows_fused(ggml_backend_sycl_context & ctx, ggml_cg
         return false;
     }
     scope_op_debug_print scope_dbg_print(__func__, b, /*num_src=*/2);
-    return ggml_sycl_q8_0_f32_rows_esimd(wa->data, (const float *) wb->data, (const float *) act->data, (float *) a->data,
+    return ggml_sycl_q8_0_f32_rows_esimd(wa->data, wb->data, wb->type, (const float *) act->data, (float *) a->data,
                                          (float *) b->data, act->ne[0], wa->ne[1], wb->ne[1], ctx.stream());
 }
 
@@ -9523,7 +9590,7 @@ static bool ggml_sycl_f32_mv_run_at(const ggml_cgraph * g, int i, ggml_sycl_f32_
     }
     const ggml_tensor * a = n->src[0];
     const ggml_tensor * x = n->src[1];
-    if (a->type != GGML_TYPE_F32 || !ggml_is_contiguous(a) || a->ne[2] != 1 || a->ne[3] != 1 || x->type != GGML_TYPE_F32 ||
+    if (!ggml_sycl_mv16_weight_type_ok(a->type) || !ggml_is_contiguous(a) || a->ne[2] != 1 || a->ne[3] != 1 || x->type != GGML_TYPE_F32 ||
         !ggml_is_contiguous(x) || a->ne[0] != x->ne[0] || a->ne[0] % 128 != 0 || !ggml_is_contiguous(n) ||
         (!any_tokens && ggml_nrows(x) != 1)) {
         return false;
@@ -10062,16 +10129,16 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                 const ggml_tensor * a1 = r1.mm->src[0];
                 const ggml_sycl_mv16_weight h0 = ggml_sycl_mv16_copy(a0, sycl_ctx->stream());
                 const ggml_sycl_mv16_weight h1 = h0.data ? ggml_sycl_mv16_copy(a1, sycl_ctx->stream()) : ggml_sycl_mv16_weight{};
-                if (h1.data && h1.type == h0.type && ggml_sycl_mv16_mat_vec2_epi_esimd(
+                if (h1.data && ggml_sycl_mv16_mat_vec2_epi_esimd(
                         h0.data, (float *) r0.out->data, a0->ne[1], a0->ne[0], r0.epi,
                         r0.bias ? (const float *) r0.bias->data : nullptr, r0.scale ? (const float *) r0.scale->data : nullptr,
                         h1.data, (float *) r1.out->data, a1->ne[1], a1->ne[0], r1.epi,
                         r1.bias ? (const float *) r1.bias->data : nullptr, r1.scale ? (const float *) r1.scale->data : nullptr,
-                        h0.type, (const float *) r0.mm->src[1]->data, a0->ne[0], sycl_ctx->stream())) {
+                        h0.type, h1.type, (const float *) r0.mm->src[1]->data, a0->ne[0], sycl_ctx->stream())) {
                     i = r1.last;
                     continue;
                 }
-                if (ggml_sycl_f32_mat_vec2_epi_esimd(
+                if (a0->type == GGML_TYPE_F32 && a1->type == GGML_TYPE_F32 && ggml_sycl_f32_mat_vec2_epi_esimd(
                         (const float *) a0->data, (float *) r0.out->data, a0->ne[1], a0->ne[0], r0.epi,
                         r0.bias ? (const float *) r0.bias->data : nullptr, r0.scale ? (const float *) r0.scale->data : nullptr,
                         (const float *) a1->data, (float *) r1.out->data, a1->ne[1], a1->ne[0], r1.epi,
@@ -10096,7 +10163,7 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
                     i = em.last_idx;
                     continue;
                 }
-                if (ggml_sycl_f32_mat_vec_epi_esimd((const float *) a->data, (const float *) em.mm->src[1]->data,
+                if (a->type == GGML_TYPE_F32 && ggml_sycl_f32_mat_vec_epi_esimd((const float *) a->data, (const float *) em.mm->src[1]->data,
                                                     (float *) em.last->data, a->ne[1], a->ne[0], a->ne[0], em.epi,
                                                     em.bias ? (const float *) em.bias->data : nullptr,
                                                     em.scale ? (const float *) em.scale->data : nullptr,
@@ -10921,7 +10988,7 @@ static void ggml_sycl_hoist_q8_f32_rows(ggml_cgraph * cgraph) {
         return;
     }
     auto f32_rows = [](const ggml_tensor * n, const ggml_tensor * act) {
-        return n->op == GGML_OP_MUL_MAT && n->src[1] == act && n->src[0]->type == GGML_TYPE_F32 && n->type == GGML_TYPE_F32 &&
+        return n->op == GGML_OP_MUL_MAT && n->src[1] == act && ggml_sycl_mv16_weight_type_ok(n->src[0]->type) && n->type == GGML_TYPE_F32 &&
                n->src[0]->ne[1] <= 8 && n->src[0]->ne[2] == 1 && n->src[0]->ne[3] == 1 && n->src[0]->ne[0] == act->ne[0];
     };
     for (int i = 0; i < cgraph->n_nodes - 1; ++i) {

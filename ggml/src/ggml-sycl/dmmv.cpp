@@ -1873,6 +1873,11 @@ static void dequantize_mul_mat_vec_q6_K_sycl(const void *vx, const float *y,
         });
 }
 
+// a bf16 weight, read as its 16 bits: widened to f32 by a shift, so no bf16 arithmetic is needed
+struct mv_bf16 {
+    uint16_t bits;
+};
+
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
 using ggml_sycl_esimd::GGML_SYCL_DMMV_ESIMD_WG_SIZE;
 
@@ -2593,9 +2598,21 @@ static void q8_0_esimd_launch_rows(const void * vx, const float * y, float * dst
     });
 }
 
-// one work-group of q8_0_esimd_launch_rows_f32 for one f32 row: dst = w . y
-template <int WG>
-ESIMD_INLINE void f32_row_dot_esimd(const float * w, const float * y, float * dst, const int ncols,
+// N weights of type TA as f32
+template <typename TA, int N> ESIMD_INLINE sycl::ext::intel::esimd::simd<float, N> mv_load(const TA * p) {
+    namespace es = sycl::ext::intel::esimd;
+    if constexpr (std::is_same_v<TA, mv_bf16>) {
+        es::simd<uint32_t, N> u = es::block_load<uint16_t, N>((const uint16_t *) p);
+        u <<= 16;
+        return u.template bit_cast_view<float>().read();
+    } else {
+        return es::block_load<TA, N>(p);
+    }
+}
+
+// one work-group of q8_0_esimd_launch_rows_f32 for one row of f32, f16 or bf16 (TW) weights: dst = w . y, in f32
+template <int WG, typename TW = float>
+ESIMD_INLINE void f32_row_dot_esimd(const TW * w, const float * y, float * dst, const int ncols,
                                     sycl::local_accessor<float, 1> lmem, const sycl::nd_item<1> & it) {
     using namespace sycl::ext::intel::esimd;
     const int tid = it.get_local_id(0);
@@ -2609,11 +2626,11 @@ ESIMD_INLINE void f32_row_dot_esimd(const float * w, const float * y, float * ds
     for (; c + 3 * WG * 32 < ncols; c += 4 * WG * 32) {
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
-            acc[u] += block_load<float, 32>(w + c + u * WG * 32) * block_load<float, 32>(y + c + u * WG * 32);
+            acc[u] += mv_load<TW, 32>(w + c + u * WG * 32) * block_load<float, 32>(y + c + u * WG * 32);
         }
     }
     for (; c < ncols; c += WG * 32) {
-        acc[0] += block_load<float, 32>(w + c) * block_load<float, 32>(y + c);
+        acc[0] += mv_load<TW, 32>(w + c) * block_load<float, 32>(y + c);
     }
     lmem[tid] = reduce<float>(acc[0] + acc[1] + acc[2] + acc[3], std::plus<>{});
     sycl::group_barrier(it.get_group());
@@ -2627,9 +2644,9 @@ ESIMD_INLINE void f32_row_dot_esimd(const float * w, const float * y, float * ds
 }
 
 // the rows kernel above plus a few f32 rows that read the same activation, appended as work-groups of their own
-template <int WG, int NR>
+template <int WG, int NR, typename TW = float>
 static void q8_0_esimd_launch_rows_f32(const void * vx, const float * y, float * dst, const int ncols, const int nrows,
-                                       const float * wf, float * dstf, const int nrows_f, dpct::queue_ptr stream) {
+                                       const TW * wf, float * dstf, const int nrows_f, dpct::queue_ptr stream) {
     const int workgroups = (nrows + NR - 1) / NR;
     stream->submit([&](sycl::handler & h) {
         sycl::local_accessor<float, 1> lmem(sycl::range<1>(WG * NR), h);
@@ -2641,7 +2658,7 @@ static void q8_0_esimd_launch_rows_f32(const void * vx, const float * y, float *
                 if (g >= nrows_f) {
                     dequantize_mul_mat_vec_q8_0_reorder_esimd_rows<WG, NR>(vx, y, dst, ncols, nrows, lmem, it, g - nrows_f);
                 } else {
-                    f32_row_dot_esimd<WG>(wf + (size_t) g * ncols, y, dstf + g, ncols, lmem, it);
+                    f32_row_dot_esimd<WG, TW>(wf + (size_t) g * ncols, y, dstf + g, ncols, lmem, it);
                 }
             });
     });
@@ -4247,24 +4264,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     GGML_UNUSED(ctx);
 }
 
-// a bf16 weight, read as its 16 bits: widened to f32 by a shift, so no bf16 arithmetic is needed
-struct mv_bf16 {
-    uint16_t bits;
-};
-
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-
-// N weights of type TA as f32
-template <typename TA, int N> ESIMD_INLINE sycl::ext::intel::esimd::simd<float, N> mv_load(const TA * p) {
-    namespace es = sycl::ext::intel::esimd;
-    if constexpr (std::is_same_v<TA, mv_bf16>) {
-        es::simd<uint32_t, N> u = es::block_load<uint16_t, N>((const uint16_t *) p);
-        u <<= 16;
-        return u.template bit_cast_view<float>().read();
-    } else {
-        return es::block_load<TA, N>(p);
-    }
-}
 
 // f32 mat-vec for one token (the qwen4exp MoE router: 512 x 2560 f32, 48 per token). KS threads share a row; each
 // takes CH chunks of 128 floats, issues all their weight and activation loads before the FMAs, and the KS partial
@@ -4337,8 +4337,28 @@ struct f32_mv_seg {
     int           epi;
 };
 
-// TA = sycl::half or mv_bf16: the segments' a point to 16-bit copies of the weights
-template <int KS, int RG, int CH, typename TA = float>
+// one row's partial sums over this thread's 128-column chunks
+template <int KS, int CH, typename TA>
+ESIMD_INLINE void mv2_row_acc(sycl::ext::intel::esimd::simd<float, 128> & acc, const TA * arow, const float * b, int ks,
+                              int nch) {
+    using namespace sycl::ext::intel::esimd;
+    int c = ks * CH;
+    for (; c + CH <= nch; c += KS * CH) {
+        simd<float, 128 * CH> av = mv_load<TA, 128 * CH>(arow + c * 128);
+        simd<float, 128 * CH> bv = block_load<float, 128 * CH>(b + c * 128);
+#pragma unroll
+        for (int i = 0; i < CH; ++i) {
+            acc += av.template select<128, 1>(i * 128) * bv.template select<128, 1>(i * 128);
+        }
+    }
+    for (int i = 0; i < CH && c + i < nch; ++i) {
+        acc += mv_load<TA, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
+    }
+}
+
+// TA0 / TA1 = float, sycl::half or mv_bf16: the element type of segment 0's and segment 1's weights (16-bit copies,
+// or weights llama stored narrow); a row reads its own segment's type, the sums stay f32
+template <int KS, int RG, int CH, typename TA0 = float, typename TA1 = TA0>
 static void f32_mat_vec2_esimd_launch(f32_mv_seg s0, f32_mv_seg s1, const float * b, const int K,
                                       dpct::queue_ptr stream) {
     constexpr int WG = KS * RG;
@@ -4359,18 +4379,14 @@ static void f32_mat_vec2_esimd_launch(f32_mv_seg s0, f32_mv_seg s1, const float 
 
             simd<float, 128> acc = 0.0f;
             if (m < M) {
-                const TA * arow = (const TA *) (in1 ? s1.a : s0.a) + (size_t) m * (in1 ? s1.lda : s0.lda);
-                int c = ks * CH;
-                for (; c + CH <= nch; c += KS * CH) {
-                    simd<float, 128 * CH> av = mv_load<TA, 128 * CH>(arow + c * 128);
-                    simd<float, 128 * CH> bv = block_load<float, 128 * CH>(b + c * 128);
-#pragma unroll
-                    for (int i = 0; i < CH; ++i) {
-                        acc += av.template select<128, 1>(i * 128) * bv.template select<128, 1>(i * 128);
-                    }
-                }
-                for (int i = 0; i < CH && c + i < nch; ++i) {
-                    acc += mv_load<TA, 128>(arow + (c + i) * 128) * block_load<float, 128>(b + (c + i) * 128);
+                const void * arow = (const char *) (in1 ? s1.a : s0.a) +
+                                    (size_t) m * (in1 ? s1.lda : s0.lda) * (in1 ? sizeof(TA1) : sizeof(TA0));
+                if constexpr (std::is_same_v<TA0, TA1>) {
+                    mv2_row_acc<KS, CH, TA0>(acc, (const TA0 *) arow, b, ks, nch);
+                } else if (in1) {
+                    mv2_row_acc<KS, CH, TA1>(acc, (const TA1 *) arow, b, ks, nch);
+                } else {
+                    mv2_row_acc<KS, CH, TA0>(acc, (const TA0 *) arow, b, ks, nch);
                 }
             }
             slm_scalar_store<float>(tid * sizeof(float), reduce<float>(acc, std::plus<>{}));
@@ -4470,17 +4486,28 @@ bool ggml_sycl_mv_siblings_esimd(const ggml_sycl_mv_sibling * mats, int n, const
 #endif
 }
 
-bool ggml_sycl_q8_0_f32_rows_esimd(const void * vx, const float * wf, const float * y, float * dst, float * dstf,
-                                   int64_t ncols, int64_t nrows, int64_t nrows_f, dpct::queue_ptr stream) {
+bool ggml_sycl_q8_0_f32_rows_esimd(const void * vx, const void * wf, ggml_type wtype, const float * y, float * dst,
+                                   float * dstf, int64_t ncols, int64_t nrows, int64_t nrows_f, dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     if (!g_ggml_sycl_enable_esimd || !g_ggml_sycl_q8_0_mmv_shapes || ncols % QK8_0 || ncols / QK8_0 < 128 || ncols % 32 ||
         ncols > INT32_MAX || nrows <= 0 || nrows > INT32_MAX - 1 || nrows_f <= 0 || nrows_f > 8) {
         return false;
     }
-    q8_0_esimd_launch_rows_f32<16, 2>(vx, y, dst, (int) ncols, (int) nrows, wf, dstf, (int) nrows_f, stream);
-    return true;
+    switch (wtype) {
+        case GGML_TYPE_F32:
+            q8_0_esimd_launch_rows_f32<16, 2>(vx, y, dst, (int) ncols, (int) nrows, (const float *) wf, dstf, (int) nrows_f, stream);
+            return true;
+        case GGML_TYPE_F16:
+            q8_0_esimd_launch_rows_f32<16, 2>(vx, y, dst, (int) ncols, (int) nrows, (const sycl::half *) wf, dstf, (int) nrows_f, stream);
+            return true;
+        case GGML_TYPE_BF16:
+            q8_0_esimd_launch_rows_f32<16, 2>(vx, y, dst, (int) ncols, (int) nrows, (const mv_bf16 *) wf, dstf, (int) nrows_f, stream);
+            return true;
+        default:
+            return false;
+    }
 #else
-    GGML_UNUSED_VARS(vx, wf, y, dst, dstf, ncols, nrows, nrows_f, stream);
+    GGML_UNUSED_VARS(vx, wf, wtype, y, dst, dstf, ncols, nrows, nrows_f, stream);
     return false;
 #endif
 }
@@ -4508,14 +4535,14 @@ bool ggml_sycl_q8_0_glu_esimd(const void * vg, const void * vu, const float * y,
 #endif
 }
 
-template <typename TA>
-static bool f32_mat_vec2_epi_impl(const TA * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
+template <typename TA0, typename TA1 = TA0>
+static bool f32_mat_vec2_epi_impl(const TA0 * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
                                       const float * bias0, const float * scale0,
-                                      const TA * a1, float * dst1, int64_t M1, int64_t lda1, int epi1,
+                                      const TA1 * a1, float * dst1, int64_t M1, int64_t lda1, int epi1,
                                       const float * bias1, const float * scale1,
                                       const float * b, int64_t K, dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-    if (!g_ggml_sycl_enable_esimd || K % 128 != 0 || lda0 % (16 / sizeof(TA)) != 0 || lda1 % (16 / sizeof(TA)) != 0 || M0 <= 0 || M1 <= 0 ||
+    if (!g_ggml_sycl_enable_esimd || K % 128 != 0 || lda0 % (16 / sizeof(TA0)) != 0 || lda1 % (16 / sizeof(TA1)) != 0 || M0 <= 0 || M1 <= 0 ||
         M0 + M1 > INT32_MAX || K > INT32_MAX || ((uintptr_t) a0 | (uintptr_t) a1 | (uintptr_t) b) % 16 != 0 ||
         epi0 < 0 || epi0 > 2 || epi1 < 0 || epi1 > 2) {
         return false;
@@ -4524,9 +4551,9 @@ static bool f32_mat_vec2_epi_impl(const TA * a0, float * dst0, int64_t M0, int64
     const f32_mv_seg s1 = { (const float *) a1, dst1, bias1, scale1, (int) M1, (int) lda1, epi1 };
     // the shapes of the single launches: few rows spread a row over more threads
     if (M0 + M1 < 128) {
-        f32_mat_vec2_esimd_launch<10, 4, 2, TA>(s0, s1, b, (int) K, stream);
+        f32_mat_vec2_esimd_launch<10, 4, 2, TA0, TA1>(s0, s1, b, (int) K, stream);
     } else {
-        f32_mat_vec2_esimd_launch<2, 16, 5, TA>(s0, s1, b, (int) K, stream);
+        f32_mat_vec2_esimd_launch<2, 16, 5, TA0, TA1>(s0, s1, b, (int) K, stream);
     }
     return true;
 #else
@@ -4582,11 +4609,15 @@ template <typename F> static bool mv16_visit(ggml_type wtype, F && f) {
 bool ggml_sycl_mv16_mat_vec2_epi_esimd(const void * a0, float * dst0, int64_t M0, int64_t lda0, int epi0,
                                        const float * bias0, const float * scale0, const void * a1, float * dst1,
                                        int64_t M1, int64_t lda1, int epi1, const float * bias1, const float * scale1,
-                                       ggml_type wtype, const float * b, int64_t K, dpct::queue_ptr stream) {
-    return mv16_visit(wtype, [&](auto tag) {
-        using TA = std::remove_const_t<std::remove_pointer_t<decltype(tag)>>;
-        return f32_mat_vec2_epi_impl((const TA *) a0, dst0, M0, lda0, epi0, bias0, scale0, (const TA *) a1, dst1, M1, lda1,
-                                     epi1, bias1, scale1, b, K, stream);
+                                       ggml_type wtype0, ggml_type wtype1, const float * b, int64_t K,
+                                       dpct::queue_ptr stream) {
+    return mv16_visit(wtype0, [&](auto tag0) {
+        using TA0 = std::remove_const_t<std::remove_pointer_t<decltype(tag0)>>;
+        return mv16_visit(wtype1, [&](auto tag1) {
+            using TA1 = std::remove_const_t<std::remove_pointer_t<decltype(tag1)>>;
+            return f32_mat_vec2_epi_impl((const TA0 *) a0, dst0, M0, lda0, epi0, bias0, scale0, (const TA1 *) a1, dst1,
+                                         M1, lda1, epi1, bias1, scale1, b, K, stream);
+        });
     });
 }
 
@@ -4621,32 +4652,40 @@ bool ggml_sycl_mv16_mat_vec_esimd(const void * a, ggml_type wtype, const float *
 #endif
 }
 
-bool ggml_sycl_bf16_mat_vec_esimd(const void * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
-                                  dpct::queue_ptr stream) {
+bool ggml_sycl_w16_mat_vec_esimd(const void * a, ggml_type wtype, const float * b, float * dst, int64_t M, int64_t K,
+                                 int64_t lda, dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     if (!g_ggml_sycl_enable_esimd || M <= 0 || K <= 0 || K % 32 != 0 || M > INT32_MAX / 2 || K > INT32_MAX / 2 ||
         ((uintptr_t) a | (uintptr_t) b) % 16 != 0) {
         return false;
     }
     if (K % 128 == 0 && lda % 8 == 0 && lda <= INT32_MAX) {
-        // few rows (the hc injects, the shared-expert gate): more threads per row
-        if (M < 128) {
-            f32_mat_vec_esimd_launch<10, 4, 2, 0, mv_bf16>((const mv_bf16 *) a, b, dst, (int) M, (int) K, (int) lda, stream);
-        } else {
-            f32_mat_vec_esimd_launch<2, 16, 5, 0, mv_bf16>((const mv_bf16 *) a, b, dst, (int) M, (int) K, (int) lda, stream);
-        }
-        return true;
+        return mv16_visit(wtype, [&](auto tag) {
+            using TA = std::remove_const_t<std::remove_pointer_t<decltype(tag)>>;
+            // few rows (the hc injects, the shared-expert gate): more threads per row
+            if (M < 128) {
+                f32_mat_vec_esimd_launch<10, 4, 2, 0, TA>((const TA *) a, b, dst, (int) M, (int) K, (int) lda, stream);
+            } else {
+                f32_mat_vec_esimd_launch<2, 16, 5, 0, TA>((const TA *) a, b, dst, (int) M, (int) K, (int) lda, stream);
+            }
+            return true;
+        });
     }
     // K a multiple of 32 only (the qwen4exp hc up projections, K = 320): the siblings kernel's bf16 slot, rows packed
-    if (lda != K) {
+    if (wtype != GGML_TYPE_BF16 || lda != K) {
         return false;
     }
     const ggml_sycl_mv_sibling mat = { a, dst, M, GGML_TYPE_BF16 };
     return ggml_sycl_mv_siblings_esimd(&mat, 1, b, K, stream);
 #else
-    GGML_UNUSED_VARS(a, b, dst, M, K, lda, stream);
+    GGML_UNUSED_VARS(a, wtype, b, dst, M, K, lda, stream);
     return false;
 #endif
+}
+
+bool ggml_sycl_bf16_mat_vec_esimd(const void * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,
+                                  dpct::queue_ptr stream) {
+    return ggml_sycl_w16_mat_vec_esimd(a, GGML_TYPE_BF16, b, dst, M, K, lda, stream);
 }
 
 bool ggml_sycl_f32_mat_vec_esimd(const float * a, const float * b, float * dst, int64_t M, int64_t K, int64_t lda,

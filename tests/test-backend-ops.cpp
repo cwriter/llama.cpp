@@ -5892,13 +5892,18 @@ struct test_mul_mat_stream : public test_case {
     }
 };
 
-// a Q8_0 mat-vec and a small f32 mat-vec of the same activation (qwen4exp hc_*_down and hc_*_inject)
+// a Q8_0 mat-vec and a small f32 mat-vec of the same activation (qwen4exp hc_*_down and hc_*_inject); the small weight
+// may be f16 / bf16 with an F32 request, as llama stores F32 weights those hold exactly (LLAMA_NARROW_WEIGHTS)
 struct test_mul_mat_q8_f32_rows : public test_case {
     const int64_t k, ma, mb, tokens;
+    const ggml_type type_b;
 
-    test_mul_mat_q8_f32_rows(int64_t k, int64_t ma, int64_t mb, int64_t tokens = 1) : k(k), ma(ma), mb(mb), tokens(tokens) {}
+    test_mul_mat_q8_f32_rows(int64_t k, int64_t ma, int64_t mb, int64_t tokens = 1, ggml_type type_b = GGML_TYPE_F32)
+        : k(k), ma(ma), mb(mb), tokens(tokens), type_b(type_b) {}
 
-    std::string vars() override { return VARS_TO_STR4(k, ma, mb, tokens); }
+    std::string vars() override {
+        return VARS_TO_STR4(k, ma, mb, tokens) + (type_b != GGML_TYPE_F32 ? "," + VAR_TO_STR(type_b) : "");
+    }
     std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "MUL_MAT_Q8_F32_ROWS"; }
     double max_nmse_err() override { return 5e-4; }
     bool run_whole_graph() override { return true; }
@@ -5906,10 +5911,15 @@ struct test_mul_mat_q8_f32_rows : public test_case {
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto * x  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
         auto * wa = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, k, ma);
-        auto * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, mb);
+        auto * wb = ggml_new_tensor_2d(ctx, type_b, k, mb);
         ggml_set_name(wa, "q8_rows");
         ggml_set_name(wb, "f32_rows");
-        return ggml_concat(ctx, ggml_mul_mat(ctx, wa, x), ggml_mul_mat(ctx, wb, x), 0);
+        ggml_tensor * b = ggml_mul_mat(ctx, wb, x);
+        if (type_b != GGML_TYPE_F32) {
+            ggml_prec_set_src(b, GGML_PREC_F32, 1);
+            ggml_prec_set_acc(b, GGML_PREC_F32);
+        }
+        return ggml_concat(ctx, ggml_mul_mat(ctx, wa, x), b, 0);
     }
 };
 
@@ -9706,32 +9716,59 @@ struct test_fwht_cache : public test_case {
 
 // the shared-expert gate (sigmoid of a one-row f32 mat-vec) right before the f32 router over the same activation,
 // as a backend may order them to run both in one launch
+// The weights may be F16 / BF16 as llama stores F32 weights those hold exactly (LLAMA_NARROW_WEIGHTS), with the
+// F32 request it sets on their matmuls; the CPU reference rounds the activation for them, so the bound is looser.
 struct test_f32_siblings : public test_case {
     const int64_t k;
     const int64_t m;
     const int64_t n_tokens;
+    const ggml_type type_sh;
+    const ggml_type type_inp;
     ggml_tensor * gate   = nullptr;
     ggml_tensor * logits = nullptr;
 
-    std::string vars() override { return VARS_TO_STR3(k, m, n_tokens); }
+    std::string vars() override {
+        std::string v = VARS_TO_STR3(k, m, n_tokens);
+        if (type_sh != GGML_TYPE_F32 || type_inp != GGML_TYPE_F32) {
+            v += "," + VARS_TO_STR2(type_sh, type_inp);
+        }
+        return v;
+    }
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "F32_SIBLINGS";
     }
-    double max_nmse_err() override { return 1e-5; }
+    // the CPU rounds the activation to the weight's type (bf16: 2^-9), which on the one-value gate near zero is
+    // NMSE 1e-4..3e-3 (one value); a misread weight type is ~1
+    double max_nmse_err() override {
+        if (type_sh == GGML_TYPE_BF16 || type_inp == GGML_TYPE_BF16) {
+            return 2e-2;
+        }
+        return type_sh == GGML_TYPE_F32 && type_inp == GGML_TYPE_F32 ? 1e-5 : 5e-5;
+    }
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { gate, logits }; }
 
-    test_f32_siblings(int64_t k = 2560, int64_t m = 512, int64_t n_tokens = 1) : k(k), m(m), n_tokens(n_tokens) {}
+    test_f32_siblings(int64_t k = 2560, int64_t m = 512, int64_t n_tokens = 1, ggml_type type_sh = GGML_TYPE_F32,
+                      ggml_type type_inp = GGML_TYPE_F32)
+        : k(k), m(m), n_tokens(n_tokens), type_sh(type_sh), type_inp(type_inp) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_tokens);
         ggml_set_name(x, "x");
-        ggml_tensor * w_sh  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, 1);
-        ggml_tensor * w_inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
-        gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_sh, x));
+        ggml_tensor * w_sh  = ggml_new_tensor_2d(ctx, type_sh, k, 1);
+        ggml_tensor * w_inp = ggml_new_tensor_2d(ctx, type_inp, k, m);
+        auto mm = [&](ggml_tensor * w) {
+            ggml_tensor * r = ggml_mul_mat(ctx, w, x);
+            if (w->type != GGML_TYPE_F32) {
+                ggml_prec_set_src(r, GGML_PREC_F32, 1);
+                ggml_prec_set_acc(r, GGML_PREC_F32);
+            }
+            return r;
+        };
+        gate = ggml_sigmoid(ctx, mm(w_sh));
         ggml_build_forward_expand(gf, gate);
-        logits = ggml_mul_mat(ctx, w_inp, x);
+        logits = mm(w_inp);
         ggml_set_name(logits, "logits");
         return ggml_add(ctx, logits, ggml_repeat(ctx, gate, logits));
     }
@@ -13204,6 +13241,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_q8_f32_rows(4096, 33, 1));
     test_cases.emplace_back(new test_mul_mat_q8_f32_rows(6144, 257, 8));
     test_cases.emplace_back(new test_mul_mat_q8_f32_rows(10240, 320, 4, 3));
+    for (ggml_type t : { GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        test_cases.emplace_back(new test_mul_mat_q8_f32_rows(10240, 320, 4, 1, t));
+        test_cases.emplace_back(new test_mul_mat_q8_f32_rows(4096, 33, 1, 1, t));
+        test_cases.emplace_back(new test_mul_mat_q8_f32_rows(10240, 320, 4, 3, t));
+    }
 
     // 2D quantized weight against a 3D activation (the MTP eh_proj, [K, 4 streams, n_tokens])
     for (int nt : {1, 2, 3, 42}) {
@@ -14688,6 +14730,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_f32_siblings(2560, 512, 1));
     test_cases.emplace_back(new test_f32_siblings(2560, 512, 3));
     test_cases.emplace_back(new test_f32_siblings(1024, 48, 1));
+    // narrowed weights (the Flash-Next gate is exactly f16, the router exactly bf16)
+    for (ggml_type sh : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32 }) {
+        for (ggml_type inp : { GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_F32 }) {
+            if (sh != GGML_TYPE_F32 || inp != GGML_TYPE_F32) {
+                test_cases.emplace_back(new test_f32_siblings(2560, 512, 1, sh, inp));
+                test_cases.emplace_back(new test_f32_siblings(2560, 512, 7, sh, inp));
+            }
+        }
+    }
         test_cases.emplace_back(new test_matvec_epi(2560, 48, nt));
         test_cases.emplace_back(new test_matvec_epi(512, 7, nt));
     }
