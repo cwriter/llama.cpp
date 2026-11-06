@@ -9403,15 +9403,21 @@ static bool ggml_sycl_mul_mat_id_glu_mmvq_fused(ggml_backend_sycl_context & ctx,
 
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     // reads the f32 activation itself, so the q8_1 quantize below is skipped
-    if (g_ggml_sycl_moe_esimd >= 2 && g_ggml_sycl_enable_esimd && wg->type == GGML_TYPE_IQ3_S &&
-        glu_op == GGML_GLU_OP_SWIGLU && wg->nb[2] % 4 == 0) {
+    // the IQ4_XS / IQ3_XXS kernels decline shapes they do not take, then the q8_1 path below runs
+    if (g_ggml_sycl_moe_esimd >= 2 && g_ggml_sycl_enable_esimd &&
+        (wg->type == GGML_TYPE_IQ3_S || wg->type == GGML_TYPE_IQ4_XS || wg->type == GGML_TYPE_IQ3_XXS) &&
+        glu_op == GGML_GLU_OP_SWIGLU &&
+        wg->nb[2] % 4 == 0) {
         scope_op_debug_print scope_dbg_print(__func__, glu, /*num_src=*/0);
-        return ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
+        const bool done = ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
             wg->type, wg->data, wu->data, (const float *) src1->data, (const int32_t *) ids->data,
             (float *) glu->data, (int) ne10, nrows, n_experts_used, (int) ne12,
             /*expert_weight_stride=*/ wg->nb[2],
             /*dst_row_stride=*/ glu->nb[1],
             /*src1_row_stride=*/ ne11 == 1 ? 0 : src1->nb[1], ids->nb[1], glu->nb[2], src1->nb[2], glu_op, stream);
+        if (done || wg->type == GGML_TYPE_IQ3_S) {
+            return done;
+        }
     }
 #endif
 
