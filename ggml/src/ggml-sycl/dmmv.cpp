@@ -3485,6 +3485,127 @@ static void iq4_nl_moe_persist_esimd_launch(const void * vx_base, const float * 
         });
 }
 
+// The 8 sub-block scales d * (ls - 32) of one reordered IQ4_XS super-block, for each of the 16 lanes of a row: lane b
+// holds super-block b of the row (lanes past the row are garbage, not used). Per expert slice the layout is
+// [qs: nb*128] [d: nb halves] [scales_h: nb u16] [scales_l: nb*4 bytes] (reorder_qw_iq4_xs_moe).
+struct iq4_xs_row_meta {
+    sycl::ext::intel::esimd::simd<float, 16>    d;
+    sycl::ext::intel::esimd::simd<uint32_t, 16> sh;
+    sycl::ext::intel::esimd::simd<uint32_t, 16> sl;
+};
+
+template <int BPR>
+ESIMD_INLINE iq4_xs_row_meta iq4_xs_load_row_meta(const uint8_t * slice, const size_t nb, const int row) {
+    using namespace sycl::ext::intel::esimd;
+    static_assert(BPR <= 16, "one lane per super-block of the row");
+    const simd<uint32_t, 16> lane(0, 1);
+    const simd_mask<16>      in_row = lane < BPR;
+    const size_t             ib0    = (size_t) row * BPR;
+    // one gather per field for the whole row instead of three small loads per block
+    simd<uint32_t, 16> d_w  = gather<uint32_t, 16>((const uint32_t *) (slice + 128 * nb), (lane + (uint32_t) ib0) * 2u & ~3u, in_row);
+    simd<uint32_t, 16> sh_w = gather<uint32_t, 16>((const uint32_t *) (slice + 130 * nb), (lane + (uint32_t) ib0) * 2u & ~3u, in_row);
+    iq4_xs_row_meta m;
+    m.sl = gather<uint32_t, 16>((const uint32_t *) (slice + 132 * nb), (lane + (uint32_t) ib0) * 4u, in_row);
+    // the halves sit in the low or high 16 bits of the aligned word
+    const simd<uint32_t, 16> shift = ((lane + (uint32_t) ib0) & 1u) * 16u;
+    simd<uint16_t, 16> d_bits = (d_w >> shift) & 0xffffu;
+    m.d  = convert<float>(d_bits.template bit_cast_view<sycl::half>().read());
+    m.sh = (sh_w >> shift) & 0xffffu;
+    return m;
+}
+
+// w . y over NSB super-blocks of one row (q at super-block b of the row), accumulated per lane in f32
+template <int NSB>
+ESIMD_INLINE void iq4_xs_row_stripe(const uint8_t * q, const iq4_xs_row_meta & m,
+                                    sycl::ext::intel::esimd::simd<float, 256 * NSB> & y_vec, const int b,
+                                    sycl::ext::intel::esimd::simd<float, 16> & acc) {
+    using namespace sycl::ext::intel::esimd;
+    constexpr int NS = 8 * NSB;  // 32-value sub-blocks in the stripe
+    const simd<uint32_t, 8> sub(0, 1);
+    simd<uint16_t, 16 * NS> qr = block_load<uint8_t, 16 * NS>(q);
+    simd<float, 16 * NS>    lo = iq4_nl_values<16 * NS>(qr & 0xF);
+    simd<float, 16 * NS>    hi = iq4_nl_values<16 * NS>(qr >> 4);
+#pragma unroll
+    for (int k = 0; k < NSB; ++k) {
+        const uint32_t     sl = m.sl[b + k];
+        const uint32_t     sh = m.sh[b + k];
+        simd<uint32_t, 8>  lu = ((sl >> (sub * 4u)) & 0xFu) | (((sh >> (sub * 2u)) & 3u) << 4);
+        simd<float, 8>     sc = (convert<float>(lu) - 32.0f) * m.d[b + k];
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            const int j = k * 8 + s;
+            simd<float, 16> t = y_vec.template select<16, 1>(j * 32) * lo.template select<16, 1>(j * 16) +
+                                y_vec.template select<16, 1>(j * 32 + 16) * hi.template select<16, 1>(j * 16);
+            const float     scs = sc[s];
+            acc += t * scs;
+        }
+    }
+}
+
+// gate . y and up . y over NSB super-blocks of one row, starting at super-block b
+template <int NSB>
+ESIMD_INLINE void iq4_xs_glu_stripe(const uint8_t * qg, const uint8_t * qu, const iq4_xs_row_meta & mg,
+                                    const iq4_xs_row_meta & mu, const float * y, const int b,
+                                    sycl::ext::intel::esimd::simd<float, 16> & acc_g,
+                                    sycl::ext::intel::esimd::simd<float, 16> & acc_u) {
+    using namespace sycl::ext::intel::esimd;
+    simd<float, 256 * NSB> y_vec = block_load<float, 256 * NSB>(y + (size_t) b * QK_K);
+    iq4_xs_row_stripe<NSB>(qg, mg, y_vec, b, acc_g);
+    iq4_xs_row_stripe<NSB>(qu, mu, y_vec, b, acc_u);
+}
+
+// GGML_SYCL_IQ4_XS_GLU_ESIMD: the gate and up expert mat-vecs over reordered IQ4_XS weights with the SWIGLU folded in,
+// for decode, on the persistent layout of the IQ3_S kernel: one thread per thread slot walks (expert, row) units with a
+// stride of the thread count (10 experts x 640 rows on 1280 threads: 5 each). A unit reads one row of both weights in
+// stripes of NSB super-blocks against the f32 activation (no q8_1 quantize), the values by the IQ4_NL polynomial.
+template <int WG, int BPR, int NSB>
+static void iq4_xs_moe_glu_persist_esimd_launch(const void * vx_gate_base, const void * vx_up_base, const float * y,
+                                                const int32_t * ids_dev, float * dst_base, const int nrows,
+                                                const int n_experts_used, const int n_tokens,
+                                                const size_t expert_weight_stride, const size_t dst_row_stride,
+                                                const size_t src1_row_stride, const size_t ids_token_stride,
+                                                const size_t dst_token_stride, const size_t src1_token_stride,
+                                                const int n_wg, dpct::queue_ptr stream) {
+    static_assert(BPR % NSB == 0, "whole stripes per row");
+    const sycl::range<3> block_nums((unsigned) n_tokens, 1, (unsigned) n_wg);
+    const sycl::range<3> block_dims(1, 1, WG);
+    stream->parallel_for(
+        sycl::nd_range<3>(block_nums * block_dims, block_dims),
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            const int    token_idx = it.get_group(0);
+            const int    total     = n_experts_used * nrows;
+            const int    n_threads = it.get_group_range(2) * WG;
+            const size_t nb        = (size_t) nrows * BPR;
+            for (int u = it.get_group(2) * WG + it.get_local_id(2); u < total; u += n_threads) {
+                const int e   = u / nrows;
+                const int row = u - e * nrows;
+                const int i02 = *(const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride + e * sizeof(int32_t));
+                float *   dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) e * dst_row_stride);
+                if (i02 < 0) { // skipped slot (id -1)
+                    dst[row] = 0.0f;
+                    continue;
+                }
+                const uint8_t * sg = (const uint8_t *) vx_gate_base + (size_t) i02 * expert_weight_stride;
+                const uint8_t * su = (const uint8_t *) vx_up_base + (size_t) i02 * expert_weight_stride;
+                const float *   yr = (const float *) ((const char *) y + (size_t) token_idx * src1_token_stride + (size_t) e * src1_row_stride);
+                const iq4_xs_row_meta mg = iq4_xs_load_row_meta<BPR>(sg, nb, row);
+                const iq4_xs_row_meta mu = iq4_xs_load_row_meta<BPR>(su, nb, row);
+                const size_t          q0 = (size_t) row * BPR * 128;
+
+                simd<float, 16> acc_g = 0.0f;
+                simd<float, 16> acc_u = 0.0f;
+#pragma unroll
+                for (int b = 0; b < BPR; b += NSB) {
+                    iq4_xs_glu_stripe<NSB>(sg + q0 + (size_t) b * 128, su + q0 + (size_t) b * 128, mg, mu, yr, b, acc_g, acc_u);
+                }
+                const float g = reduce<float>(acc_g, std::plus<>{});
+                const float v = reduce<float>(acc_u, std::plus<>{});
+                dst[row] = g / (1.0f + sycl::exp(-g)) * v;
+            }
+        });
+}
+
 // One reordered IQ3_S block of one row against a 256-float activation stripe. Per expert slice the
 // layout is [qs: nb*64] [qh: nb*8] [signs: nb*32] [{d, scales}: nb*6]. Grid entry k holds the
 // magnitudes of elements 4k..4k+3, and bit e%8 of signs[e/8] is the sign of element e.
@@ -3891,6 +4012,141 @@ static void iq3_s_moe_glu_dp4a_persist_esimd_launch(const void * vx_gate_base, c
             mul_mat_vec_iq3_s_moe_glu_dp4a_persist_esimd<WG, NB>(vx_gate_base, vx_up_base, y, dst_base, ids_dev, ncols,
                 nrows, n_experts_used, expert_weight_stride, dst_row_stride, ids_token_stride, dst_token_stride,
                 src1_token_stride, it);
+        });
+}
+
+// NB consecutive reordered IQ3_XXS blocks of one row against the int8 activation in SLM. Per expert slice the layout is
+// [qs: nb*96] [d: nb halves] (reorder_qw_soa2_moe): 64 grid indices, then 8 words of 4 x 7 sign bits and a 4-bit
+// scale per 32-value sub-block. Grid entry k holds the magnitudes of elements 4k..4k+3; the 8th sign bit of each group
+// is the parity of its 7 (ksigns_iq2xs), computed here.
+template <int NB>
+ESIMD_INLINE void iq3_xxs_moe_dp4a_blocks(const uint8_t * vx, const size_t nb, const size_t ib,
+                                          const sycl::ext::intel::esimd::simd<int32_t, 64 * NB> & yq,
+                                          const sycl::ext::intel::esimd::simd<float, 8 * NB> & yd,
+                                          sycl::ext::intel::esimd::simd<float, 8> & acc) {
+    using namespace sycl::ext::intel::esimd;
+
+    simd<uint8_t, 96 * NB> q   = block_load<uint8_t, 96 * NB>(vx + ib * 96);
+    simd<uint16_t, NB>     d_b = block_load<uint16_t, NB>((const uint16_t *) (vx + nb * 96 + ib * 2), element_aligned_tag{});
+    simd<sycl::half, NB>   d_h = d_b.template bit_cast_view<sycl::half>();
+    simd<float, NB>        d   = d_h;
+
+    const simd<uint32_t, 64> lane(0, 1);
+    // pair l of a sub-block uses sign bits 7l..7l+6 of its word; lane parity picks the low or high 4 of the 8
+    const simd<uint32_t, 64> shift7 = ((lane & 7) >> 1) * 7;
+    const simd<uint32_t, 64> half4  = (lane & 1) * 4;
+    simd<float, 8 * NB> sc;
+    simd<uint32_t, 64 * NB> w;
+#pragma unroll
+    for (int k = 0; k < NB; ++k) {
+        simd<uint32_t, 64> idx  = q.template select<64, 1>(96 * k);
+        simd<uint32_t, 64> off  = idx * (uint32_t) sizeof(uint32_t);
+        simd<uint32_t, 64> grid = slm_gather<uint32_t, 64>(off);
+        simd<uint8_t, 32>  sb   = q.template select<32, 1>(96 * k + 64);
+        simd<uint32_t, 8>  aux  = sb.template bit_cast_view<uint32_t>();
+        const float        dk   = d[k];
+        simd<uint32_t, 8>  s4   = aux >> 28;
+        simd<float, 8>     s4f  = s4;
+        sc.template select<8, 1>(8 * k) = (s4f + 0.5f) * (0.5f * dk);
+
+        simd<uint32_t, 64> aux64 = aux.template replicate_vs_w_hs<8, 1, 8, 0>(0);
+        simd<uint32_t, 64> s7    = (aux64 >> shift7) & 127u;
+        simd<uint32_t, 64> s8    = s7 | ((cbit(s7) & 1u) << 7);
+        simd<uint32_t, 64> sgn   = (s8 >> half4) & 0xfu;
+        // spread each sign bit to the low bit of its byte and negate those bytes: grid bytes are 4..62, so
+        // (g ^ 0xff) + 1 never carries into the next byte
+        simd<uint32_t, 64> m01 = (sgn * 0x00204081u) & 0x01010101u;
+        w.template select<64, 1>(64 * k) = (grid ^ (m01 * 0xffu)) + m01;
+    }
+    sc *= yd;
+
+    // 8 lanes per 32-value sub-block
+    simd<int32_t, 64 * NB> p   = dp4a<int32_t, int32_t, int32_t, int32_t, 64 * NB>(
+        simd<int32_t, 64 * NB>(0), yq, w.template bit_cast_view<int32_t>());
+    simd<int32_t, 32 * NB> p32 = p.template select<32 * NB, 2>(0) + p.template select<32 * NB, 2>(1);
+    simd<int32_t, 16 * NB> p16 = p32.template select<16 * NB, 2>(0) + p32.template select<16 * NB, 2>(1);
+    simd<int32_t, 8 * NB>  p8  = p16.template select<8 * NB, 2>(0) + p16.template select<8 * NB, 2>(1);
+    simd<float, 8 * NB>    f   = convert<float>(p8) * sc;
+#pragma unroll
+    for (int k = 0; k < NB; ++k) {
+        acc += f.template select<8, 1>(8 * k);
+    }
+}
+
+// GGML_SYCL_IQ3_XXS_GLU_ESIMD: the IQ3_S persistent gate/up kernel (GGML_SYCL_IQ3_S_PERSIST) for reordered IQ3_XXS:
+// one thread per thread slot walks whole (expert, row) units; per work-group the grid goes to SLM and the shared
+// activation is quantized to int8 per 32 values once, and the main loop has no barrier.
+template <int WG, int NB>
+static void iq3_xxs_moe_glu_persist_esimd_launch(const void * vx_gate_base, const void * vx_up_base, const float * y_base,
+                                                 const int32_t * ids_dev, float * dst_base, const int ncols,
+                                                 const int nrows, const int n_experts_used, const int n_tokens,
+                                                 const size_t expert_weight_stride, const size_t dst_row_stride,
+                                                 const size_t ids_token_stride, const size_t dst_token_stride,
+                                                 const size_t src1_token_stride, const int n_wg, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0 && ncols <= IQ3_S_MOE_DP4A_MAX_COLS);
+    const sycl::range<3> block_nums((unsigned) n_tokens, 1, (unsigned) n_wg);
+    const sycl::range<3> block_dims(1, 1, WG);
+    stream->parallel_for(
+        sycl::nd_range<3>(block_nums * block_dims, block_dims),
+        [=](sycl::nd_item<3> it) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            slm_init<IQ3_S_MOE_DP4A_YQ_SLM + IQ3_S_MOE_DP4A_MAX_COLS>();
+
+            const int     tid       = it.get_local_id(2);
+            const int     token_idx = it.get_group(0);
+            const float * y         = (const float *) ((const char *) y_base + (size_t) token_idx * src1_token_stride);
+
+            // the 256-entry grid at the bottom of the IQ3_S kernel's 512-entry region
+            for (int i = tid; i < 256 / 16; i += WG) {
+                slm_block_store<uint32_t, 16>(i * 16 * sizeof(uint32_t), block_load<uint32_t, 16>(iq3xxs_grid + i * 16));
+            }
+            for (int j = tid; j < ncols / 32; j += WG) {
+                simd<float, 32>  v    = block_load<float, 32>(y + j * 32);
+                const float      amax = hmax<float>(abs(v));
+                const float      id   = amax > 0.0f ? 127.0f / amax : 0.0f;
+                simd<int8_t, 32> q    = convert<int8_t>(rnde<float, 32>(v * id));
+                slm_block_store<int8_t, 32>(IQ3_S_MOE_DP4A_YQ_SLM + j * 32, q);
+                slm_scalar_store<float>(IQ3_S_MOE_DP4A_YD_SLM + j * sizeof(float), amax / 127.0f);
+            }
+            barrier();
+
+            const int    blocks_per_row = ncols / QK_K;
+            const size_t nb             = (size_t) nrows * blocks_per_row;
+            const int    n_threads      = it.get_group_range(2) * WG;
+            const int    total          = n_experts_used * nrows;
+            for (int u = it.get_group(2) * WG + tid; u < total; u += n_threads) {
+                const int e   = u / nrows;
+                const int row = u - e * nrows;
+                const int i02 = *(const int32_t *) ((const char *) ids_dev + (size_t) token_idx * ids_token_stride + e * sizeof(int32_t));
+                float *   dst = (float *) ((char *) dst_base + (size_t) token_idx * dst_token_stride + (size_t) e * dst_row_stride);
+                if (i02 < 0) { // skipped slot (id -1)
+                    dst[row] = 0.0f;
+                    continue;
+                }
+                const uint8_t * vg = (const uint8_t *) vx_gate_base + (size_t) i02 * expert_weight_stride;
+                const uint8_t * vu = (const uint8_t *) vx_up_base + (size_t) i02 * expert_weight_stride;
+
+                simd<float, 8> acc_g = 0.0f;
+                simd<float, 8> acc_u = 0.0f;
+                int b = 0;
+                for (; b + NB <= blocks_per_row; b += NB) {
+                    const size_t ib = (size_t) row * blocks_per_row + b;
+                    simd<int32_t, 64 * NB> yq = slm_block_load<int32_t, 64 * NB>(IQ3_S_MOE_DP4A_YQ_SLM + b * QK_K);
+                    simd<float, 8 * NB>    yd = slm_block_load<float, 8 * NB>(IQ3_S_MOE_DP4A_YD_SLM + b * 8 * sizeof(float));
+                    iq3_xxs_moe_dp4a_blocks<NB>(vg, nb, ib, yq, yd, acc_g);
+                    iq3_xxs_moe_dp4a_blocks<NB>(vu, nb, ib, yq, yd, acc_u);
+                }
+                for (; b < blocks_per_row; ++b) {
+                    const size_t ib = (size_t) row * blocks_per_row + b;
+                    simd<int32_t, 64> yq = slm_block_load<int32_t, 64>(IQ3_S_MOE_DP4A_YQ_SLM + b * QK_K);
+                    simd<float, 8>    yd = slm_block_load<float, 8>(IQ3_S_MOE_DP4A_YD_SLM + b * 8 * sizeof(float));
+                    iq3_xxs_moe_dp4a_blocks<1>(vg, nb, ib, yq, yd, acc_g);
+                    iq3_xxs_moe_dp4a_blocks<1>(vu, nb, ib, yq, yd, acc_u);
+                }
+                const float g = reduce<float>(acc_g, std::plus<>{});
+                const float v = reduce<float>(acc_u, std::plus<>{});
+                dst[row] = v * g / (1.0f + sycl::exp(-g));
+            }
         });
 }
 
@@ -4796,6 +5052,43 @@ bool ggml_sycl_mul_mat_vec_q_id_reorder_glu_esimd(
     size_t ids_token_stride, size_t dst_token_stride, size_t src1_token_stride,
     ggml_glu_op glu_op, dpct::queue_ptr stream) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
+    if (src0_type == GGML_TYPE_IQ4_XS) {
+        static const int iq4_xs = ggml_sycl_get_env("GGML_SYCL_IQ4_XS_GLU_ESIMD", 1);
+        // rows of 10 super-blocks (the Flash-Next experts, 2560 columns); the meta gathers want 4-byte fields
+        const size_t nb = (size_t) nrows * (ncols / QK_K);
+        if (!iq4_xs || glu_op != GGML_GLU_OP_SWIGLU || ncols != 10 * QK_K || nb % 2 != 0 || expert_weight_stride % 8 != 0 ||
+            ((uintptr_t) vx_gate_base | (uintptr_t) vx_up_base) % 8 != 0) {
+            return false;
+        }
+        static const int n_wg_env = ggml_sycl_get_env("GGML_SYCL_IQ4_XS_GLU_WG", 0);
+        static const int n_wg_dev = (int) stream->get_device().get_info<sycl::info::device::max_compute_units>() * 8 / 32;
+        const int        n_wg     = n_wg_env > 0 ? n_wg_env : std::max(1, n_wg_dev);
+        static const int nsb = ggml_sycl_get_env("GGML_SYCL_IQ4_XS_GLU_NSB", 1);
+#define IQ4_XS_GLU_LAUNCH(NSB_) \
+        iq4_xs_moe_glu_persist_esimd_launch<32, 10, NSB_>(vx_gate_base, vx_up_base, y, ids_dev, dst_base, nrows, \
+            n_experts_used, n_tokens, expert_weight_stride, dst_row_stride, src1_row_stride, ids_token_stride, \
+            dst_token_stride, src1_token_stride, n_wg, stream); \
+        return true
+        // stripe of 1 super-block: 433 us vs 449 (2) and 1249 (5, spills) on MOE_GLU_STREAM m=1, B60
+        if (nsb == 2) { IQ4_XS_GLU_LAUNCH(2); }
+        IQ4_XS_GLU_LAUNCH(1);
+#undef IQ4_XS_GLU_LAUNCH
+    }
+    if (src0_type == GGML_TYPE_IQ3_XXS) {
+        static const int iq3_xxs = ggml_sycl_get_env("GGML_SYCL_IQ3_XXS_GLU_ESIMD", 1);
+        // one activation shared by all experts (decode), whole rows of 5-block steps
+        if (!iq3_xxs || glu_op != GGML_GLU_OP_SWIGLU || ncols % (5 * QK_K) != 0 || ncols > IQ3_S_MOE_DP4A_MAX_COLS ||
+            src1_row_stride != 0 || expert_weight_stride % 4 != 0) {
+            return false;
+        }
+        static const int n_wg_env = ggml_sycl_get_env("GGML_SYCL_IQ3_XXS_GLU_WG", 0);
+        static const int n_wg_dev = (int) stream->get_device().get_info<sycl::info::device::max_compute_units>() * 8 / 32;
+        const int        n_wg     = n_wg_env > 0 ? n_wg_env : std::max(1, n_wg_dev);
+        iq3_xxs_moe_glu_persist_esimd_launch<32, 5>(vx_gate_base, vx_up_base, y, ids_dev, dst_base, ncols, nrows,
+            n_experts_used, n_tokens, expert_weight_stride, dst_row_stride, ids_token_stride, dst_token_stride,
+            src1_token_stride, n_wg, stream);
+        return true;
+    }
     if (src0_type != GGML_TYPE_IQ3_S || glu_op != GGML_GLU_OP_SWIGLU || ncols % QK_K != 0) {
         return false;
     }

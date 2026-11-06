@@ -13482,6 +13482,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ4_NL, m, 37, 352, 8, 4, 2, false));
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_Q8_0, m, 2560, 640, 8, 4, 2, false));
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_Q8_0, m, 37, 352, 8, 4, 2, false));
+        // the Flash-Next UD-IQ4_XS d9620119 gate/up formats: rows of 10 super-blocks, and odd row counts
+        for (ggml_type t : { GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_XXS }) {
+            test_cases.emplace_back(new test_moe_glu_stream(t, m, 640, 2560, 8, 4, 2));
+            test_cases.emplace_back(new test_moe_glu_stream(t, m, 37, 2560, 8, 4, 2));
+        }
     }
 
     for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
@@ -15278,6 +15283,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ4_NL, m, 2560, 640, 32, 10, 8, false));
         // the Q8_0 down projection of its other 5 layers
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_Q8_0, m, 2560, 640, 32, 10, 8, false));
+        // Flash-Next UD-IQ4_XS d9620119: IQ4_XS / IQ3_XXS gate/up, Q5_0 down
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ4_XS, m, 640, 2560, 32, 10, 8));
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ3_XXS, m, 640, 2560, 32, 10, 8));
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_Q5_0, m, 2560, 640, 32, 10, 8, false));
     }
     // 8 tokens route to ~75 distinct experts, so the weights do not stay in L2 across runs
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 8, 640, 2560,
