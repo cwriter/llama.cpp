@@ -15265,6 +15265,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], 1));
         test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q8_0, mk[0], mk[1], n_w));
     }
+    // the Q6_K mat-vecs of Flash-Next UD-IQ4_XS d9620119 (attention, shared experts, output head), streamed the same way
+    for (auto mk : std::vector<std::array<int64_t, 2>>{ {10240, 2560}, {12288, 2560}, {6144, 2560}, {2560, 6144},
+                                                        {512, 2560}, {640, 2560}, {248320, 2560} }) {
+        const int64_t w_size = mk[0] * (int64_t) ggml_row_size(GGML_TYPE_Q6_K, mk[1]);
+        const int     n_w    = (int) std::min<int64_t>(40, ((64ll << 20) + w_size - 1) / w_size);
+        test_cases.emplace_back(new test_mul_mat_stream(GGML_TYPE_Q6_K, mk[0], mk[1], n_w));
+    }
     for (int64_t tokens : {1, 2, 17, 257}) {
         test_cases.emplace_back(new test_gate_view(256, 24, tokens));
     }

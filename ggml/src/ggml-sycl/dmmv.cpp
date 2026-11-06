@@ -2073,6 +2073,83 @@ static void dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(const void *vx, const
     });
 }
 
+// The dense Q6_K mat-vec at decode as the persistent MoE kernels run it: one thread per
+// thread slot walks units of R rows, with no SLM and no barrier. The kernel above gives a pair of rows to 4 threads
+// that split its super-blocks round-robin (3, 3, 2, 2 at 2560 columns) and meet in SLM. The activation stays exact
+// f32: an int8 activation with dp4a measured no faster. Per row the reordered layout is [ql: nb*128] [qh: nb*64]
+// [scales: nb*16] [d: nb]. In each half of a super-block, ql dwords 0..7 (A) and 8..15 (B) and qh dwords 0..7 (H)
+// give the values in order, 4 per dword: dwords 0..7 A & 0xf | (H & 3) << 4, 8..15 B & 0xf | (H >> 2 & 3) << 4,
+// 16..23 A >> 4 | (H >> 4 & 3) << 4, 24..31 B >> 4 | (H >> 6 & 3) << 4; scale k covers values 16k..16k+15.
+template <int R>
+ESIMD_INLINE void q6_k_persist_block(const uint8_t * vx, const size_t nb, const int bpr, const int row0, const int nrows,
+                                     const int b, const float * y, sycl::ext::intel::esimd::simd<float, 16 * R> & acc) {
+    using namespace sycl::ext::intel::esimd;
+
+    simd<float, QK_K> yv = block_load<float, QK_K>(y + (size_t) b * QK_K);
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        // a tail row past nrows recomputes the last row and is not stored
+        const int    row = row0 + r < nrows ? row0 + r : nrows - 1;
+        const size_t ib  = (size_t) row * bpr + b;
+        simd<uint32_t, 32> ql = block_load<uint32_t, 32>((const uint32_t *) (vx + ib * (QK_K / 2)));
+        simd<uint32_t, 16> qh = block_load<uint32_t, 16>((const uint32_t *) (vx + nb * (QK_K / 2) + ib * (QK_K / 4)));
+        simd<int8_t, 16>   sc = block_load<int8_t, 16>((const int8_t *) (vx + nb * (QK_K / 2 + QK_K / 4) + ib * (QK_K / 16)));
+        const float        d  = ((const sycl::half *) (vx + nb * (QK_K / 2 + QK_K / 4 + QK_K / 16)))[ib];
+
+        simd<uint32_t, 64> w;
+        auto w2 = w.template bit_cast_view<uint32_t, 2, 32>();
+        auto l2 = ql.template bit_cast_view<uint32_t, 2, 16>();
+        simd<uint32_t, 16> a  = l2.template select<2, 1, 8, 1>(0, 0);
+        simd<uint32_t, 16> bb = l2.template select<2, 1, 8, 1>(0, 8);
+        w2.template select<2, 1, 8, 1>(0, 0)  = (a & 0x0f0f0f0fu) | ((qh & 0x03030303u) << 4);
+        w2.template select<2, 1, 8, 1>(0, 8)  = (bb & 0x0f0f0f0fu) | (((qh >> 2) & 0x03030303u) << 4);
+        w2.template select<2, 1, 8, 1>(0, 16) = ((a >> 4) & 0x0f0f0f0fu) | (((qh >> 4) & 0x03030303u) << 4);
+        w2.template select<2, 1, 8, 1>(0, 24) = ((bb >> 4) & 0x0f0f0f0fu) | (((qh >> 6) & 0x03030303u) << 4);
+
+        simd<uint8_t, QK_K> wb = w.template bit_cast_view<uint8_t>();
+        simd<float, QK_K>   v  = (convert<float>(wb) - 32.0f) * yv;
+        simd<float, 16>     s  = convert<float>(sc) * d;
+        simd<float, 16>     ar = acc.template select<16, 1>(16 * r);
+#pragma unroll
+        for (int k = 0; k < 16; ++k) {
+            const float sk = s[k];
+            ar += v.template select<16, 1>(16 * k) * sk;
+        }
+        acc.template select<16, 1>(16 * r) = ar;
+    }
+}
+
+// MUL_MAT_STREAM on B60, 2 rows per unit: 10240 x 2560 243 -> 215 us, 6144 x 2560 235 -> 206, 248320 x 2560 1286 -> 1172
+// (1 and 4 rows, 2 super-blocks per step and the activation staged in SLM were no faster)
+template <int WG, int R>
+static void q6_k_persist_esimd_launch(const void * vx, const float * y, float * dst, const int ncols, const int nrows,
+                                      const int n_wg, dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) n_wg * WG), sycl::range<1>(WG)),
+        [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+            using namespace sycl::ext::intel::esimd;
+            const int    bpr       = ncols / QK_K;
+            const size_t nb        = (size_t) nrows * bpr;
+            const int    n_units   = (nrows + R - 1) / R;
+            const int    n_threads = it.get_group_range(0) * WG;
+            for (int u = it.get_group(0) * WG + it.get_local_id(0); u < n_units; u += n_threads) {
+                const int row0 = u * R;
+                simd<float, 16 * R> acc = 0.0f;
+                for (int b = 0; b < bpr; ++b) {
+                    q6_k_persist_block<R>((const uint8_t *) vx, nb, bpr, row0, nrows, b, y, acc);
+                }
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (row0 + r < nrows) {
+                        simd<float, 16> ar = acc.template select<16, 1>(16 * r);
+                        dst[row0 + r] = reduce<float>(ar, std::plus<>{});
+                    }
+                }
+            }
+        });
+}
+
 // Q8_0 SOA reorder layout: [qs: nb*QK8_0] [d: nb*sizeof(half)].
 // Process eight blocks per stripe and process remaining blocks one at a time.
 template <int NBLK>
@@ -4646,7 +4723,12 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
             if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.is_reordered()) {
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
-                if (g_ggml_sycl_enable_esimd) {
+                // a thread takes whole rows, so below ~3 rows per thread slot the 4-thread row pairs win
+                // (MUL_MAT_STREAM on B60: 640 x 2560 556 -> 838 us, 2560 x 6144 214 -> 210)
+                if (g_ggml_sycl_enable_esimd && row_diff >= 4096) {
+                    static const int n_wg = std::max(1, (int) stream->get_device().get_info<sycl::info::device::max_compute_units>() * 8 / 32);
+                    q6_k_persist_esimd_launch<32, 2>(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, n_wg, stream);
+                } else if (g_ggml_sycl_enable_esimd) {
                     dequantize_mul_mat_vec_q6_K_sycl_reorder_esimd(src0_dd_i, src1_ddf_i, dst_dd_i, ne00, row_diff, stream);
                 }
                 else
