@@ -25,6 +25,7 @@ void ggml_sycl_op_dequantize_mul_mat_vec(
     const dpct::queue_ptr &stream);
 
 // Reordered MoE expert mat-vec with the f32 activation (ESIMD). Returns false for an unsupported type.
+// Q2_0 is the exception: its weights are in the canonical layout.
 bool ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
     enum ggml_type src0_type, const void * vx_base, const float * y, const int32_t * ids_dev,
     float * dst_base, int ncols, int nrows, int n_experts_used, int n_tokens,

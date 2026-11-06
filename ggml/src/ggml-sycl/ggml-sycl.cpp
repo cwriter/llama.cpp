@@ -7180,9 +7180,24 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     // reads the f32 activation itself, so the q8_1 quantize below is skipped
     static const bool moe_q8_0_esimd = ggml_sycl_get_env("GGML_SYCL_MOE_Q8_0_ESIMD", 1) != 0;
+    static const bool moe_q5_0_esimd = ggml_sycl_get_env("GGML_SYCL_Q5_0_MOE_ESIMD", 1) != 0;
+    static const bool moe_q2_0_esimd = ggml_sycl_get_env("GGML_SYCL_Q2_0_MOE_ESIMD", 1) != 0;
+    // the down shape of the persistent kernels: 640 columns, 20 Q5_0 / 10 Q2_0 blocks per row
+    const bool down_esimd_shape = ne10 == 640 && n_experts_used <= 16 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0;
     if (use_reorder && !ordered_hint && g_ggml_sycl_moe_esimd >= 1 && g_ggml_sycl_enable_esimd &&
-        (src0->type == GGML_TYPE_IQ4_NL || (moe_q8_0_esimd && src0->type == GGML_TYPE_Q8_0)) &&
+        (src0->type == GGML_TYPE_IQ4_NL || (moe_q8_0_esimd && src0->type == GGML_TYPE_Q8_0) ||
+         (moe_q5_0_esimd && src0->type == GGML_TYPE_Q5_0 && down_esimd_shape)) &&
         src0->nb[2] % 4 == 0) {
+        return ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
+            src0->type, src0->data, (const float *) src1->data, (const int32_t *) ids->data,
+            (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) ne12,
+            /*expert_weight_stride=*/ src0->nb[2],
+            /*dst_row_stride=*/ dst->nb[1],
+            /*src1_row_stride=*/ ne11 == 1 ? 0 : src1->nb[1], ids->nb[1], dst->nb[2], src1->nb[2], stream);
+    }
+    // Q2_0 is never reordered, so this reads the canonical blocks
+    if (!use_reorder && !ordered_hint && n_nodes == 1 && moe_q2_0_esimd && g_ggml_sycl_moe_esimd >= 1 &&
+        g_ggml_sycl_enable_esimd && src0->type == GGML_TYPE_Q2_0 && down_esimd_shape) {
         return ggml_sycl_mul_mat_vec_q_id_reorder_esimd(
             src0->type, src0->data, (const float *) src1->data, (const int32_t *) ids->data,
             (float *) dst->data, (int) ne10, nrows, n_experts_used, (int) ne12,
@@ -9403,9 +9418,10 @@ static bool ggml_sycl_mul_mat_id_glu_mmvq_fused(ggml_backend_sycl_context & ctx,
 
 #ifdef GGML_SYCL_DMMV_HAS_ESIMD
     // reads the f32 activation itself, so the q8_1 quantize below is skipped
-    // the IQ4_XS / IQ3_XXS kernels decline shapes they do not take, then the q8_1 path below runs
+    // the IQ4_XS / IQ3_XXS / IQ2_S kernels decline shapes they do not take, then the q8_1 path below runs
     if (g_ggml_sycl_moe_esimd >= 2 && g_ggml_sycl_enable_esimd &&
-        (wg->type == GGML_TYPE_IQ3_S || wg->type == GGML_TYPE_IQ4_XS || wg->type == GGML_TYPE_IQ3_XXS) &&
+        (wg->type == GGML_TYPE_IQ3_S || wg->type == GGML_TYPE_IQ4_XS || wg->type == GGML_TYPE_IQ3_XXS ||
+         wg->type == GGML_TYPE_IQ2_S) &&
         glu_op == GGML_GLU_OP_SWIGLU &&
         wg->nb[2] % 4 == 0) {
         scope_op_debug_print scope_dbg_print(__func__, glu, /*num_src=*/0);
