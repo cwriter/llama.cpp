@@ -13487,6 +13487,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_moe_glu_stream(t, m, 640, 2560, 8, 4, 2));
             test_cases.emplace_back(new test_moe_glu_stream(t, m, 37, 2560, 8, 4, 2));
         }
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ2_S, m, 640, 2560, 8, 4, 2));
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ2_S, m, 37, 2560, 8, 4, 2));
+        // and the down formats, 640 columns
+        for (ggml_type t : { GGML_TYPE_Q5_0, GGML_TYPE_Q2_0 }) {
+            test_cases.emplace_back(new test_moe_glu_stream(t, m, 2560, 640, 8, 4, 2, false));
+            test_cases.emplace_back(new test_moe_glu_stream(t, m, 37, 640, 8, 4, 2, false));
+        }
     }
 
     for (ggml_type type : {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_XS}) {
@@ -15287,6 +15294,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ4_XS, m, 640, 2560, 32, 10, 8));
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ3_XXS, m, 640, 2560, 32, 10, 8));
         test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_Q5_0, m, 2560, 640, 32, 10, 8, false));
+        // and the IQ2_S gate/up, Q2_0 down of its few lowest-bit layers
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_IQ2_S, m, 640, 2560, 32, 10, 8));
+        test_cases.emplace_back(new test_moe_glu_stream(GGML_TYPE_Q2_0, m, 2560, 640, 32, 10, 8, false));
     }
     // 8 tokens route to ~75 distinct experts, so the weights do not stay in L2 across runs
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ3_S, GGML_GLU_OP_SWIGLU, 8, 640, 2560,
