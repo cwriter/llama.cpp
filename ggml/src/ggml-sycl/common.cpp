@@ -11,6 +11,7 @@
 //
 
 #include "common.hpp"
+#include "mem.hpp"
 #include <sycl/backend.hpp>
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
 #include <level_zero/ze_api.h>
@@ -92,9 +93,33 @@ static bool ggml_sycl_use_level_zero_device_alloc(sycl::queue &q) {
 }
 #endif
 
+// xe does not fail a device allocation when VRAM is full: it evicts other buffers (whole ones, e.g. all
+// weights) to host memory and faults them back. Refuse instead. GGML_SYCL_VRAM_MARGIN_MIB=0 disables.
+static bool ggml_sycl_vram_fits(size_t size, sycl::queue & q) {
+    static const size_t margin = (size_t) ggml_sycl_get_env("GGML_SYCL_VRAM_MARGIN_MIB", 128) << 20;
+    if (margin == 0 || !q.get_device().is_gpu()) {
+        return true;
+    }
+    size_t free = 0;
+    size_t total = 0;
+    if (!get_memory_size(q.get_device(), free, total, MEMORY_API_TYPE_LEVEL_ZERO) || free >= total) {
+        return true; // free memory unknown
+    }
+    if (size + margin <= free) {
+        return true;
+    }
+    GGML_LOG_ERROR("%s: refusing %.1f MiB on %s: %.1f MiB VRAM free, margin %zu MiB (GGML_SYCL_VRAM_MARGIN_MIB)\n", __func__,
+                   size / 1048576.0, q.get_device().get_info<sycl::info::device::name>().c_str(), free / 1048576.0, margin >> 20);
+    return false;
+}
+
 // Use Level Zero zeMemAllocDevice to avoid sycl::malloc_device triggering
 // DMA-buf/TTM system RAM staging in the xe kernel driver during multi-GPU inference.
 void * ggml_sycl_malloc_device(size_t size, sycl::queue &q, ggml_sycl_mem_type type) {
+    if (!ggml_sycl_vram_fits(size, q)) {
+        ggml_sycl_memtrace_fail(type, size);
+        return nullptr;
+    }
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO_API
     if (ggml_sycl_use_level_zero_device_alloc(q)) {
         void *ptr = nullptr;

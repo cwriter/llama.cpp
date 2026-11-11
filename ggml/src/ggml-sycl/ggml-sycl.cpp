@@ -2845,8 +2845,8 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
 
         SYCL_CHECK(CHECK_TRY_ERROR(ptr = (void *)ggml_sycl_malloc_device(look_ahead_size, *qptr, GGML_SYCL_MEM_POOL_LEG)));
         if (!ptr) {
-            GGML_LOG_ERROR("%s: can't allocate %zu Bytes of memory on device/GPU\n", __func__, look_ahead_size);
-            return nullptr;
+            // callers launch kernels on the result, so a null here would fault the GPU
+            GGML_ABORT("%s: can't allocate %zu bytes on device %d\n", __func__, look_ahead_size, device);
         }
 
         *actual_size = look_ahead_size;
