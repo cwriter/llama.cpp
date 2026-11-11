@@ -3124,7 +3124,79 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_host(que
     return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_host(qptr, device));
 }
 
+// GGML_SYCL_POOL_MIB > 0: the device pool is one block of that size, taken when the pool is made (at load, by
+// the warmup) and never grown. A request that does not fit aborts with the size it needed.
+struct ggml_sycl_pool_arena : public ggml_sycl_pool {
+    static constexpr size_t ALIGN = 256;
+
+    int       device;
+    queue_ptr qptr;
+    char *    base = nullptr;
+    size_t    size = 0;
+    size_t    used = 0;
+    size_t    peak = 0;
+    std::map<size_t, size_t> free_blocks;  // offset -> size, coalesced
+
+    ggml_sycl_pool_arena(queue_ptr qptr_, int device_, size_t size_) : device(device_), qptr(qptr_), size(size_) {
+        base = (char *) ggml_sycl_malloc_device(size, *qptr, GGML_SYCL_MEM_POOL_LEG);
+        if (!base) {
+            GGML_ABORT("%s: can't allocate the %zu MiB pool on device %d (GGML_SYCL_POOL_MIB)\n", __func__, size >> 20, device);
+        }
+        free_blocks[0] = size;
+    }
+
+    ~ggml_sycl_pool_arena() {
+        GGML_LOG_INFO("%s: device %d pool peak %.1f of %zu MiB\n", __func__, device, peak / 1048576.0, size >> 20);
+        SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(base, *qptr)));
+    }
+
+    void * alloc(size_t req, size_t * actual_size) override {
+        const size_t n = std::max(ALIGN, (req + ALIGN - 1) / ALIGN * ALIGN);
+        for (auto it = free_blocks.begin(); it != free_blocks.end(); ++it) {
+            if (it->second < n) {
+                continue;
+            }
+            const size_t off  = it->first;
+            const size_t rest = it->second - n;
+            free_blocks.erase(it);
+            if (rest > 0) {
+                free_blocks[off + n] = rest;
+            }
+            used += n;
+            peak = std::max(peak, used);
+            *actual_size = n;
+            ggml_sycl_census_pool_alloc(device, false, req, n, false, size);
+            return base + off;
+        }
+        GGML_ABORT("%s: pool on device %d is full: %.1f MiB requested, %.1f of %zu MiB in use; raise GGML_SYCL_POOL_MIB\n",
+                   __func__, device, req / 1048576.0, used / 1048576.0, size >> 20);
+    }
+
+    void free(void * ptr, size_t n) override {
+        ggml_sycl_census_pool_free(device, false, n);
+        size_t off = (char *) ptr - base;
+        used -= n;
+        auto next = free_blocks.lower_bound(off);
+        if (next != free_blocks.end() && off + n == next->first) {
+            n += next->second;
+            next = free_blocks.erase(next);
+        }
+        if (next != free_blocks.begin()) {
+            auto prev = std::prev(next);
+            if (prev->first + prev->second == off) {
+                prev->second += n;
+                return;
+            }
+        }
+        free_blocks[off] = n;
+    }
+};
+
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device) {
+    static const size_t arena_mib = (size_t) ggml_sycl_get_env("GGML_SYCL_POOL_MIB", 0);
+    if (arena_mib > 0) {
+        return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_arena(qptr, device, arena_mib << 20));
+    }
 #if defined(GGML_SYCL_SUPPORT_VMM)
     if (g_ggml_sycl_enable_vmm && ggml_sycl_info().devices[device].vmm) {
         return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_vmm(qptr, device));
