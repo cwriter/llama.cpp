@@ -879,6 +879,57 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
     return ggml_get_dequant_sycl<sycl::half>(type, dst);
 }
 
+// a reordered tensor keeps each field in its own stream over the whole tensor, so a row slice needs
+// the block offset and the total block count; only the layouts listed here can be sliced. nr == 0 only asks
+bool ggml_sycl_dequant_rows_to_f16(ggml_tensor * dst, const void * src0_dd, int64_t r0, int64_t nr, sycl::half * y,
+                                   dpct::queue_ptr stream) {
+    const ggml_tensor * src0 = dst->src[0];
+    const int64_t       ne00 = src0->ne[0];
+    if (!is_reordered_src0(dst)) {
+        const to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(src0->type, dst);
+        if (!to_fp16) {
+            return false;
+        }
+        if (nr > 0) {
+            to_fp16((const char *) src0_dd + r0 * ggml_row_size(src0->type, ne00), y, nr * ne00, stream);
+        }
+        return true;
+    }
+    if (src0_dd != src0->data || (src0->type != GGML_TYPE_Q8_0 && src0->type != GGML_TYPE_Q6_K)) {
+        return false;
+    }
+    if (nr == 0) {
+        return true;
+    }
+    switch (src0->type) {
+        case GGML_TYPE_Q8_0: {
+            const int64_t   n_blocks = ggml_nelements(src0) / QK8_0;
+            const int64_t   ib0      = r0 * ne00 / QK8_0;
+            const int64_t   nb       = nr * ne00 / QK8_0;
+            const int8_t *  qs       = (const int8_t *) src0_dd;
+            const sycl::half * d     = (const sycl::half *) (qs + n_blocks * QK8_0);
+            stream->parallel_for(sycl::range<1>(nb * QK8_0), [=](sycl::id<1> i) {
+                const int64_t ib = ib0 + i[0] / QK8_0;
+                y[i[0]] = (sycl::half) ((float) d[ib] * qs[ib0 * QK8_0 + i[0]]);
+            });
+            return true;
+        }
+        case GGML_TYPE_Q6_K: {
+            const int64_t n_blocks = ggml_nelements(src0) / QK_K;
+            const int64_t ib0      = r0 * ne00 / QK_K;
+            const int64_t nb       = nr * ne00 / QK_K;
+            stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb * 64), sycl::range<3>(1, 1, 64)),
+                                 [=](sycl::nd_item<3> it) {
+                                     const int64_t g = it.get_group(2);
+                                     dequantize_block_q6_K_reorder(src0_dd, y + g * QK_K, ib0 + g, it, n_blocks);
+                                 });
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
 to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
     return ggml_get_dequant_sycl<float>(type, dst);
 }

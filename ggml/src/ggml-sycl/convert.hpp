@@ -23,6 +23,10 @@ typedef to_t_sycl_t<sycl::half> to_fp16_sycl_t;
 to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst);
 to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor * dst);
 
+// dequantize rows [r0, r0 + nr) of dst->src[0] (data at src0_dd) to f16; false if its layout can not be sliced
+bool ggml_sycl_dequant_rows_to_f16(ggml_tensor * dst, const void * src0_dd, int64_t r0, int64_t nr, sycl::half * y,
+                                   dpct::queue_ptr stream);
+
 #ifdef GGML_SYCL_HAS_BF16
 typedef to_t_sycl_t<sycl::ext::oneapi::bfloat16> to_bf16_sycl_t;
 to_bf16_sycl_t ggml_get_to_bf16_sycl(ggml_type type, ggml_tensor * dst);

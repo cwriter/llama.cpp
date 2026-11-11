@@ -4274,38 +4274,55 @@ inline void ggml_sycl_op_mul_mat_sycl(
                 ? (const sycl::half *)src1_ddf_i
                 : src1_as_f16.get();
 
+        // the f16 copy of src0 is pool scratch outside the graph plan: convert a wide weight in row slices
+        // of GGML_SYCL_DEQUANT_SLICE_KIB (0 = whole) and run one GEMM per slice
+        static const size_t slice_bytes = (size_t) ggml_sycl_get_env("GGML_SYCL_DEQUANT_SLICE_KIB", 16384) << 10;
+        int64_t slice_rows = row_diff;
+        if (src0->type != GGML_TYPE_F16 && slice_bytes > 0 && (size_t) row_diff * ne00 * sizeof(sycl::half) > slice_bytes &&
+            ggml_sycl_dequant_rows_to_f16(dst, src0_dd_i, 0, 0, nullptr, stream)) {
+            slice_rows = std::max<int64_t>(64, slice_bytes / (ne00 * sizeof(sycl::half)) / 64 * 64);
+        }
+
         ggml_sycl_pool_alloc<sycl::half> src0_as_f16(ctx.pool());
         if (src0->type != GGML_TYPE_F16) {
-            scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
-                                                 " : converting src0 to fp16");
-            const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
-            GGML_ASSERT(to_fp16_sycl != nullptr);
-            size_t ne = row_diff*ne00;
-            src0_as_f16.alloc(ne);
-            to_fp16_sycl(src0_dd_i, src0_as_f16.get(), ne, stream);
+            src0_as_f16.alloc(std::min(slice_rows, row_diff) * ne00);
         }
-        const sycl::half *src0_ptr = src0->type == GGML_TYPE_F16
-                                         ? (const sycl::half *)src0_dd_i
-                                         : src0_as_f16.get();
+        for (int64_t r0 = 0; r0 < row_diff; r0 += slice_rows) {
+            const int64_t nr = std::min(slice_rows, row_diff - r0);
+            const sycl::half * src0_ptr = (const sycl::half *) src0_dd_i + r0 * ne00;
+            if (src0->type != GGML_TYPE_F16) {
+                scope_op_debug_print scope_dbg_print(__func__, "/to_fp16_sycl", dst, /*num_src=*/2,
+                                                     " : converting src0 to fp16");
+                if (nr == row_diff) {
+                    const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src0->type, dst);
+                    GGML_ASSERT(to_fp16_sycl != nullptr);
+                    to_fp16_sycl(src0_dd_i, src0_as_f16.get(), row_diff * ne00, stream);
+                } else {
+                    GGML_ASSERT(ggml_sycl_dequant_rows_to_f16(dst, src0_dd_i, r0, nr, src0_as_f16.get(), stream));
+                }
+                src0_ptr = src0_as_f16.get();
+            }
+            float * dst_ptr = dst_dd_i + r0;
 
 #if GGML_SYCL_DNNL
-        if (g_ggml_sycl_enable_dnn && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
-                DnnlGemmWrapper::row_gemm(ctx,row_diff, src1_ncols , ne10, src0_ptr,
-                                     DnnlGemmWrapper::to_dt<sycl::half>(), src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
-                                      dst_dd_i, DnnlGemmWrapper::to_dt<float>(), stream);
-        }
-        else
+            if (g_ggml_sycl_enable_dnn && ggml_sycl_dnnl_has_optimized_gemm(ggml_sycl_get_device())) {
+                DnnlGemmWrapper::row_gemm(ctx, nr, src1_ncols, ne10, src0_ptr, DnnlGemmWrapper::to_dt<sycl::half>(),
+                                          src1_ptr, DnnlGemmWrapper::to_dt<sycl::half>(), dst_ptr,
+                                          DnnlGemmWrapper::to_dt<float>(), stream, true, nr == row_diff ? 0 : ldc);
+            }
+            else
 #endif
-        {
-            const float alpha = 1.0f;
-            const float beta  = 0.0f;
-            SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm(
-                *stream, oneapi::mkl::transpose::trans,
-                oneapi::mkl::transpose::nontrans, row_diff, src1_ncols, ne10,
-                &alpha, src0_ptr, dpct::library_data_t::real_half, ne00,
-                src1_ptr, dpct::library_data_t::real_half, ne10, &beta,
-                dst_dd_i, dpct::library_data_t::real_float, ldc,
-                dpct::library_data_t::real_float)));
+            {
+                const float alpha = 1.0f;
+                const float beta  = 0.0f;
+                SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm(
+                    *stream, oneapi::mkl::transpose::trans,
+                    oneapi::mkl::transpose::nontrans, nr, src1_ncols, ne10,
+                    &alpha, src0_ptr, dpct::library_data_t::real_half, ne00,
+                    src1_ptr, dpct::library_data_t::real_half, ne10, &beta,
+                    dst_ptr, dpct::library_data_t::real_float, ldc,
+                    dpct::library_data_t::real_float)));
+            }
         }
     } else {
         ggml_sycl_pool_alloc<float> src0_ddq_as_f32(ctx.pool());

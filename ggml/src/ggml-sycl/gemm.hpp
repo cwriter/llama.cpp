@@ -40,7 +40,8 @@ public:
     static void gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,
         const void * a, dt at, dnnl_dim_t stra0, dnnl_dim_t stra1, dnnl_dim_t stra2,
         const void * b, dt bt, dnnl_dim_t strb0, dnnl_dim_t strb1, dnnl_dim_t strb2,
-        void * c, dt ct, const queue_ptr & q, dnnl_dim_t batches_a, dnnl_dim_t batches_b, bool f16_math = true) {
+        void * c, dt ct, const queue_ptr & q, dnnl_dim_t batches_a, dnnl_dim_t batches_b, bool f16_math = true,
+        dnnl_dim_t ldc = 0) {
 
         auto stream = ctx.stream_dnnl(q);
         auto eng = ctx.engine_dnnl(q);
@@ -54,7 +55,10 @@ public:
         const auto b_in_md = dnnl::memory::desc(b_dims, bt, b_strides);
 
         dnnl::memory::dims c_dims = { std::max(batches_a, batches_b), m, n};
-        dnnl::memory::dims c_strides = {m*n, 1,  m };
+        if (ldc <= 0) {
+            ldc = m;
+        }
+        dnnl::memory::dims c_strides = {ldc*n, 1, ldc };
         const auto c_md    = dnnl::memory::desc(c_dims, ct, c_strides);
         dnnl::primitive_attr primitive_attr;
         primitive_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
@@ -94,9 +98,10 @@ public:
     }
 
     static void row_gemm(ggml_backend_sycl_context & ctx, int m, int n, int k,
-        const void * a, dt at, const void * b, dt bt, void * c, dt ct, const queue_ptr & q, bool f16_math = true) {
+        const void * a, dt at, const void * b, dt bt, void * c, dt ct, const queue_ptr & q, bool f16_math = true,
+        int ldc = 0) {
 
-        gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1, f16_math);
+        gemm(ctx, m, n, k, a, at, 1, k, k * m, b, bt, 1, k, n * k, c, ct, q, 1, 1, f16_math, ldc);
     }
 };
 
