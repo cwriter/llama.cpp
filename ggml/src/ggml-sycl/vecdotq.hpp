@@ -45,44 +45,20 @@ static __dpct_inline__ int get_int_b4(const void * x, const int & i32) {
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
-static __dpct_inline__ int get_int_from_int8(const int8_t* x8, const int& i32) {
-  const uint16_t* x16 =
-      (const uint16_t*)(x8 + sizeof(int) * i32); // assume at least 2 byte
-                                                 // alignment
-
-  int x32 = 0;
-  x32 |= x16[0] << 0;
-  x32 |= x16[1] << 16;
-
-  return x32;
+static __dpct_inline__ int get_int_from_int8(const int8_t * x8, const int & i32) {
+    return get_int_b2(x8, i32);
 }
 
-static __dpct_inline__ int get_int_from_uint8(
-    const uint8_t* x8,
-    const int& i32) {
-  const uint16_t* x16 =
-      (const uint16_t*)(x8 + sizeof(int) * i32); // assume at least 2 byte
-                                                 // alignment
-
-  int x32 = 0;
-  x32 |= x16[0] << 0;
-  x32 |= x16[1] << 16;
-
-  return x32;
+static __dpct_inline__ int get_int_from_uint8(const uint8_t * x8, const int & i32) {
+    return get_int_b2(x8, i32);
 }
 
-static __dpct_inline__ int get_int_from_int8_aligned(
-    const int8_t* x8,
-    const int& i32) {
-  return *(
-      (const int*)(x8 + sizeof(int) * i32)); // assume at least 4 byte alignment
+static __dpct_inline__ int get_int_from_int8_aligned(const int8_t * x8, const int & i32) {
+    return get_int_b4(x8, i32);
 }
 
-static __dpct_inline__ int get_int_from_uint8_aligned(
-    const uint8_t* x8,
-    const int& i32) {
-  return *(
-      (const int*)(x8 + sizeof(int) * i32)); // assume at least 4 byte alignment
+static __dpct_inline__ int get_int_from_uint8_aligned(const uint8_t * x8, const int & i32) {
+    return get_int_b4(x8, i32);
 }
 
 static __dpct_inline__ int byte_sub_4(const int a, const int b) {

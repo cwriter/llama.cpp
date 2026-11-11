@@ -343,15 +343,15 @@ static void group_norm_f32_sycl(const float* x, float* dst,
     }
 }
 
-// do_post_scale folds a SCALE that consumes the norm, so `post_scale`/`post_bias` are its
-// op_params; with the default template argument this is the plain RMS_NORM launcher.
-template <bool do_post_scale = false>
-static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+template <bool do_multiply, bool do_add, bool do_post_scale>
+static void rms_norm_f32_launch(const float* x, float* dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
     const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
     const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
-    const float eps, queue_ptr stream, int device, const float post_scale = 1.0f, const float post_bias = 0.0f) {
-    // printf("%s ncols=%d, nrows=%d, WARP_SIZE=%d\n", __func__, ncols, nrows, WARP_SIZE);
-
+    const float eps, queue_ptr stream, int device, const float post_scale, const float post_bias,
+    const float * mul, const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
+    const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
+    const float * add, const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
+    const int add_nrows, const int add_nchannels, const int add_nsamples) {
     const sycl::range<3> global_dims(nsamples, nchannels, nrows);
     if (ncols < 1024) {
         const sycl::range<3> block_dims(1, 1, WARP_SIZE);
@@ -360,11 +360,13 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
                 sycl::nd_range<3>(global_dims * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
                 [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<false, false, do_post_scale>(x, dst, ncols,
+                    rms_norm_f32<do_multiply, do_add, do_post_scale>(x, dst, ncols,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, nullptr, WARP_SIZE,
-                        nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, post_scale, post_bias);
+                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+                        add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows, add_nchannels, add_nsamples,
+                        post_scale, post_bias);
                 });
             });
     }
@@ -372,11 +374,6 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
         const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
         assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
         const sycl::range<3> block_dims(1, 1, work_group_size);
-        /*
-        DPCT1049:19: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
         stream->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE),
                 cgh);
@@ -384,14 +381,29 @@ static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const
                 sycl::nd_range<3>(global_dims * block_dims, block_dims),
                 [=](sycl::nd_item<3> item_ct1)
                 [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<false, false, do_post_scale>(x, dst, ncols,
+                    rms_norm_f32<do_multiply, do_add, do_post_scale>(x, dst, ncols,
                         src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
                         dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
                         eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
-                        nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, post_scale, post_bias);
+                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+                        add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows, add_nchannels, add_nsamples,
+                        post_scale, post_bias);
                 });
             });
     }
+}
+
+// do_post_scale folds a SCALE that consumes the norm.
+template <bool do_post_scale = false>
+static void rms_norm_f32_sycl(const float* x, float* dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+    const int64_t src_stride_col, const int64_t src_stride_row, const int64_t src_stride_channel, const int64_t src_stride_sample,
+    const int64_t dst_stride_col, const int64_t dst_stride_row, const int64_t dst_stride_channel, const int64_t dst_stride_sample,
+    const float eps, queue_ptr stream, int device, const float post_scale = 1.0f, const float post_bias = 0.0f) {
+    rms_norm_f32_launch<false, false, do_post_scale>(x, dst, ncols, nrows, nchannels, nsamples,
+        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
+        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
+        eps, stream, device, post_scale, post_bias,
+        nullptr, 0, 0, 0, 0, 0, 0, nullptr, 0, 0, 0, 0, 0, 0);
 }
 
 static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, const int ncols, const int nrows,
@@ -401,40 +413,12 @@ static void rms_norm_mul_f32_sycl(const float* x, const float* mul, float* dst, 
         const int64_t mul_stride_row, const int64_t mul_stride_channel, const int64_t mul_stride_sample,
         const int mul_nrows, const int mul_nchannels, const int mul_nsamples,
         const float eps, queue_ptr stream, int device) {
-    const sycl::range<3> global_dims(nsamples, nchannels, nrows);
-    if (ncols < 1024) {
-        const sycl::range<3> block_dims(1, 1, WARP_SIZE);
-        stream->submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<true>(x, dst, ncols,
-                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
-                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, nullptr, WARP_SIZE,
-                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples);
-                });
-            });
-    }
-    else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
-        assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
-        const sycl::range<3> block_dims(1, 1, work_group_size);
-        stream->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<true>(x, dst, ncols,
-                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
-                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
-                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples);
-                });
-            });
-    }
+    rms_norm_f32_launch<true, false, false>(x, dst, ncols, nrows, nchannels, nsamples,
+        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
+        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
+        eps, stream, device, 1.0f, 0.0f,
+        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+        nullptr, 0, 0, 0, 0, 0, 0);
 }
 
 static void rms_norm_mul_add_f32_sycl(const float* x, const float* mul, const float* add, float* dst,
@@ -446,42 +430,12 @@ static void rms_norm_mul_add_f32_sycl(const float* x, const float* mul, const fl
         const int64_t add_stride_row, const int64_t add_stride_channel, const int64_t add_stride_sample,
         const int add_nrows, const int add_nchannels, const int add_nsamples,
         const float eps, queue_ptr stream, int device) {
-    const sycl::range<3> global_dims(nsamples, nchannels, nrows);
-    if (ncols < 1024) {
-        const sycl::range<3> block_dims(1, 1, WARP_SIZE);
-        stream->submit([&](sycl::handler& cgh) {
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<true, true>(x, dst, ncols,
-                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
-                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, nullptr, WARP_SIZE,
-                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows, add_nchannels, add_nsamples);
-                });
-            });
-    }
-    else {
-        const int work_group_size = ggml_sycl_info().max_work_group_sizes[device];
-        assert(work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
-        const sycl::range<3> block_dims(1, 1, work_group_size);
-        stream->submit([&](sycl::handler& cgh) {
-            sycl::local_accessor<float, 1> s_sum_acc_ct1(sycl::range<1>(work_group_size / WARP_SIZE), cgh);
-            cgh.parallel_for(
-                sycl::nd_range<3>(global_dims * block_dims, block_dims),
-                [=](sycl::nd_item<3> item_ct1)
-                [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
-                    rms_norm_f32<true, true>(x, dst, ncols,
-                        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
-                        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
-                        eps, item_ct1, get_pointer(s_sum_acc_ct1), work_group_size,
-                        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
-                        add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows, add_nchannels, add_nsamples);
-                });
-            });
-    }
+    rms_norm_f32_launch<true, true, false>(x, dst, ncols, nrows, nchannels, nsamples,
+        src_stride_col, src_stride_row, src_stride_channel, src_stride_sample,
+        dst_stride_col, dst_stride_row, dst_stride_channel, dst_stride_sample,
+        eps, stream, device, 1.0f, 0.0f,
+        mul, mul_stride_row, mul_stride_channel, mul_stride_sample, mul_nrows, mul_nchannels, mul_nsamples,
+        add, add_stride_row, add_stride_channel, add_stride_sample, add_nrows, add_nchannels, add_nsamples);
 }
 
 template<int warp_size>
