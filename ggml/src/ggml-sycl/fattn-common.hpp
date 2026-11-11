@@ -1138,6 +1138,14 @@ void launch_fattn(
             }
         }
 
+        // the split-K partials are parallel_blocks x the f32 output, pool scratch outside the graph plan:
+        // keep them within a quarter of GGML_SYCL_FA_MAX_MEM_MIB, a big batch has enough tiles without the split
+        if (g_ggml_sycl_fa_max_mem_mib > 0) {
+            const size_t budget = ((size_t) g_ggml_sycl_fa_max_mem_mib << 20) / 4;
+            const size_t per_block = (size_t) ggml_nelements(KQV) * sizeof(float);
+            parallel_blocks = std::max(1, std::min(parallel_blocks, (int) (budget / per_block)));
+        }
+
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
