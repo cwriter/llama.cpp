@@ -1108,9 +1108,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "SEND",
+    "RECV",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,9 +1227,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "send(x)",
+    "recv(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4022,6 +4028,43 @@ struct ggml_tensor * ggml_get_rows(
     result->op     = GGML_OP_GET_ROWS;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_send_rows
+
+struct ggml_tensor * ggml_send_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b) {
+    GGML_ASSERT(a->ne[2] == b->ne[1]);
+    GGML_ASSERT(a->ne[3] == b->ne[2]);
+    GGML_ASSERT(b->ne[3] == 1);
+    GGML_ASSERT(b->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, a->type, a->ne[0], b->ne[0], b->ne[1], b->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, GGML_SEND_CODEC_ROWS);
+
+    result->op     = GGML_OP_SEND;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+// ggml_recv_rows
+
+struct ggml_tensor * ggml_recv_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params_i32(result, 0, GGML_SEND_CODEC_ROWS);
+
+    result->op     = GGML_OP_RECV;
+    result->src[0] = a;
 
     return result;
 }

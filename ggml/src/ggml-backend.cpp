@@ -960,6 +960,21 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// A split input that crosses the boundary as a SEND/RECV pair instead of a plain copy (GGML_SCHED_SEND_RECV=1).
+// SEND computes a package on the producer, the package is what is copied, and RECV on each consumer expands it
+// into the tensor the graph reads. A pair is only formed where both backends support their half; every other
+// input keeps the plain copy.
+struct ggml_backend_sched_channel {
+    struct ggml_tensor * src;  // the split input, as the graph reads it
+    struct ggml_tensor * root; // the GET_ROWS that computes it
+    struct ggml_tensor * send; // the package, computed on the producer
+    struct ggml_tensor * recv[GGML_SCHED_MAX_BACKENDS]; // the expansion on each consumer, NULL for a plain copy
+    int  recv_split[GGML_SCHED_MAX_BACKENDS];           // the split that copies and expands it
+    // another view of a root that already crosses: recv is a view of that pair's RECV, and nothing is copied
+    bool alias[GGML_SCHED_MAX_BACKENDS];
+    bool drop_root;            // nothing on the producer reads root: it computes the package only
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1028,6 +1043,16 @@ struct ggml_backend_sched {
     bool op_offload;
 
     enum ggml_backend_sched_seam_mode seam_mode;
+
+    // SEND/RECV pairs on the split boundaries [GGML_SCHED_SEND_RECV]
+    bool send_recv;
+    struct ggml_backend_sched_channel * channels;
+    int n_channels;
+    int channels_capacity;
+    // with any pair, the split graphs are views of this node list instead of the user graph
+    struct ggml_tensor ** exec_nodes;
+    int exec_capacity;
+    struct ggml_cgraph exec_graph;
 
     int debug;
 
@@ -1234,6 +1259,8 @@ static void ggml_backend_sched_dump_graph(ggml_backend_sched_t sched, struct ggm
     fclose(f);
 }
 
+static struct ggml_tensor * ggml_backend_sched_input_source(ggml_backend_sched_t sched, struct ggml_tensor * src, int backend_id);
+
 static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     int cur_split = 0;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -1245,8 +1272,9 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
                 if (j == 0) {
                     GGML_LOG_DEBUG(": ");
                 }
-                GGML_LOG_DEBUG("[%s (%5.5s)] ", sched->splits[cur_split].inputs[j]->name,
-                    fmt_size(ggml_nbytes(sched->splits[cur_split].inputs[j])));
+                struct ggml_tensor * input = sched->splits[cur_split].inputs[j];
+                struct ggml_tensor * copied = ggml_backend_sched_input_source(sched, input, sched->splits[cur_split].backend_id);
+                GGML_LOG_DEBUG("[%s (%5.5s)%s] ", input->name, fmt_size(ggml_nbytes(copied)), copied != input ? " send/recv" : "");
             }
             GGML_LOG_DEBUG("\n");
             cur_split++;
@@ -1553,11 +1581,254 @@ static void ggml_backend_sched_minimize_seams(ggml_backend_sched_t sched, struct
     }
 }
 
+static struct ggml_backend_sched_channel * ggml_backend_sched_channel_of(ggml_backend_sched_t sched, const struct ggml_tensor * src) {
+    for (int i = 0; i < sched->n_channels; i++) {
+        if (sched->channels[i].src == src) {
+            return &sched->channels[i];
+        }
+    }
+    return NULL;
+}
+
+// the RECV that replaces the copy of src on backend_id, or NULL for a plain copy
+static struct ggml_tensor * ggml_backend_sched_recv_of(ggml_backend_sched_t sched, const struct ggml_tensor * src, int backend_id) {
+    struct ggml_backend_sched_channel * ch = ggml_backend_sched_channel_of(sched, src);
+    return ch ? ch->recv[backend_id] : NULL;
+}
+
+// what is copied for split input src into backend_id: the package of its pair, or src itself
+static struct ggml_tensor * ggml_backend_sched_input_source(ggml_backend_sched_t sched, struct ggml_tensor * src, int backend_id) {
+    struct ggml_backend_sched_channel * ch = ggml_backend_sched_channel_of(sched, src);
+    return ch && ch->recv[backend_id] && ch->send ? ch->send : src;
+}
+
+// a view of the RECV that already brings src's GET_ROWS to backend_id, for a second view of the same rows, or NULL.
+// The rows then cross once: src gets no copy of its own and is not an input of the split
+static struct ggml_tensor * ggml_backend_sched_alias_channel(ggml_backend_sched_t sched, struct ggml_tensor * src,
+        int backend_id, int i_split) {
+    if (sched->n_channels == 0) {
+        return NULL;
+    }
+    struct ggml_tensor * root = src->view_src ? src->view_src : src;
+    struct ggml_backend_sched_channel * base = NULL;
+    for (int c = 0; c < sched->n_channels && base == NULL; c++) {
+        struct ggml_backend_sched_channel * ch = &sched->channels[c];
+        if (ch->root == root && ch->src != src && ch->recv[backend_id] != NULL && !ch->alias[backend_id]) {
+            base = ch;
+        }
+    }
+    if (base == NULL || (src != root && (src->view_offs != 0 || !ggml_is_contiguous(src))) ||
+        ggml_nelements(src) != ggml_nelements(root) || (src->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return NULL;
+    }
+
+    struct ggml_tensor * view = ggml_view_4d(sched->ctx, base->recv[backend_id], src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+            src->nb[1], src->nb[2], src->nb[3], 0);
+    ggml_format_name(view, "%s#%s#recv", ggml_backend_name(sched->backends[backend_id]), src->name);
+
+    if (sched->n_channels == sched->channels_capacity) {
+        sched->channels_capacity *= 2;
+        sched->channels = (struct ggml_backend_sched_channel *) realloc(sched->channels,
+                sched->channels_capacity * sizeof(struct ggml_backend_sched_channel));
+        GGML_ASSERT(sched->channels != NULL);
+    }
+    struct ggml_backend_sched_channel * ch = &sched->channels[sched->n_channels++];
+    memset(ch, 0, sizeof(*ch));
+    ch->src  = src;
+    ch->root = root;
+    ch->send = NULL;
+    ch->recv[backend_id]       = view;
+    ch->recv_split[backend_id] = i_split;
+    ch->alias[backend_id]      = true;
+    return view;
+}
+
+// the SEND/RECV pair for split input src, copied from src_backend_id into backend_id in split i_split, or NULL when
+// the input keeps the plain copy. Only structure decides, never sizes: a graph of the same shape always gets the
+// same pairs, so ggml-alloc can keep its plan from one ubatch to the next
+static struct ggml_tensor * ggml_backend_sched_open_channel(ggml_backend_sched_t sched, struct ggml_tensor * src,
+        int src_backend_id, int backend_id, int i_split) {
+    if (!sched->send_recv || sched->callback_eval) {
+        return NULL;
+    }
+    // GGML_SEND_CODEC_ROWS: the f32 rows of a GET_ROWS of a narrower table, or a reshape of all of them
+    struct ggml_tensor * root = src->view_src ? src->view_src : src;
+    if (root->op != GGML_OP_GET_ROWS || root->view_src != NULL || root->type != GGML_TYPE_F32 ||
+        root->src[0]->type == GGML_TYPE_F32 || root->src[0]->type == GGML_TYPE_I32 || !ggml_is_contiguous(root)) {
+        return NULL;
+    }
+    if (src != root && (src->view_offs != 0 || !ggml_is_contiguous(src) || ggml_nelements(src) != ggml_nelements(root))) {
+        return NULL;
+    }
+    if ((root->flags | src->flags) & GGML_TENSOR_FLAG_OUTPUT) {
+        return NULL;
+    }
+
+    struct ggml_backend_sched_channel * ch = ggml_backend_sched_channel_of(sched, src);
+    struct ggml_tensor * send = ch ? ch->send : NULL;
+    // another view of the same rows, crossing to another backend, sends the same package
+    for (int c = 0; c < sched->n_channels && send == NULL; c++) {
+        if (sched->channels[c].root == root && sched->channels[c].send != NULL) {
+            send = sched->channels[c].send;
+        }
+    }
+    if (send == NULL) {
+        send = ggml_send_rows(sched->ctx, root->src[0], root->src[1]);
+        ggml_format_name(send, "%s#send", root->name);
+        // the backends skip nodes that ggml_build_forward_expand did not mark; these never pass through it
+        send->flags |= GGML_TENSOR_FLAG_COMPUTE;
+        if (!ggml_backend_supports_op(sched->backends[src_backend_id], send)) {
+            return NULL;
+        }
+    }
+
+    // src[0] is pointed at the copy of the package by the caller, once that exists
+    struct ggml_tensor * recv = ggml_dup_tensor_layout(sched->ctx, src);
+    ggml_format_name(recv, "%s#%s#recv", ggml_backend_name(sched->backends[backend_id]), src->name);
+    recv->op = GGML_OP_RECV;
+    recv->op_params[0] = GGML_SEND_CODEC_ROWS;
+    recv->flags |= GGML_TENSOR_FLAG_COMPUTE;
+    recv->src[0] = send; // the layout of the copy, for supports_op
+    const bool ok = ggml_backend_supports_op(sched->backends[backend_id], recv);
+    recv->src[0] = NULL;
+    if (!ok) {
+        return NULL;
+    }
+
+    if (ch == NULL) {
+        if (sched->n_channels == sched->channels_capacity) {
+            sched->channels_capacity = sched->channels_capacity ? 2*sched->channels_capacity : 16;
+            sched->channels = (struct ggml_backend_sched_channel *) realloc(sched->channels,
+                    sched->channels_capacity * sizeof(struct ggml_backend_sched_channel));
+            GGML_ASSERT(sched->channels != NULL);
+        }
+        ch = &sched->channels[sched->n_channels++];
+        memset(ch, 0, sizeof(*ch));
+        ch->src  = src;
+        ch->root = root;
+        ch->send = send;
+    }
+    ch->recv[backend_id]       = recv;
+    ch->recv_split[backend_id] = i_split;
+    return recv;
+}
+
+static const struct ggml_tensor * ggml_backend_sched_base(const struct ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+// a pair lets the producer skip the GET_ROWS itself when nothing on it reads the result: no local node, no plain
+// copy to another backend, and not a graph output
+static void ggml_backend_sched_decide_drops(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    for (int c = 0; c < sched->n_channels; c++) {
+        sched->channels[c].drop_root = true;
+    }
+    auto keep = [sched](const struct ggml_tensor * t) {
+        const struct ggml_tensor * base = ggml_backend_sched_base(t);
+        for (int c = 0; c < sched->n_channels; c++) {
+            if (sched->channels[c].root == base) {
+                sched->channels[c].drop_root = false;
+            }
+        }
+    };
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->flags & GGML_TENSOR_FLAG_OUTPUT) {
+            keep(node);
+        }
+        if (ggml_is_view_op(node->op)) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j] != NULL) {
+                keep(node->src[j]);
+            }
+        }
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        for (int j = 0; j < split->n_inputs; j++) {
+            if (ggml_backend_sched_recv_of(sched, split->inputs[j], split->backend_id) == NULL) {
+                keep(split->inputs[j]);
+            }
+        }
+    }
+}
+
+static bool ggml_backend_sched_dropped(ggml_backend_sched_t sched, const struct ggml_tensor * node) {
+    const struct ggml_tensor * base = ggml_backend_sched_base(node);
+    for (int c = 0; c < sched->n_channels; c++) {
+        if (sched->channels[c].root == base) {
+            return sched->channels[c].drop_root;
+        }
+    }
+    return false;
+}
+
+// the split graphs with the pairs in them: each split starts with the RECVs of its inputs, and a SEND follows its
+// GET_ROWS, or takes its place when the GET_ROWS is dropped
+static void ggml_backend_sched_build_exec_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    int n_extra = sched->n_channels;
+    for (int c = 0; c < sched->n_channels; c++) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            n_extra += sched->channels[c].recv[b] != NULL;
+        }
+    }
+    if (sched->exec_capacity < graph->n_nodes + n_extra) {
+        sched->exec_capacity = graph->n_nodes + n_extra;
+        sched->exec_nodes = (struct ggml_tensor **) realloc(sched->exec_nodes, sched->exec_capacity * sizeof(struct ggml_tensor *));
+        GGML_ASSERT(sched->exec_nodes != NULL);
+    }
+
+    int n = 0;
+    std::vector<int> bounds(sched->n_splits + 1);
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
+        bounds[i] = n;
+        for (int c = 0; c < sched->n_channels; c++) {
+            struct ggml_backend_sched_channel * ch = &sched->channels[c];
+            if (ch->recv[split->backend_id] != NULL && ch->recv_split[split->backend_id] == i) {
+                sched->exec_nodes[n++] = ch->recv[split->backend_id];
+            }
+        }
+        for (int j = split->i_start; j < split->i_end; j++) {
+            struct ggml_tensor * node = graph->nodes[j];
+            // drop_root is the same for every channel of a root
+            if (!ggml_backend_sched_dropped(sched, node)) {
+                sched->exec_nodes[n++] = node;
+            }
+            // one SEND per package: views of the same rows share it
+            for (int c = 0; c < sched->n_channels; c++) {
+                struct ggml_tensor * send = sched->channels[c].send;
+                bool first = send != NULL && sched->channels[c].root == node;
+                for (int k = 0; k < c && first; k++) {
+                    first = sched->channels[k].send != send;
+                }
+                if (first) {
+                    sched->exec_nodes[n++] = send;
+                }
+            }
+        }
+    }
+    bounds[sched->n_splits] = n;
+    GGML_ASSERT(n <= sched->exec_capacity);
+
+    sched->exec_graph         = *graph;
+    sched->exec_graph.size    = sched->exec_capacity;
+    sched->exec_graph.n_nodes = n;
+    sched->exec_graph.nodes   = sched->exec_nodes;
+    for (int i = 0; i < sched->n_splits; i++) {
+        sched->splits[i].graph = ggml_graph_view(&sched->exec_graph, bounds[i], bounds[i + 1]);
+    }
+}
+
 // the inputs that one upload per split can carry: host tensors of this graph (inputs set by the user, or computed by
 // an earlier split on the CPU), never a weight, and only where the split backend stores the bytes as they are
 static bool ggml_backend_sched_input_packable(ggml_backend_sched_t sched, int backend_id, struct ggml_tensor * t) {
-    const struct ggml_tensor * root = t->view_src ? t->view_src : t;
-    return root->buffer == NULL && tensor_backend_id(t) == sched->n_backends - 1 && ggml_is_contiguous(t) &&
+    // with a SEND/RECV pair the package is uploaded; its copies are found under t
+    const struct ggml_tensor * src = ggml_backend_sched_input_source(sched, t, backend_id);
+    const struct ggml_tensor * root = src->view_src ? src->view_src : src;
+    return root->buffer == NULL && tensor_backend_id(t) == sched->n_backends - 1 && ggml_is_contiguous(src) &&
         ggml_backend_buft_set_tensor_is_copy(sched->bufts[backend_id], tensor_copy(t, backend_id, 0));
 }
 
@@ -1661,6 +1932,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
+    sched->n_channels = 0;
     sched->is_reset = false;
 
     struct ggml_init_params params = {
@@ -1970,17 +2242,33 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
                     // create a copy of the input in the split's backend
+                    struct ggml_tensor * alias = NULL;
+                    if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL && sched->send_recv && !sched->callback_eval) {
+                        alias = ggml_backend_sched_alias_channel(sched, src, cur_backend_id, i_split);
+                        if (alias) {
+                            for (int c = 0; c < sched->n_copies; c++) {
+                                tensor_id_copy(src_id, cur_backend_id, c) = alias;
+                            }
+                            sched->hv_copies_used[sched->n_hv_copies_used++] = src_id * sched->n_backends + cur_backend_id;
+                        }
+                    }
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
+                        // with a SEND/RECV pair, the copies hold the package and the RECV reads the current one
+                        struct ggml_tensor * recv = ggml_backend_sched_open_channel(sched, src, src_backend_id, cur_backend_id, i_split);
+                        struct ggml_tensor * copied = recv ? ggml_backend_sched_channel_of(sched, src)->send : src;
                         for (int c = 0; c < sched->n_copies; c++) {
-                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, src);
-                            ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), src->name, c);
+                            struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, copied);
+                            ggml_format_name(tensor_copy, recv ? "%s#%s#pkg#%d" : "%s#%s#%d", ggml_backend_name(backend), src->name, c);
                             if (sched->n_copies > 1) {
                                 ggml_set_input(tensor_copy);
                                 ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
                             }
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
+                        }
+                        if (recv) {
+                            recv->src[0] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                         }
                         sched->hv_copies_used[sched->n_hv_copies_used++] = src_id * sched->n_backends + cur_backend_id;
                         int n_inputs = split->n_inputs++;
@@ -1989,12 +2277,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         }
                         split->inputs[n_inputs] = src;
                     }
-                    node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                    struct ggml_tensor * recv = sched->n_channels > 0 ? ggml_backend_sched_recv_of(sched, src, cur_backend_id) : NULL;
+                    node->src[j] = recv ? recv : tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
             }
         }
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
+    }
+
+    if (sched->n_channels > 0) {
+        ggml_backend_sched_decide_drops(sched, graph);
     }
 
     if (sched->debug) {
@@ -2077,7 +2370,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         struct ggml_backend_sched_split * split = &sched->splits[i];
         split->graph = ggml_graph_view(graph, split->i_start, split->i_end);
-
+    }
+    if (sched->n_channels > 0) {
+        ggml_backend_sched_build_exec_graph(sched, graph);
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &sched->splits[i];
         ggml_backend_graph_optimize(sched->backends[split->backend_id], &split->graph, &opt_params);
     }
 
@@ -2091,7 +2389,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; i++) {
         total_inputs += sched->splits[i].n_inputs;
     }
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes;
+    // the pairs add a SEND per channel and a RECV per consumer to the nodes
+    int n_pair_nodes = 0;
+    for (int c = 0; c < sched->n_channels; c++) {
+        n_pair_nodes++;
+        for (int b = 0; b < sched->n_backends; b++) {
+            n_pair_nodes += sched->channels[c].recv[b] != NULL;
+        }
+    }
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + total_inputs * 2 * sched->n_copies + n_dep_nodes + n_pair_nodes;
 
     // remember the actual graph_size for performing reallocation checks later
     sched->prev_graph_size = sched->graph_size;
@@ -2123,8 +2429,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             struct ggml_tensor * input_cpy = tensor_id_copy(input_id, split->backend_id, sched->cur_copy);
 
             // add a dependency to the input source so that it is not freed before the copy is done
-            struct ggml_tensor * input_dep = ggml_view_tensor(sched->ctx, input);
-            input_dep->src[0] = input;
+            struct ggml_tensor * copied = ggml_backend_sched_input_source(sched, input, split->backend_id);
+            struct ggml_tensor * input_dep = ggml_view_tensor(sched->ctx, copied);
+            input_dep->src[0] = copied;
             sched->node_backend_ids[graph_copy->n_nodes] = sched->hv_tensor_backend_ids[input_id];
             graph_copy->nodes[graph_copy->n_nodes++] = input_dep;
 
@@ -2133,17 +2440,21 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             graph_copy->nodes[graph_copy->n_nodes++] = input_cpy;
         }
 
-        for (int j = split->i_start; j < split->i_end; j++) {
+        for (int j = 0; j < split->graph.n_nodes; j++) {
+            struct ggml_tensor * node = split->graph.nodes[j];
             assert(graph_copy->size > graph_copy->n_nodes);
-            sched->node_backend_ids[graph_copy->n_nodes] = tensor_backend_id(graph->nodes[j]);
-            graph_copy->nodes[graph_copy->n_nodes++] = graph->nodes[j];
+            // the pairs are not in the user graph, so they have no entry in the hash set
+            const bool pair = node->op == GGML_OP_SEND || node->op == GGML_OP_RECV ||
+                (node->view_src != NULL && node->view_src->op == GGML_OP_RECV);
+            sched->node_backend_ids[graph_copy->n_nodes] = pair ? split->backend_id : tensor_backend_id(node);
+            graph_copy->nodes[graph_copy->n_nodes++] = node;
 
             if (alloc_deps.empty()) {
                 continue;
             }
 
             // add a dependency node so that the kept tensors are not freed before this node is computed
-            auto it = alloc_deps.find(graph->nodes[j]);
+            auto it = alloc_deps.find(node);
             if (it != alloc_deps.end()) {
                 const std::vector<ggml_tensor *> & keep = it->second;
                 for (size_t k = 0; k < keep.size(); k += GGML_MAX_SRC) {
@@ -2289,6 +2600,8 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t split_backend = sched->backends[split_backend_id];
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
+    // with a SEND/RECV pair the package is what crosses; it is computed on the input's backend
+    input = ggml_backend_sched_input_source(sched, input, split_backend_id);
 
     if (input->flags & GGML_TENSOR_FLAG_INPUT) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
@@ -2339,16 +2652,18 @@ static void ggml_backend_sched_upload_packed_inputs(ggml_backend_sched_t sched, 
 
     struct ggml_tensor * blk = sched->pack_blk[b][sched->cur_copy];
     int j = 0;
+    // with a SEND/RECV pair, the package is uploaded in place of the input
+    auto source = [sched, b](struct ggml_tensor * t) { return ggml_backend_sched_input_source(sched, t, b); };
     while (j < split->n_packed) {
         struct ggml_tensor * input = split->inputs[j];
-        if (ggml_nbytes(input) > GGML_SCHED_PACK_SMALL_MAX) {
-            ggml_backend_tensor_copy(input, tensor_copy(input, b, sched->cur_copy));
+        if (ggml_nbytes(source(input)) > GGML_SCHED_PACK_SMALL_MAX) {
+            ggml_backend_tensor_copy(source(input), tensor_copy(input, b, sched->cur_copy));
             j++;
             continue;
         }
         // [j, k) is a run of small inputs, contiguous in the packed buffer
         int k = j;
-        while (k < split->n_packed && ggml_nbytes(split->inputs[k]) <= GGML_SCHED_PACK_SMALL_MAX) {
+        while (k < split->n_packed && ggml_nbytes(source(split->inputs[k])) <= GGML_SCHED_PACK_SMALL_MAX) {
             k++;
         }
         const char * run_begin = (const char *) tensor_copy(input, b, sched->cur_copy)->data;
@@ -2362,7 +2677,8 @@ static void ggml_backend_sched_upload_packed_inputs(ggml_backend_sched_t sched, 
         }
         for (int i = j; i < k; i++) {
             const struct ggml_tensor * input_cpy = tensor_copy(split->inputs[i], b, sched->cur_copy);
-            memcpy(sched->pack_staging + ((const char *) input_cpy->data - run_begin), split->inputs[i]->data, ggml_nbytes(split->inputs[i]));
+            const struct ggml_tensor * src = source(split->inputs[i]);
+            memcpy(sched->pack_staging + ((const char *) input_cpy->data - run_begin), src->data, ggml_nbytes(src));
         }
         ggml_backend_tensor_set(blk, sched->pack_staging, run_begin - (const char *) blk->data, run_size);
         j = k;
@@ -2504,6 +2820,10 @@ ggml_backend_sched_t ggml_backend_sched_new(
         const char * e = getenv("GGML_SCHED_PACK_INPUTS");
         sched->pack_inputs = e ? atoi(e) != 0 : true;
     }
+    {
+        const char * e = getenv("GGML_SCHED_SEND_RECV");
+        sched->send_recv = e ? atoi(e) != 0 : false;
+    }
     sched->hv_tensor_copies      = (ggml_tensor **) calloc(sched->hash_set.size * sched->n_backends * sched->n_copies, sizeof(struct ggml_tensor *));
     sched->hv_copies_used        = (size_t *) malloc(sched->hash_set.size * sched->n_backends * sizeof(size_t));
     sched->n_hv_copies_used      = 0;
@@ -2583,6 +2903,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
+    free(sched->channels);
+    free(sched->exec_nodes);
     free(sched);
 }
 

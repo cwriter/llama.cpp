@@ -474,6 +474,13 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
             return src0->type == GGML_TYPE_F32 && (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
+        case GGML_OP_SEND:
+            return ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_ROWS && op->type == src0->type &&
+                   src1->type == GGML_TYPE_I32;
+        case GGML_OP_RECV:
+            return ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_ROWS && op->type == GGML_TYPE_F32 &&
+                   ggml_get_type_traits(src0->type)->to_float != nullptr && ggml_is_contiguous(src0) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_OUT_PROD:
             return (src0->type == GGML_TYPE_F32 ||
                     ((src0->type == GGML_TYPE_F16 || ggml_is_quantized(src0->type)) && src0->ne[2] == src1->ne[2] && src0->ne[3] == src1->ne[3])) &&

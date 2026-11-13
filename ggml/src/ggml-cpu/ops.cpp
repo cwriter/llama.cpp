@@ -5517,6 +5517,76 @@ void ggml_compute_forward_set_rows(
     }
 }
 
+// ggml_compute_forward_send
+
+// GGML_SEND_CODEC_ROWS: the selected rows as they are stored, so a quantized row is copied as its blocks
+void ggml_compute_forward_send(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_ROWS);
+    GGML_ASSERT(dst->type == src0->type && ggml_is_contiguous_rows(src0));
+
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    const size_t  row_size = ggml_row_size(src0->type, ne00);
+    const int64_t nr       = ggml_nelements(src1);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        const int64_t i12 = i/(ne11*ne10);
+        const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+        const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+        const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+
+        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+
+        memcpy((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3,
+               (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03, row_size);
+    }
+}
+
+// ggml_compute_forward_recv
+
+// GGML_SEND_CODEC_ROWS: expand the rows with the type's to_float, as ggml_compute_forward_get_rows does
+void ggml_compute_forward_recv(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_ROWS);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t nc = src0->ne[0];
+    const int64_t nr = ggml_nrows(src0);
+    const size_t  rs = ggml_row_size(src0->type, nc);
+
+    ggml_to_float_t const to_float = ggml_get_type_traits(src0->type)->to_float;
+    GGML_ASSERT(to_float != nullptr);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t i = ir0; i < ir1; ++i) {
+        to_float((const char *) src0->data + i*rs, (float *) dst->data + i*nc, nc);
+    }
+}
+
 // ggml_compute_forward_get_rows_back
 
 static void ggml_compute_forward_get_rows_back_f32_f16(

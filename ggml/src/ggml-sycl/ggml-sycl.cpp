@@ -76,6 +76,7 @@
 #include "ggml-sycl/fattn-sparse.hpp"
 #include "ggml-sycl/gemm.hpp"
 #include "ggml-sycl/getrows.hpp"
+#include "ggml-sycl/send-recv.hpp"
 #include "ggml-sycl/mem.hpp"
 #include "ggml-sycl/norm.hpp"
 #include "ggml-sycl/presets.hpp"
@@ -2121,11 +2122,15 @@ static size_t ggml_backend_sycl_buffer_type_get_max_alloc_size(ggml_backend_buff
     return std::max(size, ggml_sycl_flash_attn_ext_get_max_alloc_size(tensor));
 }
 
-// a KQ mask is packed into bits on upload (see kq-mask-bits.hpp), and a quantized tensor may be kept reordered or
-// in SoA spans (init_tensor), so their bytes in memory are not the ones they were given
+// a KQ mask is packed into bits on upload (see kq-mask-bits.hpp), a KV cache tensor may be kept in SoA spans and an
+// expert weight reordered (init_tensor), so their bytes in memory are not the ones they were given. Any other
+// quantized tensor is stored as given: init_tensor attaches no layout to it, and to nothing in a compute buffer
 static bool ggml_backend_sycl_buffer_type_set_tensor_is_copy(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     GGML_UNUSED(buft);
-    return !ggml_is_quantized(tensor->type) && !ggml_sycl_kq_mask_eligible(tensor);
+    if (ggml_sycl_kq_mask_eligible(tensor)) {
+        return false;
+    }
+    return !ggml_is_quantized(tensor->type) || (strncmp(tensor->name, "cache_", 6) != 0 && tensor->ne[2] <= 1);
 }
 
 static const ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface = {
@@ -8052,6 +8057,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_GET_ROWS_BACK:
             ggml_sycl_get_rows_back(ctx, dst);
             break;
+        case GGML_OP_RECV:
+            ggml_sycl_op_recv(ctx, dst);
+            break;
         case GGML_OP_SET:
             ggml_sycl_op_set(ctx, dst);
             break;
@@ -11700,6 +11708,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                         return false;
                 }
             }
+        case GGML_OP_RECV:
+            return ggml_sycl_recv_supported(op);
         case GGML_OP_GET_ROWS_BACK:
             // return true;
              return op->type == GGML_TYPE_F32 &&

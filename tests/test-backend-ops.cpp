@@ -2452,6 +2452,34 @@ struct test_swiglu_clamp : public test_case {
 };
 
 // GGML_OP_GET_ROWS
+// GGML_OP_RECV, GGML_SEND_CODEC_ROWS: expanding rows that crossed a backend boundary in the table's own type
+struct test_recv_rows : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR2(type, ne);
+    }
+
+    // an expansion must give the bits the producer's GET_ROWS would have computed
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    test_recv_rows(ggml_type type = GGML_TYPE_IQ4_NL, std::array<int64_t, 4> ne = {160, 16, 4, 1})
+        : type(type), ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * pkg = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(pkg, "pkg");
+
+        ggml_tensor * out = ggml_recv_rows(ctx, pkg);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 struct test_get_rows : public test_case {
     const ggml_type type;
     const int n; // cols
@@ -12171,6 +12199,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_swiglu_clamp(type, { 128, 2, 2, 2 }, v, limit));
             }
         }
+    }
+
+    for (ggml_type type : {GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_recv_rows(type, {ggml_blck_size(type) == 256 ? 2560 : 160, 16, 4, 1}));
+        test_cases.emplace_back(new test_recv_rows(type, {512, 1, 1, 1}));
     }
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {

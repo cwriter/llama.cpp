@@ -1903,6 +1903,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_get_rows_back(params, tensor);
             } break;
+        case GGML_OP_SEND:
+            {
+                ggml_compute_forward_send(params, tensor);
+            } break;
+        case GGML_OP_RECV:
+            {
+                ggml_compute_forward_recv(params, tensor);
+            } break;
         case GGML_OP_SET_ROWS:
             {
                 ggml_compute_forward_set_rows(params, tensor);
@@ -2375,11 +2383,16 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
+        case GGML_OP_SEND:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
                 //n_tasks = n_threads;
                 n_tasks = 1;
+            } break;
+        case GGML_OP_RECV:
+            {
+                n_tasks = n_threads;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:

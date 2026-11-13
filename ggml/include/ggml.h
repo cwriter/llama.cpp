@@ -602,7 +602,18 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // backend boundary pair inserted by ggml_backend_sched (GGML_SCHED_SEND_RECV): SEND packs on the producer,
+        // the package crosses, RECV unpacks on the consumer into the tensor the graph expects
+        GGML_OP_SEND,
+        GGML_OP_RECV,
+
         GGML_OP_COUNT,
+    };
+
+    // how a GGML_OP_SEND / GGML_OP_RECV pair encodes the data it carries (op_params[0])
+    enum ggml_send_codec {
+        // the rows of a GET_ROWS, sent in the source's type and expanded to f32 by RECV
+        GGML_SEND_CODEC_ROWS = 1,
     };
 
     enum ggml_unary_op {
@@ -1745,6 +1756,17 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
+
+    // the rows of a selected by b, in a's own type: no conversion, so a quantized row stays its blocks
+    GGML_API struct ggml_tensor * ggml_send_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,  // data
+            struct ggml_tensor  * b); // row indices
+
+    // the f32 expansion of a package made by ggml_send_rows, in the shape of a
+    GGML_API struct ggml_tensor * ggml_recv_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a); // package
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
