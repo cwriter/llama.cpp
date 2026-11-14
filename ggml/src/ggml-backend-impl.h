@@ -169,6 +169,13 @@ extern "C" {
         // (optional) false when the backend would fuse node_idx - 1 and node_idx, so a device boundary
         // placed between them loses that fusion; used by GGML_BACKEND_SCHED_SEAM_RESPECT_FUSIONS
         bool (*graph_cut_ok)(ggml_backend_t backend, const struct ggml_cgraph * cgraph, int node_idx);
+
+        // (optional) narrow activations [GGML_SCHED_NARROW]: the type in which node reads its f32 src[j], when it
+        // narrows it before use anyway (e.g. a GEMM that converts its activation to f16); src[j]'s own type otherwise
+        enum ggml_type (*src_read_type)(ggml_backend_t backend, const struct ggml_tensor * node, int j);
+        // (optional) whether graph->nodes[node_idx] can be computed with its result stored as type. Its sources
+        // already have the types they will run with
+        bool (*can_store_type)(ggml_backend_t backend, const struct ggml_cgraph * graph, int node_idx, enum ggml_type type);
     };
 
     struct ggml_backend {

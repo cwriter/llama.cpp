@@ -638,6 +638,10 @@ void ggml_sycl_op_rms_norm(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
 
 // dst = rms_norm(x) * s + b, written straight to the SCALE output. The GDN q/k L2 norm is
 // built as ggml_scale(ggml_rms_norm(...)), so this pair is two launches per norm per layer.
+template <typename TD>
+static void rms_norm_gate_launch(ggml_backend_sycl_context & ctx, const float * x, const float * w, const float * g, TD * dst,
+                                 float eps, bool sigmoid, int ncols, int64_t nrows, int64_t n_wg, int rows_per_wg);
+
 // rms_norm(x) * w * gate(g) for rows of ncols, one sub-group per row, so no barrier; gate is sigmoid or silu
 void ggml_sycl_op_rms_norm_gate_fused(ggml_backend_sycl_context & ctx, const ggml_tensor * rms, const ggml_tensor * mul_w,
                                       const ggml_tensor * gate, ggml_tensor * out) {
@@ -646,7 +650,6 @@ void ggml_sycl_op_rms_norm_gate_fused(ggml_backend_sycl_context & ctx, const ggm
     const float * x  = (const float *) xt->data;
     const float * w  = (const float *) (mul_w->src[0] == rms ? mul_w->src[1] : mul_w->src[0])->data;
     const float * g  = (const float *) gate->src[0]->data;
-    float *       dst = (float *) out->data;
     float eps;
     memcpy(&eps, rms->op_params, sizeof(float));
     const bool    sigmoid = ggml_get_unary_op(gate) == GGML_UNARY_OP_SIGMOID;
@@ -654,6 +657,18 @@ void ggml_sycl_op_rms_norm_gate_fused(ggml_backend_sycl_context & ctx, const ggm
     const int64_t nrows   = ggml_nrows(xt);
     constexpr int rows_per_wg = 4;
     const int64_t n_wg = (nrows + rows_per_wg - 1) / rows_per_wg;
+    // the result may be stored as f16 (GGML_SCHED_NARROW)
+    GGML_ASSERT(out->type == GGML_TYPE_F32 || out->type == GGML_TYPE_F16);
+    if (out->type == GGML_TYPE_F16) {
+        rms_norm_gate_launch(ctx, x, w, g, (sycl::half *) out->data, eps, sigmoid, ncols, nrows, n_wg, rows_per_wg);
+    } else {
+        rms_norm_gate_launch(ctx, x, w, g, (float *) out->data, eps, sigmoid, ncols, nrows, n_wg, rows_per_wg);
+    }
+}
+
+template <typename TD>
+static void rms_norm_gate_launch(ggml_backend_sycl_context & ctx, const float * x, const float * w, const float * g, TD * dst,
+                                 float eps, bool sigmoid, int ncols, int64_t nrows, int64_t n_wg, int rows_per_wg) {
     ctx.stream()->parallel_for(
         sycl::nd_range<1>(sycl::range<1>(n_wg * rows_per_wg * WARP_SIZE), sycl::range<1>(rows_per_wg * WARP_SIZE)),
         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
@@ -673,7 +688,7 @@ void ggml_sycl_op_rms_norm_gate_fused(ggml_backend_sycl_context & ctx, const ggm
             for (int c = lane; c < ncols; c += WARP_SIZE) {
                 const float gv = g[row * ncols + c];
                 const float sg_v = 1.0f / (1.0f + sycl::native::exp(-gv));
-                dst[row * ncols + c] = scale * xr[c] * w[c] * (sigmoid ? sg_v : gv * sg_v);
+                dst[row * ncols + c] = (TD) (scale * xr[c] * w[c] * (sigmoid ? sg_v : gv * sg_v));
             }
         });
 }

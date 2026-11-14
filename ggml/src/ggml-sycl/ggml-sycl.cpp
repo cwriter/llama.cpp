@@ -11443,6 +11443,59 @@ static void ggml_backend_sycl_graph_optimize(ggml_backend_t backend, ggml_cgraph
 // GGML_BACKEND_SCHED_SEAM_RESPECT_FUSIONS: false when this backend would fuse node_idx - 1 with node_idx,
 // so a device boundary between them would cost that fusion. Best effort: the absorbed spans, the gated
 // hc_post + norm, rms norm * w (+ rope) and the elementwise pairs; a fusion missing here is cut silently.
+// GGML_SCHED_NARROW: a MUL_MAT of this many columns or more takes the GEMM route, which converts its f32
+// activation to f16 first [TAG_GGML_PREC]. The narrower routes (mat-vec, XMX batch, MMQ, the fused dequant GEMM)
+// stop well below it and read f32
+static bool ggml_sycl_mul_mat_reads_src1_f16(const ggml_tensor * node) {
+#ifdef GGML_SYCL_F16
+    static const int64_t min_cols = ggml_sycl_get_env("GGML_SYCL_NARROW_MIN_COLS", 128);
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    return node->op == GGML_OP_MUL_MAT && node->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
+           (ggml_is_quantized(src0->type) || src0->type == GGML_TYPE_F16) && ggml_is_contiguous(src0) &&
+           ggml_is_contiguous(src1) && src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+           src1->ne[1] >= min_cols && node->op_params[0] == GGML_PREC_DEFAULT &&
+           ggml_get_op_params_i32(node, 1) != GGML_HINT_SRC0_IS_HADAMARD && ggml_sycl_src1_f16_ok(node) &&
+           !(src0->buffer && ggml_backend_buffer_is_sycl_split(src0->buffer));
+#else
+    GGML_UNUSED(node);
+    return false;
+#endif
+}
+
+static ggml_type ggml_backend_sycl_src_read_type(ggml_backend_t backend, const ggml_tensor * node, int j) {
+    GGML_UNUSED(backend);
+    static const bool on = ggml_sycl_get_env("GGML_SYCL_NARROW", 1) != 0;
+    if (on && j == 1 && ggml_sycl_mul_mat_reads_src1_f16(node)) {
+        return GGML_TYPE_F16;
+    }
+    return node->src[j]->type;
+}
+
+// A node may be stored narrower only where every kernel that can write it knows. Decided by structure, since
+// graph_optimize reorders the split later: a gated MUL, x * sigmoid or silu of a gate (the gated norm's output, the
+// attention output gate), is written by the fused gated norm, the UNARY + MUL and gate-view fusions or bin_bcast, and
+// all of them store f16. A MUL right after a norm (norm * weight) is written by the norm fusions, and a gate fed by an
+// ADD by the alpha gate and mat-vec epilogue fusions, which store f32
+static bool ggml_backend_sycl_can_store_type(ggml_backend_t backend, const ggml_cgraph * graph, int node_idx, ggml_type type) {
+    GGML_UNUSED(backend);
+    const ggml_tensor * node = graph->nodes[node_idx];
+    if (type != GGML_TYPE_F16 || node->op != GGML_OP_MUL || node->src[0]->type != GGML_TYPE_F32 ||
+        node->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
+        return false;
+    }
+    auto is_gate = [](const ggml_tensor * u) {
+        return u->op == GGML_OP_UNARY && (ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(u) == GGML_UNARY_OP_SILU) &&
+               u->src[0]->op != GGML_OP_ADD;
+    };
+    const ggml_tensor * u = is_gate(node->src[1]) ? node->src[1] : is_gate(node->src[0]) ? node->src[0] : nullptr;
+    if (u == nullptr) {
+        return false;
+    }
+    const ggml_tensor * x = u == node->src[1] ? node->src[0] : node->src[1];
+    return x->op != GGML_OP_RMS_NORM && x != u;
+}
+
 static bool ggml_backend_sycl_graph_cut_ok(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     if (node_idx <= 0 || node_idx >= cgraph->n_nodes || !g_ggml_sycl_enable_fusion) {
         return true;
@@ -11494,6 +11547,8 @@ static ggml_backend_i ggml_backend_sycl_interface = {
     /* .graph_optimize          = */ ggml_backend_sycl_graph_optimize,
     /* .fusion_absorbs          = */ ggml_backend_sycl_fusion_absorbs,
     /* .graph_cut_ok            = */ ggml_backend_sycl_graph_cut_ok,
+    /* .src_read_type           = */ ggml_backend_sycl_src_read_type,
+    /* .can_store_type          = */ ggml_backend_sycl_can_store_type,
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {

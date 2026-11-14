@@ -416,25 +416,26 @@ static void unary_gated_op_generic_kernel(
 // of `x`: 1 when it has a value per column, 0 when it has one value per row that the MUL
 // broadcasts over the row. `dst` is contiguous and indexed flat. Math is done in f32, as the
 // CPU and CUDA references do.
-template<typename T, typename F>
-static void unary_mul_flat_kernel(const T * x, const T * g, T * dst, const int64_t k, const sycl::nd_item<1> &item_ct1, F op) {
+template<typename T, typename TD, typename F>
+static void unary_mul_flat_kernel(const T * x, const T * g, TD * dst, const int64_t k, const sycl::nd_item<1> &item_ct1, F op) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
-        dst[i] = (T) (op((float) x[i]) * (float) g[i]);
+        dst[i] = (TD) (op((float) x[i]) * (float) g[i]);
     }
 }
 
-template<typename T, typename F>
-static void unary_mul_strided_kernel(const T * x, const T * g, T * dst, const int64_t k, const sycl::uint3 n_fd, const int64_t o0, const int64_t o1, const int64_t c0, const sycl::nd_item<1> &item_ct1, F op) {
+template<typename T, typename TD, typename F>
+static void unary_mul_strided_kernel(const T * x, const T * g, TD * dst, const int64_t k, const sycl::uint3 n_fd, const int64_t o0, const int64_t o1, const int64_t c0, const sycl::nd_item<1> &item_ct1, F op) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
         const sycl::uint2 rc = fast_div_modulo((uint32_t) i, n_fd);
         const int64_t j0 = rc.x() * o0 + rc.y() * c0;
         const int64_t j1 = (o0 == o1 && c0 == 1) ? j0 : rc.x() * o1 + rc.y();
-        dst[i] = (T) (op((float) x[j0]) * (float) g[j1]);
+        dst[i] = (TD) (op((float) x[j0]) * (float) g[j1]);
     }
 }
 
-template<typename T, typename F>
-static void unary_mul_sycl(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const int64_t c0, queue_ptr main_stream, F op) {
+// dst may be narrower than the inputs (an f32 chain stored as f16, GGML_SCHED_NARROW)
+template<typename T, typename TD, typename F>
+static void unary_mul_sycl(const T * x, const T * g, TD * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const int64_t c0, queue_ptr main_stream, F op) {
     const size_t            num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
     const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE));
 
@@ -1113,7 +1114,8 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
 
     // g is picked by elimination; ggml_can_fuse()'s single-use rule rules out MUL(unary, unary)
     GGML_ASSERT(g != unary_node);
-    GGML_ASSERT(x->type == g->type && x->type == mul_node->type);
+    // an f32 chain may store its result as f16
+    GGML_ASSERT(x->type == g->type && (x->type == mul_node->type || (x->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F16)));
     // the unary side either matches the MUL column for column, or holds one value per row that
     // the MUL broadcasts; ggml_sycl_can_fuse() accepts nothing else
     const bool bcast_row = !view && x->ne[0] == 1 && mul_node->ne[0] != 1;
@@ -1131,6 +1133,11 @@ void ggml_sycl_op_unary_mul_fused(ggml_backend_sycl_context & ctx, ggml_tensor *
     const int64_t c0 = bcast_row ? 0 : 1;
 
     const auto dispatch_type = [&](auto op) {
+        if (x->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F16) {
+            unary_mul_sycl((const float *) x->data, (const float *) g->data, (sycl::half *) mul_node->data,
+                           k, n, x->nb[1] / sizeof(float), view ? n : g->nb[1] / sizeof(float), c0, main_stream, op);
+            return;
+        }
         switch (mul_node->type) {
             case GGML_TYPE_F32:
                 unary_mul_sycl((const float *) x->data, (const float *) g->data, (float *) mul_node->data,

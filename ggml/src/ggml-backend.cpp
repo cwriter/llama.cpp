@@ -1049,6 +1049,7 @@ struct ggml_backend_sched {
     // SEND/RECV pairs on the split boundaries [GGML_SCHED_SEND_RECV]
     bool send_recv;
     bool send_bf16; // GGML_SCHED_SEND_BF16: f32 crossings may round to bf16 (lossy)
+    bool narrow;    // GGML_SCHED_NARROW: store activations in the type their readers narrow them to
     struct ggml_backend_sched_channel * channels;
     int n_channels;
     int channels_capacity;
@@ -2095,6 +2096,103 @@ static void ggml_backend_sched_pack_split_inputs(ggml_backend_sched_t sched) {
     }
 }
 
+// strides of a contiguous tensor of type
+static void ggml_backend_sched_set_type(struct ggml_tensor * t, enum ggml_type type) {
+    t->type  = type;
+    t->nb[0] = ggml_type_size(type);
+    t->nb[1] = t->nb[0] * (t->ne[0] / ggml_blck_size(type));
+    for (int k = 2; k < GGML_MAX_DIMS; k++) {
+        t->nb[k] = t->nb[k - 1] * t->ne[k - 1];
+    }
+}
+
+// Store an activation in the type its readers narrow it to anyway [GGML_SCHED_NARROW]: an f32 node whose readers all
+// run on its own backend, and all read it as the same narrower type (src_read_type), takes that type when the backend
+// can write it (can_store_type), and so do the reshapes of it in between. Saves the f32 write, the reader's
+// conversion and half of the tensor's memory. Runs after the backends are assigned and before the splits: a node
+// read on another backend crosses as it is. The answers depend on structure and shapes only, so a graph of the same
+// shape is always typed the same way
+static void ggml_backend_sched_narrow(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    if (!sched->narrow || sched->callback_eval) {
+        return;
+    }
+    std::unordered_map<const struct ggml_tensor *, std::vector<std::pair<struct ggml_tensor *, int>>> readers;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j] != NULL) {
+                readers[node->src[j]].push_back({ node, j });
+            }
+        }
+    }
+    const int32_t keep = GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_PARAM | GGML_TENSOR_FLAG_LOSS;
+    std::vector<struct ggml_tensor *> views;
+    std::vector<std::pair<struct ggml_tensor *, int>> reads;
+    std::vector<const struct ggml_tensor *> stack;
+    for (int i = 0; i < graph->n_nodes; i++) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->type != GGML_TYPE_F32 || ggml_is_view_op(node->op) || node->view_src != NULL || (node->flags & keep) ||
+            !ggml_is_contiguous(node)) {
+            continue;
+        }
+        const int b = tensor_backend_id(node);
+        if (b < 0) {
+            continue;
+        }
+        ggml_backend_t backend = sched->backends[b];
+        if (backend->iface.src_read_type == NULL || backend->iface.can_store_type == NULL) {
+            continue;
+        }
+        // the readers, through reshapes, all on this backend
+        views.clear();
+        reads.clear();
+        stack.assign(1, node);
+        bool ok = true;
+        while (ok && !stack.empty()) {
+            const struct ggml_tensor * t = stack.back();
+            stack.pop_back();
+            auto it = readers.find(t);
+            if (it == readers.end()) {
+                continue;
+            }
+            for (const auto & [r, j] : it->second) {
+                if (tensor_backend_id(r) != b || (r->flags & keep)) {
+                    ok = false;
+                    break;
+                }
+                if (r->op == GGML_OP_RESHAPE) {
+                    views.push_back(r);
+                    stack.push_back(r);
+                } else if (ggml_is_view_op(r->op)) {
+                    ok = false;
+                    break;
+                } else {
+                    reads.push_back({ r, j });
+                }
+            }
+        }
+        if (!ok || reads.empty()) {
+            continue;
+        }
+        enum ggml_type type = GGML_TYPE_COUNT;
+        for (const auto & [r, j] : reads) {
+            const enum ggml_type rt = backend->iface.src_read_type(backend, r, j);
+            if (rt == GGML_TYPE_F32 || (type != GGML_TYPE_COUNT && rt != type)) {
+                ok = false;
+                break;
+            }
+            type = rt;
+        }
+        if (!ok || !backend->iface.can_store_type(backend, graph, i, type)) {
+            continue;
+        }
+        ggml_backend_sched_set_type(node, type);
+        for (struct ggml_tensor * v : views) {
+            ggml_backend_sched_set_type(v, type);
+        }
+    }
+}
+
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     // reset splits
     sched->n_splits = 0;
@@ -2328,6 +2426,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 
     ggml_backend_sched_minimize_seams(sched, graph);
+
+    ggml_backend_sched_narrow(sched, graph);
 
     // pass 5: split graph, find tensors that need to be copied
     {
@@ -3008,6 +3108,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->send_recv = e ? atoi(e) != 0 : true;
         e = getenv("GGML_SCHED_SEND_BF16");
         sched->send_bf16 = e ? atoi(e) != 0 : false;
+        // GGML_SCHED_NARROW=0: keep every activation in the type the graph built it with
+        e = getenv("GGML_SCHED_NARROW");
+        sched->narrow = e ? atoi(e) != 0 : true;
     }
     sched->hv_tensor_copies      = (ggml_tensor **) calloc(sched->hash_set.size * sched->n_backends * sched->n_copies, sizeof(struct ggml_tensor *));
     sched->hv_copies_used        = (size_t *) malloc(sched->hash_set.size * sched->n_backends * sizeof(size_t));
