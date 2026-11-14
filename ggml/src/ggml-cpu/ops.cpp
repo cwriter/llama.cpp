@@ -5519,6 +5519,34 @@ void ggml_compute_forward_set_rows(
 
 // ggml_compute_forward_send
 
+// one row of a 0/-inf mask as bits, bit (i & 31) of word i/32 set where the value is +-0; false if a value is neither
+template <typename T>
+static bool ggml_mask_bits_pack_row(const T * in, int64_t n, uint32_t * out, T abs_mask, T ninf) {
+    T bad = 0;
+    int64_t w = 0;
+    for (; 32*(w + 1) <= n; ++w) {
+        uint32_t word = 0;
+        for (int k = 0; k < 32; ++k) {
+            const T v    = in[32*w + k];
+            const T zero = (T) ((v & abs_mask) == 0);
+            word |= (uint32_t) zero << k;
+            bad  |= (T) (!zero & (T) (v != ninf));
+        }
+        out[w] = word;
+    }
+    if (32*w < n) {
+        uint32_t word = 0;
+        for (int64_t i = 32*w; i < n; ++i) {
+            const T v    = in[i];
+            const T zero = (T) ((v & abs_mask) == 0);
+            word |= (uint32_t) zero << (i & 31);
+            bad  |= (T) (!zero & (T) (v != ninf));
+        }
+        out[w] = word;
+    }
+    return bad == 0;
+}
+
 // GGML_SEND_CODEC_ROWS: the selected rows as they are stored, so a quantized row is copied as its blocks
 void ggml_compute_forward_send(
         const ggml_compute_params * params,
@@ -5530,30 +5558,24 @@ void ggml_compute_forward_send(
     if (ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_MASK_BITS) {
         // one bit per value, set where it is 0; anything but 0 and -inf breaks the mask's promise
         GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst) && src0->nb[0] == ggml_type_size(src0->type));
-        const int64_t ne00 = src0->ne[0];
         const int64_t nw   = dst->ne[0];
         const int64_t nr   = ggml_nrows(src0);
         const int64_t dr   = (nr + params->nth - 1)/params->nth;
         const int64_t ir0  = dr*params->ith;
         const int64_t ir1  = MIN(ir0 + dr, nr);
+        const bool    f16  = src0->type == GGML_TYPE_F16;
         for (int64_t ir = ir0; ir < ir1; ++ir) {
             const int64_t i3 = ir/(src0->ne[2]*src0->ne[1]);
             const int64_t i2 = (ir - i3*src0->ne[2]*src0->ne[1])/src0->ne[1];
             const int64_t i1 = ir - i3*src0->ne[2]*src0->ne[1] - i2*src0->ne[1];
             const char * row = (const char *) src0->data + i1*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3];
             uint32_t * out = (uint32_t *) dst->data + ir*nw;
-            for (int64_t w = 0; w < nw; ++w) {
-                uint32_t word = 0;
-                for (int64_t i0 = w*32; i0 < MIN(ne00, w*32 + 32); ++i0) {
-                    const float v = src0->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i0])
-                                                                : ((const float *) row)[i0];
-                    if (v == 0.0f) {
-                        word |= 1u << (i0 & 31);
-                    } else if (!(std::isinf(v) && v < 0.0f)) {
-                        GGML_ABORT("%s: %s is flagged as a binary mask but holds %g", __func__, src0->name, (double) v);
-                    }
-                }
-                out[w] = word;
+            // on the bit patterns, branch-free over each word so the compiler vectorizes it: +-0 sets the bit, -inf
+            // clears it, and anything else is caught after the row
+            const bool ok = f16 ? ggml_mask_bits_pack_row((const uint16_t *) row, src0->ne[0], out, (uint16_t) 0x7FFF, (uint16_t) 0xFC00)
+                                : ggml_mask_bits_pack_row((const uint32_t *) row, src0->ne[0], out, 0x7FFFFFFFu, 0xFF800000u);
+            if (!ok) {
+                GGML_ABORT("%s: %s is flagged as a binary mask but holds values other than 0 and -inf", __func__, src0->name);
             }
         }
         return;

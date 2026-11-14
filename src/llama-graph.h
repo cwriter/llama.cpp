@@ -5,6 +5,8 @@
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
+#include "ggml-backend.h"
+
 #include <cstdint>
 #include <cstdlib>
 #include <vector>
@@ -115,6 +117,10 @@ public:
     virtual ~llm_graph_input_i() = default;
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
+
+    // the scheduler that runs the graph, for an input that writes its SEND package itself
+    // (ggml_backend_sched_get_input_package); NULL when there is none
+    ggml_backend_sched_t sched = nullptr;
 
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
@@ -951,7 +957,7 @@ public:
 
     void reset();
 
-    void set_inputs(const llama_ubatch * ubatch);
+    void set_inputs(const llama_ubatch * ubatch, ggml_backend_sched_t sched = nullptr);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

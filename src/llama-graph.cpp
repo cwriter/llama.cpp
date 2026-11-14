@@ -1415,8 +1415,9 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
-void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+void llm_graph_result::set_inputs(const llama_ubatch * ubatch, ggml_backend_sched_t sched) {
     for (auto & input : inputs) {
+        input->sched = sched;
         input->set_input(ubatch);
     }
 }

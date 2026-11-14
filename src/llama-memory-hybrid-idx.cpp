@@ -802,7 +802,7 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
 
 void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
         ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos) const {
+        const llama_ubatch * ubatch, ggml_tensor * new_pool_pos, ggml_tensor * pool_mask_bits) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
     GGML_ASSERT(ggml_backend_buffer_is_host(pool_idxs->buffer));
@@ -1040,7 +1040,40 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    if (pool_mask_bits != nullptr) {
+        // GGML_SEND_CODEC_MASK_BITS: one bit per pool, set where the pool is visible. A row is all -inf but for the
+        // visible pools [p0, p0 + nv), so it is a run of set bits
+        const int64_t nw = (n_list + 31)/32;
+        GGML_ASSERT(pool_mask_bits->type == GGML_TYPE_I32 && pool_mask_bits->ne[0] == nw &&
+                    ggml_nrows(pool_mask_bits) == (int64_t) n_tokens && ggml_is_contiguous(pool_mask_bits));
+        uint32_t * bits = (uint32_t *) pool_mask_bits->data;
+        memset(bits, 0, ggml_nbytes(pool_mask_bits));
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id s = ubatch->seq_id[i][0];
+            const llama_pos    p = ubatch->pos[i];
+
+            const uint32_t p0 = seq_pool_start[s];
+            const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
+            const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
+                (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
+
+            uint32_t * row = bits + (size_t) i*nw;
+            for (uint32_t b = p0; b < p0 + nv; ) {
+                const uint32_t w   = b/32;
+                const uint32_t lo  = b%32;
+                const uint32_t n   = std::min(32 - lo, p0 + nv - b);
+                row[w] |= (n == 32 ? ~0u : ((1u << n) - 1)) << lo;
+                b += n;
+            }
+
+            if (gm != nullptr) {
+                const uint32_t nvc = std::min(nv, n_top);
+                float * grow = gm + (size_t) i*n_sel;
+                std::fill(grow,                        grow + (size_t) nvc*kpool,  0.0f);
+                std::fill(grow + (size_t) nvc*kpool,   grow + (size_t) n_top*kpool, -INFINITY);
+            }
+        }
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);

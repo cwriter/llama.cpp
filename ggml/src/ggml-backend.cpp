@@ -1243,14 +1243,16 @@ static void ggml_backend_sched_dump_graph(ggml_backend_sched_t sched, struct ggm
         return b ? ggml_backend_name(b) : "-";
     };
     auto put = [&](const char * kind, int i, const ggml_tensor * t) {
-        fprintf(f, "%s\t%d\t%s\t%s\t%zu\t%s\t%s\t%d", kind, i, ggml_op_desc(t), t->name, ggml_nbytes(t), bname(t),
-                t->view_src ? t->view_src->name : "-", (int) t->flags);
+        fprintf(f, "%s\t%d\t%s\t%s\t%zu\t%s\t%s\t%d\t%s\t%lldx%lldx%lldx%lld", kind, i, ggml_op_desc(t), t->name, ggml_nbytes(t), bname(t),
+                t->view_src ? t->view_src->name : "-", (int) t->flags, ggml_type_name(t->type),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             if (t->src[j]) {
-                fprintf(f, "\t%s|%zu|%s", t->src[j]->name, ggml_nbytes(t->src[j]),
-                        t->src[j]->view_src ? t->src[j]->view_src->name : "-");
+                fprintf(f, "\t%s|%zu|%s|%s|%p", t->src[j]->name, ggml_nbytes(t->src[j]),
+                        t->src[j]->view_src ? t->src[j]->view_src->name : "-", ggml_type_name(t->src[j]->type), (void *) t->src[j]);
             }
         }
+        fprintf(f, "\t@%p", (void *) t);
         fprintf(f, "\n");
     };
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -3212,6 +3214,47 @@ void ggml_backend_sched_set_realloc_callback(ggml_backend_sched_t sched, ggml_ba
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
+}
+
+struct ggml_tensor * ggml_backend_sched_get_input_package(ggml_backend_sched_t sched, struct ggml_tensor * t,
+                                                          enum ggml_send_codec codec) {
+    GGML_ASSERT(sched);
+    if (sched->n_channels == 0 || codec == GGML_SEND_CODEC_COPY || !(t->flags & GGML_TENSOR_FLAG_INPUT)) {
+        return NULL;
+    }
+    // one package for all of t: every channel of t carries t itself, through the same encoding SEND of a graph input
+    struct ggml_backend_sched_channel * ch = NULL;
+    for (int c = 0; c < sched->n_channels; c++) {
+        struct ggml_backend_sched_channel * cc = &sched->channels[c];
+        if (cc->root != t) {
+            continue;
+        }
+        if (cc->src != t || cc->codec != codec || cc->send == NULL || cc->send_split < 0 ||
+            (ch != NULL && ch->send != cc->send)) {
+            return NULL;
+        }
+        ch = cc;
+    }
+    if (ch == NULL || ch->send->data == NULL || !ggml_backend_buffer_is_host(ch->send->buffer)) {
+        return NULL;
+    }
+    // a node that still reads t (or a view of it) runs on t's own backend: the readers elsewhere read their RECV
+    const struct ggml_cgraph * g = &sched->exec_graph;
+    for (int i = 0; i < g->n_nodes; i++) {
+        const struct ggml_tensor * node = g->nodes[i];
+        if (node == ch->send) {
+            continue;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; k++) {
+            const struct ggml_tensor * src = node->src[k];
+            if (src != NULL && (src == t || src->view_src == t)) {
+                return NULL;
+            }
+        }
+    }
+    // the backends skip nodes that are not marked for compute
+    ch->send->flags &= ~GGML_TENSOR_FLAG_COMPUTE;
+    return ch->send;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

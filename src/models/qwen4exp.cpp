@@ -781,8 +781,10 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
+        // when the mask crosses to the devices as bits, write the bits (the SEND is fused into the fill)
+        ggml_tensor * pool_mask_bits = sched ? ggml_backend_sched_get_input_package(sched, pool_mask, GGML_SEND_CODEC_MASK_BITS) : nullptr;
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
-                              ubatch, new_pool_pos);
+                              ubatch, new_pool_pos, pool_mask_bits);
     }
 
     bool can_reuse(const llm_graph_params & params) override {

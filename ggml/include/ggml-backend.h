@@ -353,6 +353,14 @@ extern "C" {
 
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
+
+    // The package a graph input crosses the split boundaries as (GGML_SCHED_SEND_RECV): when every reader of t on
+    // another backend reads it through one SEND/RECV pair of the given codec, and nothing on t's own backend reads t,
+    // returns the package (host memory), and that SEND does not run in this graph. The caller then writes the package
+    // in the codec's format instead of t, every time it sets t: the SEND is fused into the producer. NULL otherwise,
+    // and t is written as usual. Call after the graph is allocated
+    GGML_API struct ggml_tensor * ggml_backend_sched_get_input_package(ggml_backend_sched_t sched, struct ggml_tensor * t,
+                                                                       enum ggml_send_codec codec);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
