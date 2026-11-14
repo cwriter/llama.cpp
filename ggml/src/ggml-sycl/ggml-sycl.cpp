@@ -907,51 +907,73 @@ inline void free_aligned_mem_host(void * memblock) {
 
 // sycl buffer
 
-struct ggml_backend_sycl_buffer_context {
-    // Pinned staging for host uploads. Chunked so the host copy of one chunk runs while the
-    // previous chunk is still on the wire.
-    static constexpr size_t staging_chunk_max = 8*1024*1024;
-    static constexpr size_t staging_first_cap = 64*1024*1024;
+// Freeing pinned host memory makes the driver wait until every device sharing the context has finished
+// all queued work, so a free during pipelined prefill drains the pipeline (measured 1.35 s on a 13k prompt).
+// Pinned blocks are therefore only freed when no queue on any device has work left.
+static bool ggml_sycl_all_queues_idle();
 
-    // A byte ring. An upload waits only for the oldest uploads whose bytes it reuses. Each
-    // copy is queued behind all earlier work on the device, and in pipeline mode that includes
-    // a wait on another device, so a small ring stalls the host thread that feeds every device.
-    struct host_staging {
-        struct entry {
-            size_t      off;
-            size_t      size;
-            sycl::event ev;
-        };
-        char *            data = nullptr;
-        size_t            cap  = 0;
-        size_t            head = 0;
-        std::deque<entry> used;  // oldest first
-        // blocks left behind by a growth, each freed once its last upload is done
-        std::vector<std::pair<char *, sycl::event>> retired;
+// A byte ring of pinned memory for host uploads, one per device. An upload waits only for the oldest
+// uploads whose bytes it reuses. Each copy is queued behind all earlier work on the device, and in
+// pipeline mode that includes a wait on another device, so a small ring stalls the host thread that
+// feeds every device. The ring belongs to the device rather than to a buffer: compute buffers are
+// reallocated per request, and a new ring would have to grow, and drop its old blocks, all over again.
+struct ggml_sycl_host_staging {
+    // Chunked so the host copy of one chunk runs while the previous chunk is still on the wire.
+    static constexpr size_t chunk_max = 8*1024*1024;
+    static constexpr size_t first_cap = 64*1024*1024;
 
-        void free_retired(sycl::queue & q, bool wait) {
-            for (size_t i = 0; i < retired.size();) {
-                auto & r = retired[i];
-                if (wait) {
-                    r.second.wait_and_throw();
-                } else if (r.second.get_info<sycl::info::event::command_execution_status>() !=
-                           sycl::info::event_command_status::complete) {
-                    ++i;
-                    continue;
-                }
-                sycl::free(r.first, q);
-                retired.erase(retired.begin() + i);
-            }
-        }
+    struct entry {
+        size_t      off;
+        size_t      size;
+        sycl::event ev;
     };
+    std::mutex        mtx;
+    char *            data = nullptr;
+    size_t            cap  = 0;
+    size_t            head = 0;
+    std::deque<entry> used;  // oldest first
+    // blocks left behind by a growth, freed once no device has work queued
+    std::vector<char *> retired;
+    // the newest upload out of a retired block; uploads are in order, so the older ones are done with it
+    std::optional<sycl::event> retired_last;
 
+    void free_retired_if_idle(sycl::queue & q) {
+        if (retired.empty() || !ggml_sycl_all_queues_idle()) {
+            return;
+        }
+        for (char * p : retired) {
+            sycl::free(p, q);
+        }
+        retired.clear();
+    }
+
+    // waits for every queued upload; a buffer must not be freed while one may still write to it
+    void wait_all() {
+        if (retired_last) {
+            retired_last->wait_and_throw();
+            retired_last.reset();
+        }
+        for (auto & e : used) {
+            e.ev.wait_and_throw();
+        }
+        used.clear();
+    }
+};
+
+// Never freed: the blocks live until the process exits, and a static destructor would run after the SYCL
+// runtime is gone.
+static ggml_sycl_host_staging & ggml_sycl_upload_staging(int device) {
+    static ggml_sycl_host_staging * stg = new ggml_sycl_host_staging[GGML_SYCL_MAX_DEVICES];
+    return stg[device];
+}
+
+struct ggml_backend_sycl_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     queue_ptr stream;
     std::string name;
     device_opt_feature opt_feature;
     std::vector<ggml_tensor_extra_gpu *> tensor_extras;
-    host_staging staging;
     bool is_usm_system;
     // 16-bit copies of f32 weights for the one-token mat-vecs (GGML_SYCL_F32_MV_TYPES)
     std::unordered_map<const ggml_tensor *, void *> mv16_copies;
@@ -963,21 +985,12 @@ struct ggml_backend_sycl_buffer_context {
             opt_feature = ggml_sycl_info().devices[device].opt_feature;
         }
 
-    // waits for every queued upload, then releases the pinned block
-    void drop_host_staging() {
-        for (auto & e : staging.used) {
-            e.ev.wait_and_throw();
-        }
-        staging.used.clear();
-        staging.free_retired(*stream, true);
-        if (staging.data != nullptr) {
-            sycl::free(staging.data, *stream);
-            staging.data = nullptr;
-        }
-    }
-
     ~ggml_backend_sycl_buffer_context() {
-        drop_host_staging();
+        {
+            auto & stg = ggml_sycl_upload_staging(device);
+            std::lock_guard<std::mutex> lock(stg.mtx);
+            stg.wait_all();
+        }
         for (auto & c : mv16_copies) {
             SYCL_CHECK(CHECK_TRY_ERROR(ggml_sycl_free_device(c.second, *stream)));
         }
@@ -1288,6 +1301,16 @@ static void ggml_sycl_upload_join_all() {
     }
 }
 
+static bool ggml_sycl_all_queues_idle() {
+    for (int d = 0; d < ggml_sycl_info().device_count; ++d) {
+        const ggml_sycl_upload_queue_state & u = g_ggml_sycl_upload_q[d];
+        if ((u.q != nullptr && !u.q->ext_oneapi_empty()) || !dpct::get_device(d).default_queue().ext_oneapi_empty()) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                                                 ggml_tensor *tensor,
                                                 const void *data, size_t offset,
@@ -1342,19 +1365,20 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     // mmap()ed pages - the reason the old path bounced through a malloc'd buffer. The block is
     // pinned and reused, and the chunks pipeline instead of draining the queue once per tensor.
     // Ordering holds because this is the same in-order queue the device computes on.
-    auto & stg = ctx->staging;
+    auto & stg = ggml_sycl_upload_staging(ctx->device);
+    std::lock_guard<std::mutex> stg_lock(stg.mtx);
     // graph inputs are uploaded every ubatch, and in pipeline mode several ubatches are in flight
     const bool   ring    = g_ggml_sycl_staging_ring != 0;
     const bool   compute = ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE;
     const size_t slots   = std::max(1, g_ggml_sycl_upload_staging_slots);
-    const size_t max_cap = ring && compute ? (size_t) g_ggml_sycl_staging_mib << 20 : slots * ctx->staging_chunk_max;
+    const size_t max_cap = ring && compute ? (size_t) g_ggml_sycl_staging_mib << 20 : slots * stg.chunk_max;
     if (g_ggml_sycl_upload_staging_slots > 0 && stg.data == nullptr) {
-        const size_t cap = std::min(max_cap, ctx->staging_first_cap);
+        const size_t cap = std::min(max_cap, stg.first_cap);
         stg.data = (char *) sycl::malloc_host(cap, *stream);
         stg.cap  = stg.data != nullptr ? cap : 0;
     }
     if (g_ggml_sycl_upload_staging_slots > 0 && stg.data != nullptr) {
-        stg.free_retired(*stream, false);
+        stg.free_retired_if_idle(*stream);
         auto done = [](const sycl::event & ev) {
             return ev.get_info<sycl::info::event::command_execution_status>() ==
                    sycl::info::event_command_status::complete;
@@ -1388,7 +1412,7 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
         // a SoA chunk must hold whole spans, as the permute works one span at a time
         const size_t align = soa ? ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>::span_size : 1;
         while (remaining > 0) {
-            const size_t chunk_max = std::min(ctx->staging_chunk_max, stg.cap / slots) / align * align;
+            const size_t chunk_max = std::min(stg.chunk_max, stg.cap / slots) / align * align;
             const size_t chunk     = std::min(remaining, chunk_max);
             // the legacy mode spends a whole slot on every chunk
             const size_t span      = ring ? GGML_PAD(chunk, 256) : chunk_max;
@@ -1399,8 +1423,11 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
                 const size_t cap  = std::min(max_cap, 2 * stg.cap);
                 char *       grown = (char *) sycl::malloc_host(cap, *stream);
                 if (grown != nullptr) {
-                    // the queue is in order, so the newest upload finishing means the old block is unused
-                    stg.retired.push_back({ stg.data, stg.used.back().ev });
+                    // the old block is freed once no device has work queued; its uploads finish before that
+                    stg.retired.push_back(stg.data);
+                    if (!stg.used.empty()) {
+                        stg.retired_last = stg.used.back().ev;
+                    }
                     stg.used.clear();
                     stg.data = grown;
                     stg.cap  = cap;
@@ -1462,33 +1489,28 @@ static bool ggml_sycl_buffer_download_staged(ggml_backend_sycl_buffer_context * 
     if (size < min_size) {
         return false;
     }
-    auto & stg = ctx->staging;
-    if (stg.data == nullptr) {
-        // the size set_tensor starts a non-compute buffer with
-        const size_t cap = 4 * ctx->staging_chunk_max;
-        stg.data = (char *) sycl::malloc_host(cap, *ctx->stream);
-        stg.cap  = stg.data != nullptr ? cap : 0;
+    // a block of its own per device, so a download never waits for the uploads queued in the ring
+    static char * stage_blocks[GGML_SYCL_MAX_DEVICES] = {};
+    static std::mutex stage_mtx[GGML_SYCL_MAX_DEVICES];
+    std::lock_guard<std::mutex> lock(stage_mtx[ctx->device]);
+    char *& stage_data = stage_blocks[ctx->device];
+    if (stage_data == nullptr) {
+        stage_data = (char *) sycl::malloc_host(n_max * chunk_max, *ctx->stream);
     }
-    if (stg.cap < chunk_max) {
+    if (stage_data == nullptr) {
         return false;
     }
-    // uploads may still read the block; the download reuses all of it
-    for (auto & e : stg.used) {
-        e.ev.wait_and_throw();
-    }
-    stg.used.clear();
-    stg.head = 0;
 
     // a SoA chunk must hold whole spans, as the unpermute works one span at a time
     const size_t align  = soa ? ggml_sycl_q8_0_access<GGML_SYCL_LAYOUT_SOA_SPAN>::span_size : 1;
     const size_t chunk  = chunk_max / align * align;
     const size_t n_chnk = (size + chunk - 1) / chunk;
-    const size_t n_work = std::min({ n_max, n_chnk, stg.cap / chunk });
+    const size_t n_work = std::min(n_max, n_chnk);
 
     sycl::queue &       q = *ctx->stream;
     std::atomic<size_t> next{ 0 };
     auto work = [&](size_t w) {
-        char * stage = stg.data + w * chunk;
+        char * stage = stage_data + w * chunk;
         for (size_t i = next++; i < n_chnk; i = next++) {
             const size_t off = i * chunk;
             const size_t n   = std::min(chunk, size - off);
@@ -8651,6 +8673,11 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     ggml_sycl_upload_join(sycl_ctx->device);
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
+    {
+        auto & stg = ggml_sycl_upload_staging(sycl_ctx->device);
+        std::lock_guard<std::mutex> lock(stg.mtx);
+        stg.free_retired_if_idle(*stream);
+    }
 
     GGML_UNUSED(backend);
 }
