@@ -2721,6 +2721,17 @@ private:
         // the draft state is saved below
         spec_catch_up(false);
 
+        // A checkpoint of this task may still be filled by the device (LLAMA_STATE_SEQ_FLAGS_ASYNC below):
+        // let the reads finish before its memory goes away. Earlier tasks ended with a synchronization.
+        auto sync_if_pending = [&](const common_prompt_checkpoint & ckpt) {
+            if (ckpt.id_task == id_task) {
+                llama_synchronize(ctx_tgt);
+                if (ctx_dft) {
+                    llama_synchronize(ctx_dft);
+                }
+            }
+        };
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2744,6 +2755,7 @@ private:
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
             const auto & cur = *slot.prompt.checkpoints.front();
+            sync_if_pending(cur);
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
@@ -2757,6 +2769,7 @@ private:
             for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
                 if ((*it)->n_tokens == n_tokens_new) {
                     SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", (*it)->n_tokens);
+                    sync_if_pending(**it);
                     it = slot.prompt.checkpoints.erase(it);
                 } else {
                     ++it;
@@ -2774,8 +2787,10 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        // asynchronous: a synchronous read would drain the batches queued on every device before the next
+        // batch is submitted (~0.8 s of idle devices per checkpoint on a 3-GPU pipeline)
+        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
@@ -2830,6 +2845,11 @@ private:
         n_written = 0;
         if (slot.prompt.checkpoints.empty()) {
             return true;
+        }
+        // the newest checkpoints may still be read asynchronously
+        llama_synchronize(ctx_tgt);
+        if (ctx_dft) {
+            llama_synchronize(ctx_dft);
         }
         std::ofstream ofs(std::filesystem::u8path(filepath), std::ios::binary | std::ios::app);
         if (!ofs) {

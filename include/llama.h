@@ -935,6 +935,11 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// Read the device tensors asynchronously, in order with the queued work: the call returns before the data is
+// in dst, without waiting for the queued batches. dst must stay valid, and must not be read, until the context
+// is synchronized (llama_synchronize(), or any call that synchronizes, such as reading logits or another state call).
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(

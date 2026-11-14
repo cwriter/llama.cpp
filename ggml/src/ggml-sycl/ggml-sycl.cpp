@@ -8481,6 +8481,59 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// Async reads into pageable memory (state checkpoints) go through pinned blocks: the device copy is queued
+// in order, and the host copy into the destination happens at the next synchronize. The blocks are reused
+// after every synchronize and never freed, as a free would wait for every device (ggml_sycl_all_queues_idle).
+struct ggml_sycl_async_download {
+    static constexpr size_t block_min = 32*1024*1024;
+
+    struct pending {
+        const char * src;
+        char *       dst;
+        size_t       size;
+    };
+    std::mutex                                 mtx;
+    std::vector<std::pair<char *, size_t>>     blocks;  // pointer, capacity
+    size_t                                     cur  = 0;  // block in use
+    size_t                                     used = 0;  // bytes used in it
+    std::vector<pending>                       todo;
+
+    char * alloc(size_t size, sycl::queue & q) {
+        size = GGML_PAD(size, 256);
+        for (; cur < blocks.size(); ++cur, used = 0) {
+            if (used + size <= blocks[cur].second) {
+                char * p = blocks[cur].first + used;
+                used += size;
+                return p;
+            }
+        }
+        const size_t cap = std::max(block_min, size);
+        char *       p   = (char *) sycl::malloc_host(cap, q);
+        if (p == nullptr) {
+            return nullptr;
+        }
+        blocks.push_back({ p, cap });
+        cur  = blocks.size() - 1;
+        used = size;
+        return p;
+    }
+
+    // the device copies must be complete
+    void finish() {
+        for (const auto & t : todo) {
+            memcpy(t.dst, t.src, t.size);
+        }
+        todo.clear();
+        cur  = 0;
+        used = 0;
+    }
+};
+
+static ggml_sycl_async_download & ggml_sycl_async_download_state(int device) {
+    static ggml_sycl_async_download * st = new ggml_sycl_async_download[GGML_SYCL_MAX_DEVICES];
+    return st[device];
+}
+
 static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
                                                const ggml_tensor *tensor,
                                                void *data, size_t offset,
@@ -8499,8 +8552,24 @@ static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
         ggml_backend_sycl_buffer_get_tensor(buf, tensor, data, offset, size);
         return;
     }
-    SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(
-        data, (const char *)tensor->data + offset, size)));
+    const char * src = (const char *) tensor->data + offset;
+    if (sycl::get_pointer_type(data, stream->get_context()) == sycl::usm::alloc::unknown) {
+        // pageable memory: a direct copy can make the driver block, so bounce through pinned memory
+        auto & dl = ggml_sycl_async_download_state(sycl_ctx->device);
+        std::lock_guard<std::mutex> lock(dl.mtx);
+        char * stage = dl.alloc(size, *stream);
+        if (stage != nullptr) {
+            ggml_sycl_pipe_trace_scope trace_scope("GETA", sycl_ctx->device, tensor->name, size);
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(stage, src, size)));
+            // fault the destination in now, while the device works, rather than in synchronize
+            for (size_t j = 0; j < size; j += 4096) {
+                ((volatile char *) data)[j] = 0;
+            }
+            dl.todo.push_back({ stage, (char *) data, size });
+            return;
+        }
+    }
+    SYCL_CHECK(CHECK_TRY_ERROR((stream)->memcpy(data, src, size)));
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -8673,6 +8742,11 @@ static void ggml_backend_sycl_synchronize(ggml_backend_t backend) try {
     ggml_sycl_upload_join(sycl_ctx->device);
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
     SYCL_CHECK(CHECK_TRY_ERROR((stream)->wait()));
+    {
+        auto & dl = ggml_sycl_async_download_state(sycl_ctx->device);
+        std::lock_guard<std::mutex> lock(dl.mtx);
+        dl.finish();
+    }
     {
         auto & stg = ggml_sycl_upload_staging(sycl_ctx->device);
         std::lock_guard<std::mutex> lock(stg.mtx);

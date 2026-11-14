@@ -3304,13 +3304,19 @@ private:
 
 class llama_io_write_host : public llama_io_write_i {
 public:
+    // with backends, device tensors are read with the async API of the backend that holds them
     llama_io_write_host(
-            uint8_t * p, size_t len) : ptr(p), buf_size(len) {}
+            uint8_t * p, size_t len, const std::vector<ggml_backend_ptr> * backends = nullptr) : ptr(p), buf_size(len), backends(backends) {}
 
     ~llama_io_write_host() {
         // TODO: add backend support to batch tensor_get? or some other way to speed this up
         for (const auto & winfo : winfos) {
-            ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            ggml_backend_t backend = async_backend(winfo.tensor);
+            if (backend) {
+                ggml_backend_tensor_get_async(backend, winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            } else {
+                ggml_backend_tensor_get(winfo.tensor, winfo.ptr, winfo.offset, winfo.size);
+            }
         }
     }
 
@@ -3353,6 +3359,22 @@ private:
         size_t offset;
     };
     std::vector<write_info> winfos;
+
+    const std::vector<ggml_backend_ptr> * backends;
+
+    ggml_backend_t async_backend(const ggml_tensor * tensor) const {
+        if (!backends || !tensor->buffer || ggml_backend_buffer_is_host(tensor->buffer)) {
+            return nullptr;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+        for (const auto & backend : *backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && ggml_backend_dev_supports_buft(dev, buft)) {
+                return backend.get();
+            }
+        }
+        return nullptr;
+    }
 };
 
 class llama_io_read_host : public llama_io_read_i {
@@ -3819,7 +3841,7 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
         io = std::make_unique<llama_io_write_device>(dst, size, mem_storage[seq_id]);
     } else {
-        io = std::make_unique<llama_io_write_host>(dst, size);
+        io = std::make_unique<llama_io_write_host>(dst, size, (flags & LLAMA_STATE_SEQ_FLAGS_ASYNC) ? &backends : nullptr);
     }
 
     try {
@@ -4980,7 +5002,9 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    if (!(flags & LLAMA_STATE_SEQ_FLAGS_ASYNC)) {
+        ctx->synchronize();
+    }
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
