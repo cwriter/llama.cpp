@@ -960,7 +960,7 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
-// A split input that crosses the boundary as a SEND/RECV pair instead of a plain copy (GGML_SCHED_SEND_RECV=1).
+// A split input that crosses the boundary as a SEND/RECV pair instead of a plain copy (on unless GGML_SCHED_SEND_RECV=0).
 // SEND computes a package on the producer, the package is what is copied, and RECV on each consumer expands it
 // into the tensor the graph reads. A pair is only formed where both backends support their half; every other
 // input keeps the plain copy.
@@ -3003,8 +3003,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->pack_inputs = e ? atoi(e) != 0 : true;
     }
     {
+        // GGML_SCHED_SEND_RECV=0: plain copies on the split boundaries instead of SEND/RECV pairs
         const char * e = getenv("GGML_SCHED_SEND_RECV");
-        sched->send_recv = e ? atoi(e) != 0 : false;
+        sched->send_recv = e ? atoi(e) != 0 : true;
         e = getenv("GGML_SCHED_SEND_BF16");
         sched->send_bf16 = e ? atoi(e) != 0 : false;
     }
