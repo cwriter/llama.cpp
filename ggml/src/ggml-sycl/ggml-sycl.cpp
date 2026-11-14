@@ -1129,9 +1129,13 @@ ggml_backend_sycl_buffer_init_tensor(ggml_backend_buffer_t buffer,
         size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
 
         if (padded_size > original_size && tensor->view_src == nullptr) {
-            SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream->memset(
-                (char *)tensor->data + original_size, 0,
-                padded_size - original_size).wait()));
+            // The kernels that may read the padding run later on this in-order queue, and uploads only write
+            // [0, original_size), so a compute buffer need not wait. The scheduler places its packed split inputs
+            // again for every graph, and a wait there drained the device pipeline once per ubatch
+            sycl::event ev = ctx->stream->memset((char *) tensor->data + original_size, 0, padded_size - original_size);
+            if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                SYCL_CHECK(CHECK_TRY_ERROR(ev.wait()));
+            }
         }
     }
     return GGML_STATUS_SUCCESS;
