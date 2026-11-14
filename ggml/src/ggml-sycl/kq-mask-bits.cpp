@@ -23,6 +23,11 @@ bool ggml_sycl_kq_mask_eligible(const ggml_tensor * t) {
     if (!g_ggml_sycl_kq_mask_bits || t == nullptr || t->type != GGML_TYPE_F16) {
         return false;
     }
+    // the RECV of a GGML_SEND_CODEC_MASK_BITS package is a mask by construction, whatever its name, and stays
+    // packed: it is written once per graph by that RECV and never uploaded
+    if (t->op == GGML_OP_RECV && ggml_get_op_params_i32(t, 0) == GGML_SEND_CODEC_MASK_BITS) {
+        return t->view_src == nullptr && ggml_is_contiguous(t) && t->ne[0] >= 32;
+    }
     // only the graph input and the scheduler's copies of it, never a tensor computed from it
     if (t->view_src != nullptr || t->op != GGML_OP_NONE || !ggml_is_contiguous(t)) {
         return false;

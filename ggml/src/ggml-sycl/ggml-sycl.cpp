@@ -8060,6 +8060,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
         case GGML_OP_RECV:
             ggml_sycl_op_recv(ctx, dst);
             break;
+        case GGML_OP_SEND:
+            ggml_sycl_op_send(ctx, dst);
+            break;
         case GGML_OP_SET:
             ggml_sycl_op_set(ctx, dst);
             break;
@@ -9997,6 +10000,11 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if (ggml_sycl_fill_absorbs(cgraph, i, false)) {
             continue;
         }
+        if (ggml_sycl_recv_repeat_fusable(cgraph, i)) {
+            ggml_sycl_op_recv_repeat(*sycl_ctx, node, cgraph->nodes[i + 1]);
+            i++;
+            continue;
+        }
         if (node->op == GGML_OP_SET_ROWS) {
             float initial, value;
             if (ggml_sycl_fill_set_rows(cgraph, node, initial, value)) {
@@ -11035,6 +11043,10 @@ static int ggml_sycl_li_gather_absorbs(const ggml_cgraph * cgraph, int node_idx)
 
 static int ggml_backend_sycl_fusion_absorbs(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {
     GGML_UNUSED(backend);
+    // a RECV expanded straight into the REPEAT after it
+    if (ggml_sycl_recv_repeat_fusable(cgraph, node_idx)) {
+        return 1;
+    }
     // the pooled-key gather, which the lightning indexer reads through its index instead
     if (ggml_sycl_li_gather_absorbs(cgraph, node_idx)) {
         return 1;
@@ -11710,6 +11722,8 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
             }
         case GGML_OP_RECV:
             return ggml_sycl_recv_supported(op);
+        case GGML_OP_SEND:
+            return ggml_sycl_send_supported(op);
         case GGML_OP_GET_ROWS_BACK:
             // return true;
              return op->type == GGML_TYPE_F32 &&

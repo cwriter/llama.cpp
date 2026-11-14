@@ -2382,8 +2382,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 n_tasks = n_threads;
             } break;
-        case GGML_OP_GET_ROWS:
         case GGML_OP_SEND:
+            {
+                n_tasks = ggml_get_op_params_i32(node, 0) == GGML_SEND_CODEC_ROWS ? 1 : n_threads;
+            } break;
+        case GGML_OP_GET_ROWS:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading

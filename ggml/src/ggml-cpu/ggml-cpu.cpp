@@ -475,10 +475,25 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         case GGML_OP_GET_ROWS_BACK:
             return src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16;
         case GGML_OP_SEND:
+            if (ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_MASK_BITS) {
+                return (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32) && op->type == GGML_TYPE_I32 &&
+                       src0->nb[0] == ggml_type_size(src0->type);
+            }
+            if (ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_BF16) {
+                return src0->type == GGML_TYPE_F32 && op->type == GGML_TYPE_BF16 && ggml_is_contiguous(src0);
+            }
             return ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_ROWS && op->type == src0->type &&
                    src1->type == GGML_TYPE_I32;
         case GGML_OP_RECV:
-            return ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_ROWS && op->type == GGML_TYPE_F32 &&
+            if (ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_MASK_BITS) {
+                return src0->type == GGML_TYPE_I32 && (op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32) &&
+                       ggml_is_contiguous(src0) && ggml_is_contiguous(op);
+            }
+            if (ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_BF16 && src0->type != GGML_TYPE_BF16) {
+                return false;
+            }
+            return (ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_ROWS ||
+                    ggml_get_op_params_i32(op, 0) == GGML_SEND_CODEC_BF16) && op->type == GGML_TYPE_F32 &&
                    ggml_get_type_traits(src0->type)->to_float != nullptr && ggml_is_contiguous(src0) &&
                    ggml_is_contiguous(op);
         case GGML_OP_OUT_PROD:

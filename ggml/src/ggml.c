@@ -4069,6 +4069,82 @@ struct ggml_tensor * ggml_recv_rows(
     return result;
 }
 
+// ggml_send_bf16
+
+struct ggml_tensor * ggml_send_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_BF16, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params_i32(result, 0, GGML_SEND_CODEC_BF16);
+
+    result->op     = GGML_OP_SEND;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_recv_bf16
+
+struct ggml_tensor * ggml_recv_bf16(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_BF16);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params_i32(result, 0, GGML_SEND_CODEC_BF16);
+
+    result->op     = GGML_OP_RECV;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_send_mask_bits
+
+struct ggml_tensor * ggml_send_mask_bits(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a) {
+    GGML_ASSERT(a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, (a->ne[0] + 31)/32, a->ne[1], a->ne[2], a->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, GGML_SEND_CODEC_MASK_BITS);
+
+    result->op     = GGML_OP_SEND;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_recv_mask_bits
+
+struct ggml_tensor * ggml_recv_mask_bits(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        enum ggml_type        type,
+        int64_t               ne0) {
+    GGML_ASSERT(a->type == GGML_TYPE_I32 && a->ne[0] == (ne0 + 31)/32);
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, type, ne0, a->ne[1], a->ne[2], a->ne[3]);
+
+    ggml_set_op_params_i32(result, 0, GGML_SEND_CODEC_MASK_BITS);
+
+    result->op     = GGML_OP_RECV;
+    result->src[0] = a;
+
+    return result;
+}
+
+void ggml_set_binary_mask(struct ggml_tensor * tensor) {
+    tensor->flags |= GGML_TENSOR_FLAG_BINARY_MASK;
+}
+
 // ggml_get_rows_back
 
 struct ggml_tensor * ggml_get_rows_back(

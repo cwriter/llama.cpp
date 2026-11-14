@@ -2480,6 +2480,86 @@ struct test_recv_rows : public test_case {
     }
 };
 
+// GGML_SEND_CODEC_BF16 both ways: rounded to bf16 on the producer, widened on the consumer
+struct test_send_recv_bf16 : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    // both halves are exact roundings, the same on every backend
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    test_send_recv_bf16(std::array<int64_t, 4> ne = {2560, 4, 7, 1})
+        : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * pkg = ggml_send_bf16(ctx, a);
+        ggml_set_name(pkg, "pkg");
+
+        ggml_tensor * out = ggml_recv_bf16(ctx, pkg);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_SEND_CODEC_MASK_BITS both ways: a 0/-inf mask (a view, as a scheduler input can be) packed and expanded
+struct test_send_recv_mask : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+
+    std::string vars() override {
+        return VARS_TO_STR2(type, ne);
+    }
+
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    test_send_recv_mask(ggml_type type = GGML_TYPE_F16, std::array<int64_t, 4> ne = {1000, 7, 2, 1})
+        : type(type), ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+        // the leading 990 columns of each row: strided rows
+        ggml_tensor * v = ggml_view_4d(ctx, a, ne[0] - 10, ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+
+        ggml_tensor * pkg = ggml_send_mask_bits(ctx, v);
+        ggml_set_name(pkg, "pkg");
+
+        ggml_tensor * out = ggml_recv_mask_bits(ctx, pkg, GGML_TYPE_F16, v->ne[0]);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const int64_t n = ggml_nelements(t);
+            std::vector<float> f(n);
+            for (int64_t i = 0; i < n; ++i) {
+                f[i] = rng() % 3 == 0 ? 0.0f : -INFINITY;
+            }
+            if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> h(n);
+                ggml_fp32_to_fp16_row(f.data(), h.data(), n);
+                ggml_backend_tensor_set(t, h.data(), 0, n * sizeof(ggml_fp16_t));
+            } else {
+                ggml_backend_tensor_set(t, f.data(), 0, n * sizeof(float));
+            }
+        }
+    }
+};
+
 struct test_get_rows : public test_case {
     const ggml_type type;
     const int n; // cols
@@ -12205,6 +12285,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_recv_rows(type, {ggml_blck_size(type) == 256 ? 2560 : 160, 16, 4, 1}));
         test_cases.emplace_back(new test_recv_rows(type, {512, 1, 1, 1}));
     }
+    test_cases.emplace_back(new test_send_recv_bf16());
+    test_cases.emplace_back(new test_send_recv_bf16({1000, 3, 1, 1}));
+    test_cases.emplace_back(new test_send_recv_mask(GGML_TYPE_F16));
+    test_cases.emplace_back(new test_send_recv_mask(GGML_TYPE_F32));
+    test_cases.emplace_back(new test_send_recv_mask(GGML_TYPE_F16, {64, 1024, 1, 1}));
 
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_Q4_0}) {
         test_cases.emplace_back(new test_get_rows(type, 300*256,   5,         4,   1,   2, false));
@@ -14860,6 +14945,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // prefill lengths: whole and partial chunks of 64 (SYCL: GGML_SYCL_GDN_CHUNKED=N takes these chunked)
     for (int64_t n_tokens : {64, 130, 512}) {
         test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, 1, 3, false, false, 1, 3, true));
+    }
+    for (int64_t head_size : {16, 32, 64, 128}) {
+        for (int64_t n_tokens : {63, 64, 65, 127, 128, 129}) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, head_size, n_tokens, 2, 1, false, false, 1, 3));
+        }
     }
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 100, 2, 2));

@@ -845,6 +845,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
     ggml_set_input(inp->pool_mask);
+    ggml_set_binary_mask(inp->pool_mask); // fill_mask writes 0 and -inf only
     ggml_set_input(inp->tail_idxs);
 
     // set_input fills them all, so keep them allocated even when no op reads them

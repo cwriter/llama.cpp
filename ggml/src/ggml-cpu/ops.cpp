@@ -5527,6 +5527,53 @@ void ggml_compute_forward_send(
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
 
+    if (ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_MASK_BITS) {
+        // one bit per value, set where it is 0; anything but 0 and -inf breaks the mask's promise
+        GGML_ASSERT(dst->type == GGML_TYPE_I32 && ggml_is_contiguous(dst) && src0->nb[0] == ggml_type_size(src0->type));
+        const int64_t ne00 = src0->ne[0];
+        const int64_t nw   = dst->ne[0];
+        const int64_t nr   = ggml_nrows(src0);
+        const int64_t dr   = (nr + params->nth - 1)/params->nth;
+        const int64_t ir0  = dr*params->ith;
+        const int64_t ir1  = MIN(ir0 + dr, nr);
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const int64_t i3 = ir/(src0->ne[2]*src0->ne[1]);
+            const int64_t i2 = (ir - i3*src0->ne[2]*src0->ne[1])/src0->ne[1];
+            const int64_t i1 = ir - i3*src0->ne[2]*src0->ne[1] - i2*src0->ne[1];
+            const char * row = (const char *) src0->data + i1*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3];
+            uint32_t * out = (uint32_t *) dst->data + ir*nw;
+            for (int64_t w = 0; w < nw; ++w) {
+                uint32_t word = 0;
+                for (int64_t i0 = w*32; i0 < MIN(ne00, w*32 + 32); ++i0) {
+                    const float v = src0->type == GGML_TYPE_F16 ? GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) row)[i0])
+                                                                : ((const float *) row)[i0];
+                    if (v == 0.0f) {
+                        word |= 1u << (i0 & 31);
+                    } else if (!(std::isinf(v) && v < 0.0f)) {
+                        GGML_ABORT("%s: %s is flagged as a binary mask but holds %g", __func__, src0->name, (double) v);
+                    }
+                }
+                out[w] = word;
+            }
+        }
+        return;
+    }
+
+    if (ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_BF16) {
+        // rows of an f32 tensor, rounded as ggml_cpu_fp32_to_bf16 does
+        GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_BF16);
+        GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+        const int64_t nc  = src0->ne[0];
+        const int64_t nr  = ggml_nrows(src0);
+        const int64_t dr  = (nr + params->nth - 1)/params->nth;
+        const int64_t ir0 = dr*params->ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+        for (int64_t i = ir0; i < ir1; ++i) {
+            ggml_cpu_fp32_to_bf16((const float *) src0->data + i*nc, (ggml_bf16_t *) dst->data + i*nc, nc);
+        }
+        return;
+    }
+
     GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_ROWS);
     GGML_ASSERT(dst->type == src0->type && ggml_is_contiguous_rows(src0));
 
@@ -5557,14 +5604,38 @@ void ggml_compute_forward_send(
 
 // ggml_compute_forward_recv
 
-// GGML_SEND_CODEC_ROWS: expand the rows with the type's to_float, as ggml_compute_forward_get_rows does
+// GGML_SEND_CODEC_ROWS: expand the rows with the type's to_float, as ggml_compute_forward_get_rows does.
+// GGML_SEND_CODEC_BF16: the same on a bf16 package
 void ggml_compute_forward_recv(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
     const ggml_tensor * src0 = dst->src[0];
 
-    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_ROWS);
+    if (ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_MASK_BITS) {
+        GGML_ASSERT(src0->type == GGML_TYPE_I32 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+        const int64_t ne0 = dst->ne[0];
+        const int64_t nw  = src0->ne[0];
+        const int64_t nr  = ggml_nrows(dst);
+        const int64_t dr  = (nr + params->nth - 1)/params->nth;
+        const int64_t ir0 = dr*params->ith;
+        const int64_t ir1 = MIN(ir0 + dr, nr);
+        for (int64_t ir = ir0; ir < ir1; ++ir) {
+            const uint32_t * in = (const uint32_t *) src0->data + ir*nw;
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                const float v = (in[i0 >> 5] >> (i0 & 31)) & 1 ? 0.0f : -INFINITY;
+                if (dst->type == GGML_TYPE_F16) {
+                    ((ggml_fp16_t *) dst->data)[ir*ne0 + i0] = GGML_CPU_FP32_TO_FP16(v);
+                } else {
+                    ((float *) dst->data)[ir*ne0 + i0] = v;
+                }
+            }
+        }
+        return;
+    }
+
+    GGML_ASSERT(ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_ROWS ||
+                (ggml_get_op_params_i32(dst, 0) == GGML_SEND_CODEC_BF16 && src0->type == GGML_TYPE_BF16));
     GGML_ASSERT(dst->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
     GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
 

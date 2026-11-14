@@ -612,8 +612,15 @@ extern "C" {
 
     // how a GGML_OP_SEND / GGML_OP_RECV pair encodes the data it carries (op_params[0])
     enum ggml_send_codec {
+        // the tensor as it is: the pair has no nodes, the scheduler's copy is the transfer
+        GGML_SEND_CODEC_COPY = 0,
         // the rows of a GET_ROWS, sent in the source's type and expanded to f32 by RECV
         GGML_SEND_CODEC_ROWS = 1,
+        // an f32 tensor rounded to bf16 by SEND and widened back by RECV: lossy
+        GGML_SEND_CODEC_BF16 = 2,
+        // a GGML_TENSOR_FLAG_BINARY_MASK tensor as bits: the package is i32 [(ne0 + 31)/32, ne1, ne2, ne3],
+        // bit (i0 & 31) of word i0/32 set where the value is 0. Lossless
+        GGML_SEND_CODEC_MASK_BITS = 3,
     };
 
     enum ggml_unary_op {
@@ -677,6 +684,7 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        GGML_TENSOR_FLAG_BINARY_MASK = 32, // ...holds only 0 and -inf (an attention mask), so it may be stored as bits
     };
 
     enum ggml_tri_type {
@@ -1763,10 +1771,34 @@ extern "C" {
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
 
-    // the f32 expansion of a package made by ggml_send_rows, in the shape of a
+    // the f32 expansion of a package made by ggml_send_rows, in the shape of a. ggml_backend_sched sets
+    // op_params[1] to 1 when the node right after it is its only reader, which a backend may then fuse it into
     GGML_API struct ggml_tensor * ggml_recv_rows(
             struct ggml_context * ctx,
             struct ggml_tensor  * a); // package
+
+    // a rounded to bf16 (GGML_SEND_CODEC_BF16), and its f32 widening
+    GGML_API struct ggml_tensor * ggml_send_bf16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_recv_bf16(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a); // package
+
+    // a GGML_TENSOR_FLAG_BINARY_MASK mask (f16 or f32) as bits (GGML_SEND_CODEC_MASK_BITS), and its expansion
+    // back to type, ne0 columns
+    GGML_API struct ggml_tensor * ggml_send_mask_bits(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a);
+
+    GGML_API struct ggml_tensor * ggml_recv_mask_bits(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a, // package
+            enum ggml_type        type,
+            int64_t               ne0);
+
+    GGML_API void ggml_set_binary_mask(struct ggml_tensor * tensor);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
