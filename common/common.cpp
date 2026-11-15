@@ -26,6 +26,8 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <map>
+#include <mutex>
 #include <random>
 #include <regex>
 #include <sstream>
@@ -57,6 +59,10 @@
 #if !defined(_WIN32)
 #include <sys/types.h>
 #include <pwd.h>
+#endif
+
+#if defined(__linux__)
+#include <sys/mman.h>
 #endif
 
 #if defined(_AIX)
@@ -2407,6 +2413,99 @@ void common_prompt_checkpoint::update_pos(
     this->n_tokens = n_tokens;
     this->pos_min  = pos_min;
     this->pos_max  = pos_max;
+}
+
+// Context checkpoints (~100 MiB of recurrent state each) are erased and created again with every prompt. A fresh
+// allocation is a fresh mmap: the first write faults every 4 KiB page in, ~57 ms per 112 MiB checkpoint on the
+// thread that submits the next batch. Freed buffers are kept for reuse (LLAMA_STATE_POOL_MIB, default 1024) and new
+// ones ask for huge pages where the kernel offers them.
+static constexpr size_t COMMON_STATE_POOL_MIN   = 1 << 20;
+static constexpr size_t COMMON_STATE_POOL_ALIGN = 2 << 20;
+
+struct common_state_pool {
+    std::mutex                      mtx;
+    std::multimap<size_t, void *>   free;
+    size_t                          bytes = 0;
+    size_t                          cap   = 0;
+
+    common_state_pool() {
+        const char * env = getenv("LLAMA_STATE_POOL_MIB");
+        cap = (size_t) (env ? std::max(0L, atol(env)) : 1024) << 20;
+    }
+
+    ~common_state_pool() {
+        for (auto & [size, p] : free) {
+            common_state_pool::release(p);
+        }
+    }
+
+    static void release(void * p) {
+#ifdef _WIN32
+        _aligned_free(p);
+#else
+        ::free(p);
+#endif
+    }
+};
+
+static common_state_pool & common_state_pool_get() {
+    static common_state_pool pool;
+    return pool;
+}
+
+static size_t common_state_pool_size(size_t size) {
+    return (size + COMMON_STATE_POOL_ALIGN - 1) / COMMON_STATE_POOL_ALIGN * COMMON_STATE_POOL_ALIGN;
+}
+
+void * common_state_alloc(size_t size) {
+    if (size < COMMON_STATE_POOL_MIN) {
+        return ::operator new(size);
+    }
+    const size_t sz   = common_state_pool_size(size);
+    auto &       pool = common_state_pool_get();
+    {
+        std::lock_guard<std::mutex> lock(pool.mtx);
+        auto it = pool.free.find(sz);
+        if (it != pool.free.end()) {
+            void * p = it->second;
+            pool.free.erase(it);
+            pool.bytes -= sz;
+            return p;
+        }
+    }
+#ifdef _WIN32
+    void * p = _aligned_malloc(sz, COMMON_STATE_POOL_ALIGN);
+#else
+    void * p = aligned_alloc(COMMON_STATE_POOL_ALIGN, sz);
+#endif
+    if (p == nullptr) {
+        throw std::bad_alloc();
+    }
+#ifdef __linux__
+    madvise(p, sz, MADV_HUGEPAGE);
+#endif
+    return p;
+}
+
+void common_state_free(void * p, size_t size) {
+    if (p == nullptr) {
+        return;
+    }
+    if (size < COMMON_STATE_POOL_MIN) {
+        ::operator delete(p);
+        return;
+    }
+    const size_t sz   = common_state_pool_size(size);
+    auto &       pool = common_state_pool_get();
+    {
+        std::lock_guard<std::mutex> lock(pool.mtx);
+        if (pool.bytes + sz <= pool.cap) {
+            pool.free.emplace(sz, p);
+            pool.bytes += sz;
+            return;
+        }
+    }
+    common_state_pool::release(p);
 }
 
 void common_prompt_checkpoint::update_tgt(

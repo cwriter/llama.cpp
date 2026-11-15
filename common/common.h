@@ -1290,6 +1290,10 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// large state buffers come from a pool that keeps freed ones for reuse, see common_state_alloc()
+void * common_state_alloc(size_t size);
+void   common_state_free(void * p, size_t size);
+
 // leaves the elements uninitialized on resize(), for large buffers that are overwritten right away
 // note: a vector of a struct with a defaulted constructor is still zeroed by resize()
 template <typename T>
@@ -1300,6 +1304,9 @@ struct common_no_init_allocator : std::allocator<T> {
     template <typename U> common_no_init_allocator(const common_no_init_allocator<U> &) {}
 
     template <typename U> void construct(U * p) { ::new ((void *) p) U; }
+
+    T *  allocate(size_t n) { return static_cast<T *>(common_state_alloc(n * sizeof(T))); }
+    void deallocate(T * p, size_t n) { common_state_free(p, n * sizeof(T)); }
 };
 
 // sequence state data, filled by llama_state_seq_get_data_ext()
