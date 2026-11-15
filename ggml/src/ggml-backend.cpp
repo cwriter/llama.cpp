@@ -1678,6 +1678,12 @@ static struct ggml_tensor * ggml_backend_sched_open_channel(ggml_backend_sched_t
         return NULL;
     }
     struct ggml_tensor * root = src->view_src ? src->view_src : src;
+    // a host weight crosses as a plain copy: the copy callback (the MoE cache slot maps) finds the readers of the
+    // copy itself, and there is nothing to encode
+    if (root->buffer != NULL && ggml_backend_buffer_get_usage(root->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+        ggml_backend_buffer_is_host(root->buffer)) {
+        return NULL;
+    }
     // ROWS and BF16 encode the whole of root, so src has to be all of it
     const bool whole = ggml_backend_sched_whole(src, root);
 
