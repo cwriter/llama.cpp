@@ -114,11 +114,13 @@ using fg_half = sycl::half;
 using fg_bf16 = sycl::ext::oneapi::bfloat16;
 using fg_tf32 = mx::precision::tf32;
 
-// The combination the GGML_SYCL_MMID_SCHED tile and A-stage variants were tuned on (B60). Only it
-// builds them; every other combination runs the plain tile, which keeps the kernel count bounded.
-using fg_tuned_combo = fg_combo<fg_half, fg_half, 8, 16, 16, 16>;
+// The combination the GGML_SYCL_MMID_SCHED tile and A-stage variants were tuned on (B60), and its bf16 twin
+// (GGML_SYCL_DYNAMIC_PRECISION=BF16), the same shape. Only they build them; every other combination runs the
+// plain tile, which keeps the kernel count bounded.
+using fg_tuned_combo      = fg_combo<fg_half, fg_half, 8, 16, 16, 16>;
+using fg_tuned_bf16_combo = fg_combo<fg_bf16, fg_bf16, 8, 16, 16, 16>;
 template <typename S> static constexpr bool fg_is_tuned() {
-    return std::is_same_v<S, fg_tuned_combo>;
+    return std::is_same_v<S, fg_tuned_combo> || std::is_same_v<S, fg_tuned_bf16_combo>;
 }
 
 // The combinations the ESIMD grouped GEMM (fused-gemm-esimd.cpp) stands in for: 8 x SG x 16 with f16
@@ -3199,20 +3201,19 @@ bool ggml_sycl_grouped_dequant_gemm_dev(ggml_type src0_type, const void * src0_b
     return launched;
 }
 
-template <typename T, bool REORDERED, bool GRF256, bool REUSE_C>
+template <typename S, typename T, bool REORDERED, bool GRF256, bool REUSE_C>
 struct fg_gate_up_pack_kernel {
-    using S = fg_tuned_combo;
     const char * gate;
     const char * up;
     size_t expert_stride;
     const ggml_sycl_gg_tile * tiles;
-    const S::tsb * input;
-    S::tsb * output;
+    const typename S::tsb * input;
+    typename S::tsb * output;
     int F;
     int K;
     int Npad;
     bool merged;
-    sycl::local_accessor<S::tsa, 1> tile_a;
+    sycl::local_accessor<typename S::tsa, 1> tile_a;
     sycl::local_accessor<float, 1> tile_c;
 
     [[sycl::reqd_sub_group_size(ggml_sycl_xmx::hw_sub_group_size(S::SG))]]
@@ -3283,7 +3284,7 @@ struct fg_gate_up_pack_kernel {
                 ggml_sycl_xmx::group_barrier(sg);
 #pragma unroll
                 for (int kt = 0; kt < FG_BK / S::TK; ++kt) {
-                    mx::joint_matrix<sycl::sub_group, S::tb, mx::use::b, S::TK, S::TN, S::b_layout> b[S::NT];
+                    mx::joint_matrix<sycl::sub_group, typename S::tb, mx::use::b, S::TK, S::TN, S::b_layout> b[S::NT];
 #pragma unroll
                     for (int nt = 0; nt < S::NT; ++nt) {
                         mx::joint_matrix_load(sg, b[nt], bptr + (size_t) ((kb * FG_BK + kt * S::TK) / S::VNNI) *
@@ -3293,7 +3294,7 @@ struct fg_gate_up_pack_kernel {
                     for (int q = 0; q < 2; ++q) {
 #pragma unroll
                         for (int mt = 0; mt < MT; ++mt) {
-                            mx::joint_matrix<sycl::sub_group, S::ta, mx::use::a, S::TM, S::TK, mx::layout::row_major> a;
+                            mx::joint_matrix<sycl::sub_group, typename S::ta, mx::use::a, S::TM, S::TK, mx::layout::row_major> a;
                             mx::joint_matrix_load(sg, a, tile_a.template get_multi_ptr<sycl::access::decorated::no>() +
                                 q * AI + split * S::SG_ROWS * FG_BK + fg_a_tile_off<S, true>(mt, kt), S::TK);
 #pragma unroll
@@ -3391,26 +3392,26 @@ struct fg_gate_up_pack_kernel {
     }
 };
 
-template <typename T, bool REORDERED, bool GRF256, bool REUSE_C = false>
+template <typename S, typename T, bool REORDERED, bool GRF256, bool REUSE_C = false>
 static void fg_gate_up_pack_launch(const ggml_tensor * wu, const ggml_tensor * wg, const ggml_sycl_gg_tile * tiles,
-                                    const fg_tuned_combo::tsb * input, fg_tuned_combo::tsb * output,
+                                    const typename S::tsb * input, typename S::tsb * output,
                                     int F, int K, int Npad, int count, dpct::queue_ptr stream) {
-    using S = fg_tuned_combo;
     if constexpr (fg_listed<S::SG>()) {
         stream->submit([&](sycl::handler & cgh) {
-            sycl::local_accessor<S::tsa, 1> a(2 * fg_a_image<S::SG_ROWS>(), cgh);
+            sycl::local_accessor<typename S::tsa, 1> a(2 * fg_a_image<S::SG_ROWS>(), cgh);
             sycl::local_accessor<float, 1> c((REUSE_C ? 1 : 2) * fg_tile_c_floats<S, true>() + fg_grid_traits<T>::dwords, cgh);
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(count, ((F + S::SG_ROWS - 1) / S::SG_ROWS) * S::WG_SIZE),
                                               sycl::range<2>(1, S::WG_SIZE)),
-                fg_gate_up_pack_kernel<T, REORDERED, GRF256, REUSE_C>{ (const char *) (wg ? wg : wu)->data,
+                fg_gate_up_pack_kernel<S, T, REORDERED, GRF256, REUSE_C>{ (const char *) (wg ? wg : wu)->data,
                     (const char *) wu->data, wu->nb[2], tiles, input, output, F, K, Npad, wg == nullptr, a, c });
         });
     }
 }
 
+template <typename S>
 static bool fg_gate_up_pack(const ggml_tensor * wu, const ggml_tensor * wg, bool reordered, bool grf256,
-                             const ggml_sycl_gg_tile * tiles, const fg_tuned_combo::tsb * input,
-                             fg_tuned_combo::tsb * output, int F, int K, int Npad, int count, dpct::queue_ptr stream) {
+                             const ggml_sycl_gg_tile * tiles, const typename S::tsb * input,
+                             typename S::tsb * output, int F, int K, int Npad, int count, dpct::queue_ptr stream) {
     static const bool reuse_c = ggml_sycl_get_env("GGML_SYCL_MMID_GATE_UP_REDUCE_REUSE", 1) != 0;
     auto launch = [&](auto tag) {
         using T = decltype(tag);
@@ -3425,11 +3426,11 @@ static bool fg_gate_up_pack(const ggml_tensor * wu, const ggml_tensor * wg, bool
             }
         }
         if (grf256 && reuse_c) {
-            fg_gate_up_pack_launch<typename T::type, T::reordered, true, true>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
+            fg_gate_up_pack_launch<S, typename T::type, T::reordered, true, true>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
         } else if (grf256) {
-            fg_gate_up_pack_launch<typename T::type, T::reordered, true>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
+            fg_gate_up_pack_launch<S, typename T::type, T::reordered, true>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
         } else {
-            fg_gate_up_pack_launch<typename T::type, T::reordered, false>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
+            fg_gate_up_pack_launch<S, typename T::type, T::reordered, false>(wu, wg, tiles, input, output, F, K, Npad, count, stream);
         }
     };
     switch (wu->type) {
@@ -3517,8 +3518,8 @@ static void fg_tiled_moe_run(ggml_backend_sycl_context & ctx, const ggml_tensor 
                                grouped_gemm_pack_b_wide_ok(input.base, input.nb1, input.nb2, K), stream);
         if (paired) {
             if constexpr (fg_is_tuned<S>()) {
-                GGML_ASSERT(fg_gate_up_pack(wu, wg, up_reordered, gate_up_mode == 2, tt, packed.get(),
-                                             down_packed, F, K, rows, count, stream));
+                GGML_ASSERT(fg_gate_up_pack<S>(wu, wg, up_reordered, gate_up_mode == 2, tt, packed.get(),
+                                                down_packed, F, K, rows, count, stream));
             }
         } else {
             const int up_m = gate ? F : 2 * F;

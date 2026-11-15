@@ -31,10 +31,14 @@ bool ggml_sycl_grouped_gemm_esimd(const char * src0_dd, size_t expert_stride, co
                                   dpct::queue_ptr stream);
 
 // The paired gate/up GEMM of the fused MoE chain (fg_gate_up_pack_kernel's contract): silu(gate) * up
-// written as f16 into the down GEMM's packed B. iq3_s, q8_0 and q4_K, either weight layout.
+// written as T (f16 or bf16, the packed B type) into the down GEMM's packed B. iq3_s, q8_0, q4_K and iq2_s,
+// either weight layout. _ok says whether it would run, without launching.
 template <typename block_q_t>
+bool ggml_sycl_gate_up_esimd_ok(const char * gate, const char * up, size_t expert_stride, const void * input,
+                                const void * output, int F, int K, int Npad, bool reordered);
+template <typename block_q_t, typename T>
 bool ggml_sycl_gate_up_esimd(const char * gate, const char * up, size_t expert_stride, const ggml_sycl_gg_tile * tiles,
-                             const sycl::half * input, sycl::half * output, int F, int K, int Npad, bool merged,
+                             const T * input, T * output, int F, int K, int Npad, bool merged,
                              bool reordered, int64_t n_tiles, dpct::queue_ptr stream);
 
 // GGML_SYCL_MMID_ESIMD: 1 (default) takes the ESIMD kernels above where they apply, 0 never does
