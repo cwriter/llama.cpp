@@ -199,9 +199,11 @@ bool ggml_sycl_can_fuse(const ggml_cgraph * cgraph, int node_idx, std::initializ
             return false;
         }
 
-        // SCALE is F32-only in this backend, and the fused kernel indexes every operand flat
+        // SCALE is F32-only in this backend, and the fused kernel indexes every operand flat. The unary may be
+        // stored in f16 for its readers [GGML_SCHED_NARROW]
         const ggml_tensor * x = scale->src[0];
-        if (x->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32) {
+        if (x->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+            (unary->type != GGML_TYPE_F32 && unary->type != GGML_TYPE_F16)) {
             return false;
         }
         if (!ggml_are_same_shape(x, unary) || !ggml_is_contiguous(x) || !ggml_is_contiguous(unary)) {

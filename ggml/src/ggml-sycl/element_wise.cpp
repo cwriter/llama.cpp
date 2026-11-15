@@ -269,10 +269,10 @@ static __dpct_inline__ T op_trunc(T x) {
     }
 }
 
-template<typename T, typename F>
-static void unary_op_flat_kernel(const T * x, T * dst, const int k, const sycl::nd_item<1> & item_ct1, F func) {
+template<typename T, typename TD, typename F>
+static void unary_op_flat_kernel(const T * x, TD * dst, const int k, const sycl::nd_item<1> & item_ct1, F func) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
-        dst[i] = func(x[i]);
+        dst[i] = static_cast<TD>(func(x[i]));
     }
 }
 
@@ -383,10 +383,10 @@ static void clamp(const T * x, T * dst, const float min, const float max, const 
     }
 }
 
-template<typename T, typename F>
-static void unary_gated_op_flat_kernel(const T * x, const T * g, T * dst, const uint64_t k, const sycl::nd_item<1> & item_ct1, F func) {
+template<typename T, typename TD, typename F>
+static void unary_gated_op_flat_kernel(const T * x, const T * g, TD * dst, const uint64_t k, const sycl::nd_item<1> & item_ct1, F func) {
     SYCL_GLOBAL_ID_LOOP(k, item_ct1) {
-        dst[i] = func(x[i]) * g[i];
+        dst[i] = static_cast<TD>(func(x[i]) * g[i]);
     }
 }
 
@@ -660,6 +660,21 @@ static inline void ggml_sycl_op_unary(
     // skip the strided index math entirely for them.
     const bool contiguous = ggml_is_contiguous(src0) && ggml_is_contiguous(dst);
 
+    // an f32 activation stored in f16 for its readers [GGML_SCHED_NARROW]
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+        GGML_ASSERT(contiguous);
+        const float * src     = (const float *) src0->data;
+        sycl::half *  dst_ptr = (sycl::half *) dst->data;
+        const int     k       = (int) ggml_nelements(dst);
+        SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+        ctx.stream()->parallel_for(
+            sycl::nd_range<1>(sycl::range<1>(ceil_div(k, 256)) * sycl::range<1>(256), sycl::range<1>(256)),
+            [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                unary_op_flat_kernel(src, dst_ptr, k, item_ct1, func);
+            });
+        return;
+    }
+
     ggml_sycl_detail::dispatch_ggml_sycl_op_unary(ctx, dst,
         [=](const auto* src, auto* dst_ptr, int k_elements, queue_ptr stream) {
 
@@ -698,6 +713,30 @@ static inline void ggml_sycl_op_unary(
 template<typename F>
 static inline void ggml_sycl_op_unary_gated(
         ggml_backend_sycl_context & ctx, ggml_tensor * dst, F func) {
+
+    // f32 operands, the output stored in f16 for its readers [GGML_SCHED_NARROW]
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16) {
+        const int64_t nc = dst->ne[0];
+        // two separate contiguous srcs only: can_store_type does not narrow a single fused [gate|up] src0
+        GGML_ASSERT(src1 && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) &&
+                    ggml_is_contiguous(dst) && src0->ne[0] == nc && src1->ne[0] == nc);
+        GGML_ASSERT(ggml_nelements(dst) < ((int64_t) 1 << 31));
+        // as dispatch_ggml_sycl_op_fused_glu: with two srcs the activation is src0
+        const float * x       = (const float *) src0->data;
+        const float * g       = (const float *) src1->data;
+        sycl::half *  dst_ptr = (sycl::half *) dst->data;
+        const uint64_t k      = ggml_nelements(dst);
+        SYCL_CHECK(ggml_sycl_set_device(ctx.device));
+        const uint32_t num_blocks = (uint32_t) ceil_div(k, SYCL_GLU_BLOCK_SIZE);
+        ctx.stream()->parallel_for(
+            sycl::nd_range<1>(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE), sycl::range<1>(SYCL_GLU_BLOCK_SIZE)),
+            [=](sycl::nd_item<1> item_ct1) [[sycl::reqd_sub_group_size(WARP_SIZE)]] {
+                unary_gated_op_flat_kernel(x, g, dst_ptr, k, item_ct1, func);
+            });
+        return;
+    }
 
     dispatch_ggml_sycl_op_fused_glu(ctx, dst,
         [func](const auto * x_ptr, const auto * g_ptr, auto * dst_ptr, uint64_t k, uint64_t n, uint64_t o0, uint64_t o1, queue_ptr main_stream) {
@@ -1053,8 +1092,8 @@ static void dispatch_fused_unary_op(ggml_unary_op uop, F && launch) {
 
 // dst = op(unary_node->src[0]) * other, written straight to the MUL output, saving the
 // standalone unary launch. Preconditions come from ggml_sycl_can_fuse(); re-asserted here.
-template <typename T, typename F>
-static void scale_unary_sycl(const T * x, T * dst, const int64_t k, const float scale, const float bias,
+template <typename T, typename TD, typename F>
+static void scale_unary_sycl(const T * x, TD * dst, const int64_t k, const float scale, const float bias,
                              queue_ptr main_stream, F op) {
     const size_t            num_blocks = ceil_div((size_t) k, (size_t) SYCL_GLU_BLOCK_SIZE);
     const sycl::nd_range<1> range(num_blocks * sycl::range<1>(SYCL_GLU_BLOCK_SIZE),
@@ -1064,7 +1103,7 @@ static void scale_unary_sycl(const T * x, T * dst, const int64_t k, const float 
         if (i >= k) {
             return;
         }
-        dst[i] = op(static_cast<T>(scale * static_cast<float>(x[i]) + bias));
+        dst[i] = static_cast<TD>(op(static_cast<T>(scale * static_cast<float>(x[i]) + bias)));
     });
 }
 
@@ -1075,7 +1114,8 @@ void ggml_sycl_op_scale_unary_fused(ggml_backend_sycl_context & ctx, ggml_tensor
     const ggml_tensor * x = scale_node->src[0];
 
     GGML_ASSERT(unary_node->src[0] == scale_node);
-    GGML_ASSERT(x->type == scale_node->type && x->type == unary_node->type);
+    // the unary output may be stored in f16 for its readers [GGML_SCHED_NARROW]
+    GGML_ASSERT(x->type == scale_node->type && (x->type == unary_node->type || unary_node->type == GGML_TYPE_F16));
     GGML_ASSERT(ggml_are_same_shape(x, unary_node));
     // both the scale and the unary index flat, so every operand must be fully contiguous
     GGML_ASSERT(ggml_is_contiguous(x) && ggml_is_contiguous(unary_node));
@@ -1092,8 +1132,12 @@ void ggml_sycl_op_scale_unary_fused(ggml_backend_sycl_context & ctx, ggml_tensor
 
     // GGML_OP_SCALE is F32-only in this backend, and ggml_sycl_can_fuse() checks it
     const auto dispatch_type = [&](auto op) {
-        GGML_ASSERT(unary_node->type == GGML_TYPE_F32);
-        scale_unary_sycl((const float *) x->data, (float *) unary_node->data, k, scale, bias, main_stream, op);
+        GGML_ASSERT(x->type == GGML_TYPE_F32);
+        if (unary_node->type == GGML_TYPE_F16) {
+            scale_unary_sycl((const float *) x->data, (sycl::half *) unary_node->data, k, scale, bias, main_stream, op);
+        } else {
+            scale_unary_sycl((const float *) x->data, (float *) unary_node->data, k, scale, bias, main_stream, op);
+        }
     };
 
     switch (ggml_get_unary_op(unary_node)) {

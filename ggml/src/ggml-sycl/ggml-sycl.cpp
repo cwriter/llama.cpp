@@ -6970,6 +6970,11 @@ static bool ggml_sycl_mul_mat_glu_fused(ggml_backend_sycl_context & ctx, ggml_cg
     const ggml_tensor * wg   = gate->src[0];
     const ggml_tensor * act  = up->src[1];
 
+    // the kernels below write f32; a GLU stored narrower for its readers runs unfused [GGML_SCHED_NARROW]
+    if (glu->type != GGML_TYPE_F32) {
+        return false;
+    }
+
     // this writes glu->data directly rather than the per-device row slices that
     // ggml_sycl_op_mul_mat() stitches back together, so it cannot serve split weights
     if (ggml_backend_buffer_is_sycl_split(wu->buffer) || ggml_backend_buffer_is_sycl_split(wg->buffer)) {
@@ -11473,27 +11478,52 @@ static ggml_type ggml_backend_sycl_src_read_type(ggml_backend_t backend, const g
 }
 
 // A node may be stored narrower only where every kernel that can write it knows. Decided by structure, since
-// graph_optimize reorders the split later: a gated MUL, x * sigmoid or silu of a gate (the gated norm's output, the
-// attention output gate), is written by the fused gated norm, the UNARY + MUL and gate-view fusions or bin_bcast, and
-// all of them store f16. A MUL right after a norm (norm * weight) is written by the norm fusions, and a gate fed by an
-// ADD by the alpha gate and mat-vec epilogue fusions, which store f32
+// graph_optimize reorders the split later:
+// - a gated MUL, x * sigmoid or silu of a gate (the gated norm's output, the attention output gate), is written by
+//   the fused gated norm, the UNARY + MUL and gate-view fusions or bin_bcast, and all of them store f16. A MUL right
+//   after a norm (norm * weight) is written by the norm fusions, and a gate fed by an ADD by the alpha gate and
+//   mat-vec epilogue fusions, which store f32
+// - a SILU of a projection or of a SCALE (the hyper-connection gate MLP) is written by the unary kernel or the
+//   SCALE + UNARY fusion, which store f16. A SILU of the short conv is written by the SSM_CONV fusions, in f32
+// - a two-source GLU of dense projections (the shared expert) is written by the GLU kernel, which stores f16; the
+//   mat-vec GLU fusions decline it. A GLU of expert projections belongs to the MoE chains, which keep f32
 static bool ggml_backend_sycl_can_store_type(ggml_backend_t backend, const ggml_cgraph * graph, int node_idx, ggml_type type) {
     GGML_UNUSED(backend);
     const ggml_tensor * node = graph->nodes[node_idx];
-    if (type != GGML_TYPE_F16 || node->op != GGML_OP_MUL || node->src[0]->type != GGML_TYPE_F32 ||
-        node->src[1]->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
+    if (type != GGML_TYPE_F16 || !ggml_is_contiguous(node)) {
         return false;
     }
-    auto is_gate = [](const ggml_tensor * u) {
-        return u->op == GGML_OP_UNARY && (ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(u) == GGML_UNARY_OP_SILU) &&
-               u->src[0]->op != GGML_OP_ADD;
-    };
-    const ggml_tensor * u = is_gate(node->src[1]) ? node->src[1] : is_gate(node->src[0]) ? node->src[0] : nullptr;
-    if (u == nullptr) {
-        return false;
+    const ggml_tensor * a = node->src[0];
+    const ggml_tensor * b = node->src[1];
+    switch (node->op) {
+        case GGML_OP_UNARY:
+            return ggml_get_unary_op(node) == GGML_UNARY_OP_SILU && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
+                   (a->op == GGML_OP_SCALE || a->op == GGML_OP_MUL_MAT);
+        case GGML_OP_GLU: {
+            const ggml_glu_op op = ggml_get_glu_op(node);
+            return (op == GGML_GLU_OP_SWIGLU || op == GGML_GLU_OP_GEGLU || op == GGML_GLU_OP_REGLU) && b != nullptr &&
+                   a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
+                   ggml_is_contiguous(b) && ggml_are_same_shape(a, node) && ggml_are_same_shape(b, node) &&
+                   a->op == GGML_OP_MUL_MAT && b->op == GGML_OP_MUL_MAT;
+        }
+        case GGML_OP_MUL: {
+            if (a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32) {
+                return false;
+            }
+            auto is_gate = [](const ggml_tensor * u) {
+                return u->op == GGML_OP_UNARY && (ggml_get_unary_op(u) == GGML_UNARY_OP_SIGMOID || ggml_get_unary_op(u) == GGML_UNARY_OP_SILU) &&
+                       u->src[0]->op != GGML_OP_ADD;
+            };
+            const ggml_tensor * u = is_gate(b) ? b : is_gate(a) ? a : nullptr;
+            if (u == nullptr) {
+                return false;
+            }
+            const ggml_tensor * x = u == b ? a : b;
+            return x->op != GGML_OP_RMS_NORM && x != u;
+        }
+        default:
+            return false;
     }
-    const ggml_tensor * x = u == node->src[1] ? node->src[0] : node->src[1];
-    return x->op != GGML_OP_RMS_NORM && x != u;
 }
 
 static bool ggml_backend_sycl_graph_cut_ok(ggml_backend_t backend, const ggml_cgraph * cgraph, int node_idx) {

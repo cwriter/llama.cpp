@@ -910,7 +910,10 @@ bool ggml_sycl_match_dsv4_hc_pre_up(const ggml_cgraph * cgraph, int node_idx, gg
         !ggml_is_contiguous(w) || w->ne[2] != 1 || w->ne[3] != 1 || (uintptr_t) w->data % 4 != 0) {
         return false;
     }
-    if (lo->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || unary->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) {
+    // a wide ubatch stores the silu in f16 for the up projection [GGML_SCHED_NARROW]; the fused kernel never runs
+    // there, but the allocation dependency asked for with any_tokens must not depend on it
+    if (lo->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32 ||
+        (unary->type != GGML_TYPE_F32 && !(any_tokens && unary->type == GGML_TYPE_F16))) {
         return false;
     }
     if (!ggml_is_contiguous_rows(lo) || lo->ne[1] != n_tokens || lo->ne[2] != 1 || lo->ne[3] != 1 ||
