@@ -1187,6 +1187,59 @@ static bool ggml_sycl_moe_restorable_type(ggml_type type) {
     return ggml_sycl_moe_streams(type, st) > 0;
 }
 
+// The MoE reorder layouts as planes, for the device copies of the MoE cache: per type, the planes of an expert
+// slice in order, each holding per block up to two byte ranges of the canonical block. This also covers layouts
+// that no host transfer restores, and only these types are reordered through a view (ggml_sycl_moe_slice_root)
+struct ggml_sycl_moe_plane {
+    int    n_seg;
+    size_t aos[2];
+    size_t size[2];
+};
+
+static int ggml_sycl_moe_planes(ggml_type type, ggml_sycl_moe_plane * p) {
+    ggml_sycl_moe_stream st[4];
+    const int n_streams = ggml_sycl_moe_streams(type, st);
+    for (int i = 0; i < n_streams; ++i) {
+        p[i] = { 1, { st[i].aos, 0 }, { st[i].size, 0 } };
+    }
+    if (n_streams > 0) {
+        return n_streams;
+    }
+    switch (type) {
+        case GGML_TYPE_IQ4_NL:  // reorder_qw_soa2_moe: [qs of every block][d of every block]
+            p[0] = { 1, { offsetof(block_iq4_nl, qs), 0 }, { QK4_NL / 2, 0 } };
+            p[1] = { 1, { 0, 0 }, { sizeof(ggml_half), 0 } };
+            return 2;
+        case GGML_TYPE_Q8_0:
+            p[0] = { 1, { offsetof(block_q8_0, qs), 0 }, { QK8_0, 0 } };
+            p[1] = { 1, { 0, 0 }, { sizeof(ggml_half), 0 } };
+            return 2;
+        case GGML_TYPE_IQ3_S:   // reorder_qw_iq3_s_moe: qs, qh, signs, then d and the scales of each block together
+            p[0] = { 1, { offsetof(block_iq3_s, qs), 0 }, { QK_K / 4, 0 } };
+            p[1] = { 1, { offsetof(block_iq3_s, qh), 0 }, { QK_K / 32, 0 } };
+            p[2] = { 1, { offsetof(block_iq3_s, signs), 0 }, { QK_K / 8, 0 } };
+            p[3] = { 2, { 0, offsetof(block_iq3_s, scales) }, { sizeof(ggml_half), IQ3S_N_SCALE } };
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+// The weight a view of whole expert slices reads, the view itself if it is not a view, nullptr for any other
+// view. The MoE cache gives the matmuls such views of its banks, so the view shares the layout of the bank
+static const ggml_tensor * ggml_sycl_moe_slice_root(const ggml_tensor * t) {
+    const ggml_tensor * r = t->view_src;
+    if (r == nullptr) {
+        return t;
+    }
+    if (r->view_src != nullptr || r->ne[2] <= 1 || r->ne[3] != 1 || t->ne[3] != 1 || t->type != r->type ||
+        t->ne[0] != r->ne[0] || t->ne[1] != r->ne[1] || t->nb[1] != r->nb[1] || t->nb[2] != r->nb[2] ||
+        t->view_offs % r->nb[2] != 0) {
+        return nullptr;
+    }
+    return r;
+}
+
 static const ggml_tensor * ggml_sycl_moe_reordered_owner(const ggml_tensor * tensor) {
     while (tensor->view_src) {
         tensor = tensor->view_src;
@@ -6456,12 +6509,23 @@ static inline bool ggml_sycl_mul_mat_id_reorders_type(enum ggml_type type) {
            (type == GGML_TYPE_IQ2_S  && (g_ggml_sycl_reorder_types & GGML_SYCL_REORDER_IQ2_S));
 }
 
-static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * src0) {
+static void opt_for_reorder_id(ggml_backend_sycl_context * ctx, const ggml_tensor * w) {
     if (!g_ggml_sycl_enable_optimize || !ctx->opt_feature.reorder) {
         return;
     }
-    if (!ggml_sycl_mul_mat_id_reorders_type(src0->type)) {
+    if (!ggml_sycl_mul_mat_id_reorders_type(w->type)) {
         return;
+    }
+    // a view of whole expert slices (the MoE cache banks) takes the layout of the weight it views, which is
+    // reordered as a whole. Only for the layouts its fills and copies can convert on the device
+    const ggml_tensor * src0 = w;
+    if (w->view_src != nullptr) {
+        ggml_sycl_moe_plane planes[4];
+        src0 = ggml_sycl_moe_slice_root(w);
+        if (src0 == nullptr || src0->extra == nullptr || ggml_sycl_moe_planes(src0->type, planes) == 0) {
+            return;
+        }
+        const_cast<ggml_tensor *>(w)->extra = src0->extra;
     }
     // The MXFP4 reorder kernels use 8-byte vector loads, so every expert slice must stay aligned.
     if (src0->type == GGML_TYPE_MXFP4 && (src0->nb[2] % 16 != 0 || (uintptr_t) src0->data % 16 != 0)) {
@@ -8473,6 +8537,108 @@ static void ggml_backend_sycl_free(ggml_backend_t backend) {
     delete backend;
 }
 
+// The reordered MoE weight written at [offset, offset + size) of tensor, if the write covers whole expert slices
+static const ggml_tensor * ggml_sycl_moe_reordered_slices(const ggml_tensor * tensor, size_t offset, size_t size) {
+    const ggml_tensor * root = tensor;
+    while (root->view_src) {
+        root = root->view_src;
+    }
+    ggml_sycl_moe_plane planes[4];
+    if (root->ne[2] <= 1 || !root->buffer || !ggml_backend_buffer_is_sycl(root->buffer) ||
+        ggml_backend_buffer_is_sycl_split(root->buffer) || ggml_sycl_moe_planes(root->type, planes) == 0) {
+        return nullptr;
+    }
+    const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(root->extra);
+    if (!extra || !extra->optimized_feature.is_reordered()) {
+        return nullptr;
+    }
+    const size_t start = (size_t) ((const char *) tensor->data - (const char *) root->data) + offset;
+    if (size == 0 || start % root->nb[2] != 0 || size % root->nb[2] != 0 || start + size > ggml_nbytes(root)) {
+        return nullptr;
+    }
+    return root;
+}
+
+// Converts n expert slices between the canonical blocks and the planes of ggml_sycl_moe_planes(), from src to dst
+// on the queue: into the planes for the slices the MoE cache fills, back for the ones it copies out. Every byte
+// range of the plane table is even, so each work item moves one 16-bit word and the writes are coalesced
+static void ggml_sycl_moe_convert_slices(ggml_type type, const uint8_t * src, uint8_t * dst, size_t slice_bytes,
+                                         int64_t n, bool to_planes, const queue_ptr & stream) {
+    struct segments {
+        uint32_t aos[8];     // start in the canonical block
+        uint32_t size[8];    // bytes per block
+        uint32_t pstart[8];  // the segment's plane in the slice: [pstart, pend)
+        uint32_t pend[8];
+        uint32_t segoff[8];  // start in the plane's bytes of one block
+        uint32_t step[8];    // the plane's bytes per block
+        int      n;
+    } sg = {};
+    ggml_sycl_moe_plane p[4];
+    const int    n_planes    = ggml_sycl_moe_planes(type, p);
+    const size_t block_bytes = ggml_type_size(type);
+    GGML_ASSERT(n_planes > 0 && slice_bytes % block_bytes == 0 && block_bytes % 2 == 0 && slice_bytes <= UINT32_MAX);
+    const size_t nblocks = slice_bytes / block_bytes;
+    size_t off = 0;
+    for (int i = 0; i < n_planes; ++i) {
+        const size_t step = p[i].size[0] + (p[i].n_seg > 1 ? p[i].size[1] : 0);
+        size_t segoff = 0;
+        for (int k = 0; k < p[i].n_seg; ++k) {
+            GGML_ASSERT(p[i].aos[k] % 2 == 0 && p[i].size[k] % 2 == 0);
+            sg.aos[sg.n]    = (uint32_t) p[i].aos[k];
+            sg.size[sg.n]   = (uint32_t) p[i].size[k];
+            sg.pstart[sg.n] = (uint32_t) off;
+            sg.pend[sg.n]   = (uint32_t) (off + nblocks * step);
+            sg.segoff[sg.n] = (uint32_t) segoff;
+            sg.step[sg.n]   = (uint32_t) step;
+            segoff += p[i].size[k];
+            sg.n++;
+        }
+        off += nblocks * step;
+    }
+    GGML_ASSERT(off == slice_bytes);
+    const uint32_t block = (uint32_t) block_bytes;
+    const size_t   words = slice_bytes / 2;
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->parallel_for(sycl::range<1>(words * (size_t) n), [=](sycl::id<1> id) {
+        const size_t   e    = id[0] / words;
+        const uint32_t o    = (uint32_t) (id[0] % words) * 2;  // the byte written in the slice
+        uint32_t       from = 0;
+        for (int k = 0; k < sg.n; ++k) {
+            if (to_planes) {
+                if (o >= sg.pstart[k] && o < sg.pend[k]) {
+                    const uint32_t r = o - sg.pstart[k];
+                    const uint32_t w = r % sg.step[k];
+                    if (w >= sg.segoff[k] && w < sg.segoff[k] + sg.size[k]) {
+                        from = r / sg.step[k] * block + sg.aos[k] + (w - sg.segoff[k]);
+                    }
+                }
+            } else {
+                const uint32_t ob = o % block;
+                if (ob >= sg.aos[k] && ob < sg.aos[k] + sg.size[k]) {
+                    from = sg.pstart[k] + o / block * sg.step[k] + sg.segoff[k] + (ob - sg.aos[k]);
+                }
+            }
+        }
+        *(uint16_t *) (dst + e * slice_bytes + o) = *(const uint16_t *) (src + e * slice_bytes + from);
+    })));
+}
+
+// The MoE cache fills whole slices of its banks with canonical experts: upload them and convert them into the
+// slots on the queue, behind the kernels that read the previous experts of those slots
+static bool ggml_sycl_moe_fill_reordered(ggml_backend_sycl_context * ctx, ggml_tensor * tensor, const void * data,
+                                         size_t offset, size_t size) {
+    const ggml_tensor * root = ggml_sycl_moe_reordered_slices(tensor, offset, size);
+    if (root == nullptr) {
+        return false;
+    }
+    const queue_ptr stream = ctx->stream(ctx->device, 0);
+    ggml_sycl_pipe_trace_scope trace_scope("SETR", ctx->device, tensor->name, size);
+    ggml_sycl_pool_alloc<uint8_t> tmp(ctx->pool(), size);
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tmp.get(), data, size)));
+    ggml_sycl_moe_convert_slices(root->type, tmp.get(), (uint8_t *) tensor->data + offset, root->nb[2],
+                                 (int64_t) (size / root->nb[2]), true, stream);
+    return true;
+}
+
 static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
                                                ggml_tensor *tensor,
                                                const void *data, size_t offset,
@@ -8486,6 +8652,9 @@ static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
 
     GGML_ASSERT(buf->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     const queue_ptr stream = sycl_ctx->stream(sycl_ctx->device, 0);
+    if (ggml_sycl_moe_fill_reordered(sycl_ctx, tensor, data, offset, size)) {
+        return;
+    }
     if (ggml_sycl_kq_mask_is_bits(tensor) || ggml_sycl_kv_is_soa(tensor) || ggml_sycl_moe_reordered_owner(tensor)) {
         // packing and permuting work on a host copy, which the staged upload takes care of
         ggml_backend_sycl_buffer_set_tensor(buf, tensor, data, offset, size);
@@ -8681,9 +8850,38 @@ static bool sycl_copy_via_src_ring(int device_src, sycl::queue & q_src, sycl::qu
 //     when that slot comes round again; without it the source queue waits for the read itself;
 //   - a host source is staged through pinned memory by set_tensor, which copies it out
 //     synchronously, so the caller may reuse the source buffer as soon as this returns.
+// A copy of whole slices of a reordered MoE weight into a canonical tensor on the same device (the MoE cache
+// handing the experts it holds to the copy of a host weight for a large batch) restores the layout on the way
+static bool ggml_sycl_moe_copy_restored(ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_backend_is_sycl(backend_dst) || src->type != dst->type || !ggml_is_contiguous(src) ||
+        !ggml_is_contiguous(dst) || ggml_nbytes(src) != ggml_nbytes(dst) || dst->buffer == nullptr) {
+        return false;
+    }
+    const ggml_tensor * root = ggml_sycl_moe_reordered_slices(src, 0, ggml_nbytes(src));
+    if (root == nullptr) {
+        return false;
+    }
+    const ggml_tensor * dst_root = dst->view_src ? dst->view_src : dst;
+    const auto * dst_extra = static_cast<const ggml_tensor_extra_gpu *>(dst_root->extra);
+    auto * ctx = static_cast<ggml_backend_sycl_context *>(backend_dst->context);
+    const auto * src_bctx = static_cast<const ggml_backend_sycl_buffer_context *>(root->buffer->context);
+    if ((dst_extra && dst_extra->optimized_feature.is_reordered()) || src_bctx->device != ctx->device ||
+        dst->buffer->buft != ggml_backend_sycl_buffer_type(ctx->device)) {
+        return false;
+    }
+    ggml_sycl_upload_join(ctx->device);
+    ggml_sycl_pipe_trace_scope trace_scope("CPYR", ctx->device, dst->name, ggml_nbytes(dst));
+    ggml_sycl_moe_convert_slices(root->type, (const uint8_t *) src->data, (uint8_t *) dst->data, root->nb[2],
+                                 (int64_t) (ggml_nbytes(src) / root->nb[2]), false, ctx->stream(ctx->device, 0));
+    return true;
+}
+
 static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst,
                                                const ggml_tensor * src, ggml_tensor * dst) try {
     GGML_SYCL_DEBUG("[SYCL] call %s\n", __func__);
+    if (ggml_sycl_moe_copy_restored(backend_dst, src, dst)) {
+        return true;
+    }
     if (ggml_sycl_moe_reordered_owner(src) || ggml_sycl_moe_reordered_owner(dst)) {
         return false;
     }
@@ -10488,6 +10686,10 @@ static bool graph_needs_reorder(ggml_backend_sycl_context * ctx, const ggml_cgra
         }
 
         const ggml_tensor * src0 = node->src[0];
+        // a view of expert slices is reordered through the weight it views (opt_for_reorder_id)
+        if (src0 != nullptr && src0->extra == nullptr && src0->view_src != nullptr && node->op == GGML_OP_MUL_MAT_ID) {
+            src0 = ggml_sycl_moe_slice_root(src0);
+        }
         const ggml_tensor_extra_gpu * extra = src0 != nullptr
             ? static_cast<const ggml_tensor_extra_gpu *>(src0->extra)
             : nullptr;
@@ -10772,6 +10974,10 @@ static bool check_graph_compatibility(ggml_backend_sycl_context * ctx, ggml_cgra
 static void ggml_sycl_moe_check_consumers(ggml_backend_sycl_context & ctx, const ggml_cgraph * cgraph) {
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
+        // a view reads nothing; the nodes that read it are checked against its owner
+        if (ggml_sycl_is_view_or_noop(node)) {
+            continue;
+        }
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             const ggml_tensor * src = node->src[j];
             if (!src || !ggml_sycl_moe_restorable_type(src->type)) {
@@ -10785,7 +10991,8 @@ static void ggml_sycl_moe_check_consumers(ggml_backend_sycl_context & ctx, const
                 continue;
             }
             auto * extra = static_cast<ggml_tensor_extra_gpu *>(owner->extra);
-            if (!extra || (node->op == GGML_OP_MUL_MAT_ID && j == 0 && src == owner)) {
+            // the matmul reads a view of whole slices in the owner's layout (opt_for_reorder_id)
+            if (!extra || (node->op == GGML_OP_MUL_MAT_ID && j == 0 && ggml_sycl_moe_slice_root(src) == owner)) {
                 continue;
             }
             extra->optimized_feature.reorder_allowed = false;
