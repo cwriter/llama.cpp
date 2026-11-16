@@ -6669,6 +6669,11 @@ static int ggml_sycl_try_gdn_cache_fusion(const ggml_cgraph * cgraph, int node_i
     }
 
     const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    // pending inputs may alias the cache destination
+    if (gdn->src[6] != nullptr) {
+        return 0;
+    }
+
     // the kernel skips the snapshot tail, so the gdn output must not be a graph output, and the cpy
     // found below is taken to be its only reader, as it is in every graph that builds this op
     if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
@@ -7743,8 +7748,7 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
         case GGML_OP_OPT_STEP_SGD:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // replay of pending tokens (op param 1) is not implemented
-            return ggml_get_op_params_i32(op, 1) == 0;
+            return op->src[6] == nullptr || ggml_get_op_params_i32(op, 0) == 1;
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&
