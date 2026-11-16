@@ -13695,6 +13695,34 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 6, 4096, 5120, {1, 1}, {1, 1}));
 
+    // Dense ESIMD K split (few row tiles, K of >= 16 stored blocks): atomically summed K ranges.
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        for (int n : {17, 64, 100}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 64, n, 4096, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 96, n, 8192, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_reused_weight(type, 4096, 64));
+    }
+
+    // Dense ESIMD tile tails and reuse after the single-column weight reorder.
+    for (ggml_type type : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
+        for (int n : {2, 31, 32, 33, 63, 64, 65, 80, 81, 127, 128, 129}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 96, n, 256, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_reused_weight(type, 256, n));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 97, 65, 256, {1, 1}, {1, 1}));
+    }
+
+    // Dense ESIMD: short and odd K, row counts not a multiple of the row tile.
+    for (ggml_type type : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
+        for (int n : {33, 65, 129}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 24, n, 768, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 32, 129, 1536, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 25, 65, 768, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat_reused_weight(type, 768, 65));
+    }
+
     // SIMD K boundaries, including tails shorter than one vector.
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
         for (int k : {1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 48}) {
@@ -15347,6 +15375,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_a : all_types) {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
+            }
+        }
+    }
+
+    // Dense FFN gate/up and down shapes of Qwen3.8-27B and Qwen3.5-0.8B.
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
+        for (auto mk : std::vector<std::array<int64_t, 2>>{ {17408, 5120}, {5120, 17408}, {3584, 1024}, {1024, 3584} }) {
+            for (int n : {16, 31, 32, 33, 48, 63, 64, 65, 80, 81, 96, 128, 256, 512, 1024}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, mk[0], n, mk[1], {1, 1}, {1, 1}));
             }
         }
     }

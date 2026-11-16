@@ -1185,6 +1185,153 @@ template <typename block_q_t, int KS, typename T, bool AOS, typename A> struct g
     auto get(syclexp::properties_tag) const { return syclexp::properties{ sycl::ext::intel::experimental::grf_size<256> }; }
 };
 
+// Dense (single matrix) dequant GEMM: a thread owns MR weight rows x NT * NW columns over the whole K, so one
+// decode feeds NT dpas column tiles. Threads go in groups of GM row blocks with all column tiles of the group
+// together, so concurrent threads share weight rows in L2 instead of streaming the whole weight per column tile.
+template <typename block_q_t, typename T, bool AOS, typename A, int NT> struct dense_gemm_esimd_kernel {
+    using F = gg_esimd_a<block_q_t, A::MR>;
+
+    const char * weights;
+    const T *    packed;
+    float *      dst;
+    int          M;
+    int          N;
+    int          Npad;
+    int          K;
+    int          GM;
+    int          KS; // K ranges; > 1 adds them atomically into a zeroed dst
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        if constexpr (gg_built<A>()) {
+            run(it);
+        }
+    }
+
+    ESIMD_INLINE void run(sycl::nd_item<1> it) const {
+        using namespace sycl::ext::intel::esimd;
+        namespace xmx = ggml_sycl_xmx::esimd;
+        constexpr int MR  = A::MR;
+        constexpr int NW  = A::NW;
+        constexpr int RC  = GG_RC;
+        constexpr int RG  = MR / RC;
+        constexpr int BNT = NT * NW;
+        constexpr int KPB = F::qk / GG_QK;
+        static_assert(A::L2D, "the dense kernel reads B with 2D block loads");
+
+        if constexpr (F::slm_bytes > 0) {
+            slm_init<F::slm_bytes>();
+            F::init_slm();
+        }
+
+        const int mblocks = M / MR;
+        const int ntiles  = (N + BNT - 1) / BNT;
+        const int gall    = it.get_global_id(0);
+        const int ks      = gall / (mblocks * ntiles);
+        const int gid     = gall - ks * mblocks * ntiles;
+        const int grp     = gid / (GM * ntiles);
+        const int in      = gid - grp * GM * ntiles;
+        const int gm      = GM < mblocks - grp * GM ? GM : mblocks - grp * GM;
+        const int mb      = grp * GM + in % gm;
+        const int t       = in / gm;
+        const int m0      = mb * MR;
+        const int n0      = t * BNT;
+        const int ncols   = BNT < N - n0 ? BNT : N - n0;
+
+        const int                                 bpr = K / F::qk;
+        const gg_esimd::slice<MR, typename A::HW> sl  = { (const uint8_t *) weights, M, bpr, M * bpr, m0, AOS,
+                                                          (int) sizeof(block_q_t) };
+        const uint32_t *                          bp  = (const uint32_t *) packed;
+        const unsigned                            bw  = (unsigned) Npad * 4;
+        // K range of this thread, in whole stored blocks
+        const int                                 kb_begin = (ks * bpr / KS) * KPB;
+        const int                                 kb_end   = ((ks + 1) * bpr / KS) * KPB;
+
+        simd<float, RC * NW> acc[RG][NT];
+#pragma unroll
+        for (int g = 0; g < RG; ++g) {
+#pragma unroll
+            for (int nt = 0; nt < NT; ++nt) {
+                acc[g][nt] = 0.0f;
+            }
+        }
+
+        typename F::sb_t sb;
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
+            const int j = kb % KPB;
+            if (j == 0) {
+                F::load_sb(sb, sl, kb / KPB);
+            }
+            typename F::raw r;
+            F::load(r, sb, sl, kb, j);
+            // first B tile loads while the weights decode
+            simd<uint32_t, 16 * NW> b = xmx::load_2d<typename A::HW, uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1,
+                                                                                         n0, kb * 16);
+            gg_esimd::a_vals<T> av[RG];
+            if constexpr (F::whole) {
+                simd<T, MR * GG_QK> all = F::template decode_all<T>(r);
+                auto                am  = all.template bit_cast_view<T, MR, GG_QK>();
+#pragma unroll
+                for (int g = 0; g < RG; ++g) {
+                    av[g].template select<RC * 16, 1>(0)       = am.template select<RC, 1, 16, 1>(g * RC, 0);
+                    av[g].template select<RC * 16, 1>(RC * 16) = am.template select<RC, 1, 16, 1>(g * RC, 16);
+                }
+            } else {
+                auto dec = [&](auto gc) SYCL_ESIMD_FUNCTION {
+                    constexpr int g = decltype(gc)::value;
+                    av[g]           = F::template decode<g, T>(r);
+                };
+                gg_esimd::static_for<0, RG>::run(dec);
+            }
+            auto col_tile = [&](auto ntc) SYCL_ESIMD_FUNCTION {
+                constexpr int nt = decltype(ntc)::value;
+                simd<uint32_t, 16 * NW> bn;
+                if constexpr (nt + 1 < NT) {
+                    bn = xmx::load_2d<typename A::HW, uint32_t, NW, 16>(bp, bw - 1, K / 2 - 1, bw - 1,
+                                                                        n0 + (nt + 1) * NW, kb * 16);
+                }
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    simd<uint32_t, 8 * NW> bh32 = b.template select<8 * NW, 1>(h * 8 * NW);
+                    simd<T, 16 * NW>       bh   = bh32.template bit_cast_view<T>();
+#pragma unroll
+                    for (int g = 0; g < RG; ++g) {
+                        simd<T, RC * 16> at = av[g].template select<RC * 16, 1>(h * RC * 16);
+                        acc[g][nt]          = xmx::dpas<8, RC, float, float>(acc[g][nt], bh, at);
+                    }
+                }
+                if constexpr (nt + 1 < NT) {
+                    b = bn;
+                }
+            };
+            gg_esimd::static_for<0, NT>::run(col_tile);
+        }
+
+#pragma unroll
+        for (int c = 0; c < BNT; ++c) {
+            if (c >= ncols) {
+                continue;
+            }
+            simd<float, MR> col;
+#pragma unroll
+            for (int g = 0; g < RG; ++g) {
+                col.template select<RC, 1>(g * RC) = acc[g][c / NW].template select<RC, NW>(c % NW);
+            }
+            float * out = dst + (size_t) (n0 + c) * M + m0;
+            if (KS > 1) {
+                simd<uint32_t, 16> off(0, sizeof(float));
+#pragma unroll
+                for (int u = 0; u < MR / 16; ++u) {
+                    atomic_update<atomic_op::fadd, float, 16>(out + u * 16, off, col.template select<16, 1>(u * 16));
+                }
+            } else {
+                block_store<float, MR>(out, col, element_aligned_tag{});
+            }
+        }
+    }
+
+    auto get(syclexp::properties_tag) const { return syclexp::properties{ sycl::ext::intel::experimental::grf_size<256> }; }
+};
+
 // The paired gate/up GEMM of the fused MoE chain, as fg_gate_up_pack_kernel computes it: per tile t
 // of the schedule, gate and up rows [m0, m0 + MR) of the expert times the packed B at column t * BN,
 // and silu(gate) * up stored as T (f16 or bf16, the dpas operand type) straight into the down GEMM's packed B
@@ -1491,3 +1638,72 @@ GG_ESIMD_INSTANCE(block_q4_K)
 GG_ESIMD_INSTANCE(block_q5_0)
 GG_ESIMD_INSTANCE(block_q2_0)
 GG_ESIMD_INSTANCE(block_iq2_s)
+
+template <typename block_q_t, typename T, bool AOS, int MR, int NT>
+static void dense_gemm_esimd_launch(const char * weights, const T * packed, float * dst, int M, int N, int Npad, int K,
+                                    int gm, int ks, dpct::queue_ptr stream) {
+    using A                    = gg_arch<ggml_sycl_xmx::xe2, MR>;
+    const int               nt = (N + NT * A::NW - 1) / (NT * A::NW);
+    const sycl::nd_range<1> range((size_t) ks * nt * (M / MR), 1);
+    if (ks > 1) {
+        stream->memset(dst, 0, (size_t) M * N * sizeof(float));
+    }
+    stream->parallel_for(range, dense_gemm_esimd_kernel<block_q_t, T, AOS, A, NT>{ weights, packed, dst, M, N, Npad, K, gm, ks });
+}
+
+// 32 x 64 tiles (16 x 64 where M is not a multiple of 32). A 256-GRF thread takes 4 of the 8 slots of
+// an XVE: 160 XVEs x 4 = 640 threads in flight on a B60; fewer tiles than that split K instead.
+template <typename block_q_t, typename T>
+bool ggml_sycl_dense_gemm_esimd(const char * weights, const T * packed, float * dst, int M, int N, int Npad, int K,
+                                bool reordered, dpct::queue_ptr stream) {
+    static const int gm_env = ggml_sycl_get_env("GGML_SYCL_DENSE_ESIMD_GM", 8);
+    constexpr int    NT     = 4;
+    const int        ntiles = (N + NT * 16 - 1) / (NT * 16);
+    const int        mr     = M % 32 == 0 ? 32 : 16;
+    const bool ok32 = gg_esimd_a<block_q_t, 32>::ok(K, !reordered), ok16 = gg_esimd_a<block_q_t, 16>::ok(K, !reordered);
+    if (M <= 0 || N <= 0 || M % mr != 0 || !(mr == 32 ? ok32 : ok16) || K < GG_QK ||
+        !gg_esimd_weights_ok(weights, 0, reordered) || ((uintptr_t) packed % 64) != 0 || Npad % 16 != 0 || N > Npad) {
+        return false;
+    }
+    const int gm = std::max(1, gm_env);
+    // fewer tiles than thread slots: split K (>= 8 stored blocks a range), summed with atomics
+    static const int ks_env = ggml_sycl_get_env("GGML_SYCL_DENSE_ESIMD_KSPLIT", -1);
+    const int64_t    tiles  = (int64_t) (M / mr) * ntiles;
+    int              ks     = ks_env >= 1 ? ks_env : (int) std::min<int64_t>(4, std::max<int64_t>(1, 640 / tiles));
+    ks                      = std::max(1, std::min(ks, (K / gg_esimd_a<block_q_t, 32>::qk) / 8));
+    if (mr == 32) {
+        if (reordered) {
+            dense_gemm_esimd_launch<block_q_t, T, false, 32, NT>(weights, packed, dst, M, N, Npad, K, gm, ks, stream);
+        } else {
+            dense_gemm_esimd_launch<block_q_t, T, true, 32, NT>(weights, packed, dst, M, N, Npad, K, gm, ks, stream);
+        }
+    } else {
+        if (reordered) {
+            dense_gemm_esimd_launch<block_q_t, T, false, 16, NT>(weights, packed, dst, M, N, Npad, K, gm, ks, stream);
+        } else {
+            dense_gemm_esimd_launch<block_q_t, T, true, 16, NT>(weights, packed, dst, M, N, Npad, K, gm, ks, stream);
+        }
+    }
+    return true;
+}
+
+#define GG_DENSE_INSTANCE(block_q_t, T) \
+    template bool ggml_sycl_dense_gemm_esimd<block_q_t, T>(const char *, const T *, float *, int, int, int, int, bool, dpct::queue_ptr);
+#define GG_DENSE_TYPES(block_q_t) \
+    GG_DENSE_INSTANCE(block_q_t, sycl::half) \
+    GG_DENSE_INSTANCE(block_q_t, sycl::ext::oneapi::bfloat16)
+GG_DENSE_TYPES(block_q8_0)
+GG_DENSE_TYPES(block_iq4_nl)
+GG_DENSE_TYPES(block_iq4_xs)
+GG_DENSE_TYPES(block_iq3_s)
+GG_DENSE_TYPES(block_iq3_xxs)
+GG_DENSE_TYPES(block_q3_K)
+GG_DENSE_TYPES(block_q2_K)
+GG_DENSE_TYPES(block_q6_K)
+GG_DENSE_TYPES(block_q5_K)
+GG_DENSE_TYPES(block_q4_K)
+GG_DENSE_TYPES(block_q5_0)
+GG_DENSE_TYPES(block_q2_0)
+GG_DENSE_TYPES(block_iq2_s)
+#undef GG_DENSE_TYPES
+#undef GG_DENSE_INSTANCE

@@ -2852,7 +2852,7 @@ template <typename S> struct grouped_gemm_launcher {
 template <typename S>
 static bool fg_fused_run(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,
                          float * dst, int64_t M, int64_t N, int64_t K, int64_t ldd, bool reordered,
-                         ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+                         ggml_sycl_pool & pool, dpct::queue_ptr stream, bool esimd = false) {
     const int64_t groups_n = (N + S::BN - 1) / S::BN;
     const int64_t groups_m = (M + S::SG_ROWS - 1) / S::SG_ROWS;
     const int     Npad     = (int) (groups_n * S::BN);
@@ -2868,11 +2868,53 @@ static bool fg_fused_run(ggml_type src0_type, const void * src0, const void * sr
     }
 
     const typename S::tsb * packed = packed_b.get();
-    return fg_visit_type(src0_type, reordered, [&](auto tag) {
+    bool launched = false;
+    fg_visit_type(src0_type, reordered, [&](auto tag) {
         using T = decltype(tag);
+        if (esimd) {
+            if constexpr (fg_esimd_combo<S>() && S::SG == 16 && ggml_sycl_grouped_gemm_esimd_has<typename T::type>) {
+                launched = ggml_sycl_dense_gemm_esimd<typename T::type, typename S::tsb>(
+                    (const char *) src0, packed, dst, (int) M, (int) N, Npad, (int) K, reordered, stream);
+            }
+            return;
+        }
         fused_dequant_gemm_launch<S, typename T::type, T::reordered>(src0, packed, dst, (int) M, (int) N, Npad, (int) K,
                                                                      (int) ldd, groups_n, groups_m, stream);
+        launched = true;
     });
+    return launched;
+}
+
+bool ggml_sycl_dense_dequant_gemm_esimd(ggml_type src0_type, const void * src0, const float * src1,
+                                       int32_t src1_prec, float * dst, int64_t M, int64_t N, int64_t K,
+                                       bool reordered, ggml_sycl_pool & pool, dpct::queue_ptr stream) {
+    if (!ggml_sycl_grouped_gemm_esimd_enabled() ||
+        !ggml_sycl_fused_dequant_gemm_shape_ok(src0_type, M, 1, K, M) ||
+        N <= 0 || N > INT32_MAX / 4 - GGML_SYCL_FG_BN ||
+        M > INT32_MAX / K || ((N + GGML_SYCL_FG_BN - 1) / GGML_SYCL_FG_BN) > INT32_MAX / M ||
+        ((N + GGML_SYCL_FG_BN - 1) / GGML_SYCL_FG_BN) * GGML_SYCL_FG_BN > INT32_MAX / K) {
+        return false;
+    }
+    bool covered = false;
+    fg_visit_type(src0_type, reordered, [&](auto tag) {
+        using T = decltype(tag);
+        covered = ggml_sycl_grouped_gemm_esimd_has<typename T::type>;
+    });
+    if (!covered) {
+        return false;
+    }
+    const int combo = fg_esimd_remap(stream, fg_pick_combo(stream, GGML_TYPE_F32, src1_prec), { {src0_type, reordered} });
+    if (combo < 0) {
+        return false;
+    }
+    bool launched = false;
+    fg_visit_combo(combo, [&](auto s) {
+        if constexpr (fg_esimd_combo<decltype(s)>()) {
+            launched = fg_fused_run<decltype(s)>(src0_type, src0, src1, GGML_TYPE_F32, dst, M, N, K, M,
+                                                 reordered, pool, stream, true);
+        }
+    });
+    return launched;
 }
 
 bool ggml_sycl_fused_dequant_gemm(ggml_type src0_type, const void * src0, const void * src1, ggml_type src1_type,

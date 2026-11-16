@@ -6665,6 +6665,22 @@ static void ggml_sycl_mul_mat(ggml_backend_sycl_context & ctx, const ggml_tensor
 
     const bool split = ggml_backend_buffer_is_sycl_split(src0->buffer);
 
+    static const int dense_esimd_max_cols = ggml_sycl_get_env("GGML_SYCL_DENSE_ESIMD_MAX_COLS", 0);
+    if (dense_esimd_max_cols > 0 && g_ggml_sycl_enable_esimd && !split && dst->op == GGML_OP_MUL_MAT &&
+        ggml_is_quantized(src0->type) && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src1->ne[1] >= 2 && src1->ne[1] <= dense_esimd_max_cols && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        const auto * extra = static_cast<const ggml_tensor_extra_gpu *>(src0->extra);
+        const bool reordered = extra && extra->optimized_feature.is_reordered();
+        if (ggml_sycl_dense_dequant_gemm_esimd(src0->type, src0->data, (const float *) src1->data,
+                                               ggml_sycl_src1_prec(dst), (float *) dst->data,
+                                               src0->ne[1], src1->ne[1], src0->ne[0], reordered,
+                                               ctx.pool(), ctx.stream())) {
+            return;
+        }
+    }
+
     // One 2D weight against a contiguous activation with batch dims (the MTP eh_proj, [K, 4 streams,
     // n_tokens]): ggml_sycl_op_mul_mat() would loop once per batch index, each with its own
     // quantize and launch, and never installs the reorder layout for a 3D activation. The product
